@@ -1,0 +1,11 @@
+# The demo's SQLite databases and ETL records, shared by the DAG's tasks.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: etl-demo-var
+  namespace: etl-demo
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi

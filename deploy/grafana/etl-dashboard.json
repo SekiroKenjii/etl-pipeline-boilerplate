@@ -1,0 +1,308 @@
+{
+  "title": "ETL pipelines",
+  "uid": "etl-pipelines",
+  "schemaVersion": 39,
+  "tags": [
+    "etl"
+  ],
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "refresh": "1m",
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "label": "Data source"
+      },
+      {
+        "name": "pipeline",
+        "type": "query",
+        "label": "Pipeline",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": "label_values(etl_runs_total, etl_pipeline)",
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Runs by status (24h)",
+      "type": "stat",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 8,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (etl_status) (increase(etl_runs_total{etl_pipeline=~\"$pipeline\"}[24h]))",
+          "legendFormat": "{{etl_status}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Since the last successful run",
+      "type": "stat",
+      "gridPos": {
+        "x": 8,
+        "y": 0,
+        "w": 8,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "time() - max by (etl_pipeline) (etl_run_last_completed_seconds{etl_pipeline=~\"$pipeline\",etl_status=\"success\"})",
+          "legendFormat": "{{etl_pipeline}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 3,
+      "title": "Lock lost (24h)",
+      "type": "stat",
+      "gridPos": {
+        "x": 16,
+        "y": 0,
+        "w": 8,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(etl_lock_lost_total{etl_pipeline=~\"$pipeline\"}[24h]))",
+          "legendFormat": "lost"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Rows loaded per second",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 6,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (etl_pipeline, etl_step) (rate(etl_rows_loaded_total{etl_pipeline=~\"$pipeline\"}[5m]))",
+          "legendFormat": "{{etl_pipeline}} {{etl_step}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "rowsps"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 5,
+      "title": "Reject rate",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 12,
+        "y": 6,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (etl_pipeline, etl_step) (rate(etl_rows_rejected_total{etl_pipeline=~\"$pipeline\"}[1h])) / sum by (etl_pipeline, etl_step) (rate(etl_rows_read_total{etl_pipeline=~\"$pipeline\"}[1h]))",
+          "legendFormat": "{{etl_pipeline}} {{etl_step}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 6,
+      "title": "Step duration, p95",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 14,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le, etl_pipeline, etl_step) (rate(etl_step_duration_seconds_bucket{etl_pipeline=~\"$pipeline\"}[1h])))",
+          "legendFormat": "{{etl_pipeline}} {{etl_step}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 7,
+      "title": "Rows created, updated, deleted",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 12,
+        "y": 14,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (etl_pipeline) (rate(etl_rows_created_total{etl_pipeline=~\"$pipeline\"}[5m]))",
+          "legendFormat": "created {{etl_pipeline}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (etl_pipeline) (rate(etl_rows_updated_total{etl_pipeline=~\"$pipeline\"}[5m]))",
+          "legendFormat": "updated {{etl_pipeline}}"
+        },
+        {
+          "refId": "C",
+          "expr": "sum by (etl_pipeline) (rate(etl_rows_deleted_total{etl_pipeline=~\"$pipeline\"}[5m]))",
+          "legendFormat": "deleted {{etl_pipeline}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "rowsps"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 8,
+      "title": "Change data capture lag",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 22,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (etl_pipeline, etl_table) (etl_changes_lag_seconds{etl_pipeline=~\"$pipeline\"})",
+          "legendFormat": "{{etl_table}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 9,
+      "title": "Kafka lag",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 12,
+        "y": 22,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (etl_topic, etl_group) (etl_messages_lag)",
+          "legendFormat": "{{etl_topic}}"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Failed attempts of steps",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 30,
+        "w": 24,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (etl_pipeline, etl_step, etl_retryable) (increase(etl_step_errors_total{etl_pipeline=~\"$pipeline\"}[1h]))",
+          "legendFormat": "{{etl_step}} retryable={{etl_retryable}}"
+        }
+      ]
+    }
+  ]
+}

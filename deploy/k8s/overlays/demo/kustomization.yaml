@@ -1,0 +1,57 @@
+# The demo on a local cluster (kind): SQLite seeded by an init container, the
+# image built locally. `make k8s-demo` runs it.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: etl-demo
+resources:
+  - namespace.yaml
+  - ../../base
+# The pods mount etl-secrets, which the dev settings do not read: placeholders.
+secretGenerator:
+  - name: etl-secrets
+    literals:
+      - legacy-database-url=unused-by-dev
+      - crm-database-url=unused-by-dev
+    options:
+      disableNameSuffixHash: true
+images:
+  # The base names the published image; the demo runs the local one.
+  - name: ghcr.io/example/etl-pipeline
+    newName: localhost/etl-pipeline
+    newTag: dev
+patches:
+  - target:
+      kind: CronJob
+      name: crm-full-load
+    patch: |-
+      - op: replace
+        path: /spec/jobTemplate/spec/template/spec/containers/0/env/0/value
+        value: dev
+      - op: replace
+        path: /spec/jobTemplate/spec/template/spec/containers/0/imagePullPolicy
+        value: Never
+      - op: add
+        path: /spec/jobTemplate/spec/template/spec/initContainers
+        value:
+          - name: seed
+            image: localhost/etl-pipeline:dev
+            imagePullPolicy: Never
+            command: [python, -m, modules.crm.demo, --env, dev]
+            securityContext:
+              allowPrivilegeEscalation: false
+              readOnlyRootFilesystem: true
+              capabilities:
+                drop: [ALL]
+            volumeMounts:
+              - name: var
+                mountPath: /app/var
+  - target:
+      kind: CronJob
+      name: etl-housekeeping
+    patch: |-
+      - op: replace
+        path: /spec/jobTemplate/spec/template/spec/containers/0/env/0/value
+        value: dev
+      - op: replace
+        path: /spec/jobTemplate/spec/template/spec/containers/0/imagePullPolicy
+        value: Never

@@ -1,0 +1,235 @@
+name: CI
+
+# Third-party actions are pinned by commit SHA (the version in a comment): a
+# tag can be moved to other code, a SHA cannot. Dependabot proposes updates
+# (.github/dependabot.yml).
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Weekly, for the vulnerabilities published since the last push: the
+  # Python dependencies (make security) and the image (make image-scan).
+  schedule:
+    - cron: "23 4 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  # As the Dockerfile's uv.
+  UV_VERSION: "0.13.6"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    # The databases of the conformance suite; SQLite needs none.
+    services:
+      mssql:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_SA_PASSWORD: Etl-Passw0rd!
+        ports:
+          - 51433:1433
+      oracle:
+        image: gvenzl/oracle-free:23-slim
+        env:
+          # The password of SYS and SYSTEM: ETL_TEST_ORACLE_ADMIN_URL.
+          ORACLE_PASSWORD: etl
+          APP_USER: etl
+          APP_USER_PASSWORD: etl
+        ports:
+          - 51521:1521
+        options: >-
+          --health-cmd healthcheck.sh
+          --health-interval 10s
+          --health-retries 30
+      seq:
+        image: datalust/seq:latest
+        env:
+          ACCEPT_EULA: "Y"
+          SEQ_FIRSTRUN_NOAUTHENTICATION: "true"
+        ports:
+          - 55341:80
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: etl
+          MYSQL_DATABASE: etl
+          MYSQL_USER: etl
+          MYSQL_PASSWORD: etl
+        ports:
+          - 53306:3306
+      kafka:
+        image: apache/kafka:3.9.1
+        env:
+          KAFKA_NODE_ID: "1"
+          KAFKA_PROCESS_ROLES: broker,controller
+          KAFKA_LISTENERS: PLAINTEXT://:59092,CONTROLLER://:9093
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:59092
+          KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+          KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+          KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+          KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+          KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+        ports:
+          - 59092:59092
+      vault:
+        image: hashicorp/vault:1.20
+        env:
+          VAULT_DEV_ROOT_TOKEN_ID: root
+          VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+        ports:
+          - 58200:8200
+    # As DB_URLS of the Makefile.
+    env:
+      ETL_TEST_POSTGRES_URL: postgresql+psycopg://etl:etl@localhost:55432/etl
+      ETL_TEST_MSSQL_URL: mssql+mssqlpython://sa:Etl-Passw0rd!@localhost:51433/master?TrustServerCertificate=yes&Encrypt=no
+      ETL_TEST_ORACLE_URL: oracle+oracledb://etl:etl@localhost:51521/?service_name=FREEPDB1
+      ETL_TEST_ORACLE_ADMIN_URL: oracle+oracledb://system:etl@localhost:51521/?service_name=FREEPDB1
+      ETL_TEST_MYSQL_URL: mysql+pymysql://etl:etl@127.0.0.1:53306/etl
+      ETL_TEST_MONGODB_URL: mongodb://localhost:57017/etl?replicaSet=rs0&directConnection=true
+      ETL_TEST_SEQ_URL: http://localhost:55341
+      ETL_TEST_KAFKA_URL: localhost:59092
+      ETL_TEST_OTEL_URL: http://localhost:54318
+      ETL_TEST_OTEL_DIR: ${{ github.workspace }}/var/otel-test
+      ETL_TEST_VAULT_URL: http://localhost:58200
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+      - name: Install
+        run: uv sync --all-extras --frozen
+      - name: Lint
+        run: make lint
+      - name: Type check
+        run: make typecheck
+      # Services cannot take arguments: Postgres needs wal_level=logical for
+      # logical replication, MongoDB --replSet for transactions and change
+      # streams.
+      - name: Start Postgres
+        run: |
+          docker run -d --name postgres -p 55432:5432 -e POSTGRES_USER=etl \
+            -e POSTGRES_PASSWORD=etl -e POSTGRES_DB=etl postgres:18 \
+            -c wal_level=logical
+      - name: Start MongoDB
+        run: |
+          docker run -d --name mongodb -p 57017:27017 mongo:8.2 --replSet rs0 --bind_ip_all
+          until docker exec mongodb mongosh --quiet --eval \
+            "try { rs.status().ok } catch (e) { rs.initiate().ok }"; do sleep 2; done
+      # Writes every signal it receives where the telemetry test reads them.
+      - name: Start an OpenTelemetry Collector
+        run: |
+          mkdir -p var/otel-test && chmod 777 var/otel-test
+          docker run -d --name otel -p 54318:4318 \
+            -v "$PWD/deploy/otel-collector/file.yaml:/etc/otelcol-contrib/config.yaml" \
+            -v "$PWD/var/otel-test:/out" "$(make -s print-OTELCOL_IMAGE)"
+      - name: Wait for the databases
+        run: uv run python scripts/wait_for_databases.py
+      # As `make cov-db` (locally after `make db-up`): the unit tests in
+      # parallel, then every database, then the end-to-end tests (`slow`),
+      # whose `etl` processes count. The coverage floor applies here, where
+      # every adapter runs.
+      - name: Unit tests
+        run: |
+          rm -f .coverage .coverage.*
+          uv run pytest -n auto tests/units --cov --cov-report=
+      - name: Integration tests
+        run: >-
+          uv run pytest -m "not slow" tests/integrations tests/e2e
+          --cov --cov-append --cov-report=
+      - name: End-to-end tests and coverage
+        run: >-
+          uv run pytest -m slow tests/integrations tests/e2e
+          --cov --cov-append --cov-report=term-missing
+          --cov-report=xml:var/coverage.xml
+          --cov-fail-under="$(make -s print-COV_FLOOR)"
+      - name: Coverage report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage
+          path: var/coverage.xml
+          if-no-files-found: ignore
+      - name: OpenTelemetry Collector configurations
+        run: make otel-validate CONTAINER=docker
+      - name: Compiled mappings up to date
+        run: make mappings
+      # Known vulnerabilities (pip-audit), insecure code (bandit), and the
+      # software bill of materials of what ships (CycloneDX).
+      - name: Security
+        run: make security
+      - name: Documentation
+        run: |
+          uv sync --all-extras --group docs --frozen
+          make docs
+      - name: Software bill of materials
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom
+          path: var/sbom.cdx.json
+
+  # SonarQube or SonarCloud, with the coverage of the check job. It runs when
+  # the repository has a SONAR_TOKEN secret and a SONAR_HOST_URL variable
+  # (https://sonarcloud.io for SonarCloud); pull requests from forks get no
+  # secret, and skip it. The quality gate fails the job.
+  sonar:
+    runs-on: ubuntu-latest
+    needs: check
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: env.SONAR_TOKEN != ''
+        with:
+          # Blame data, for the new code period.
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: env.SONAR_TOKEN != ''
+        with:
+          name: coverage
+          path: var
+      - name: Analysis
+        if: env.SONAR_TOKEN != ''
+        uses: SonarSource/sonarqube-scan-action@e805d875275f728fac1885b413934be6d7c63f65 # v8.4.1
+        with:
+          args: -Dsonar.qualitygate.wait=true
+
+  # The image, run as Kubernetes runs it, and as Airflow does: the demo as a
+  # Job of its CronJob, then the CRM DAG with its tasks as pods, on kind.
+  deploy:
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Image
+        run: make image CONTAINER=docker
+      - name: Smoke test
+        run: docker run --rm localhost/etl-pipeline:dev --env dev list
+      # Known vulnerabilities of the image, OS packages included, that have a
+      # fix (trivy); then its bill of materials (syft).
+      - name: Image scan
+        run: make image-scan CONTAINER=docker
+      - name: Image bill of materials
+        run: make image-sbom CONTAINER=docker
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-sbom
+          path: var/image.cdx.json
+      - uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        with:
+          cluster_name: etl
+      - name: Kubernetes Job
+        run: make k8s-demo CONTAINER=docker
+      - name: Airflow DAG
+        run: make airflow-demo CONTAINER=docker

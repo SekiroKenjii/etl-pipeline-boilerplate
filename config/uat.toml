@@ -1,0 +1,21 @@
+# User acceptance tests: production-like, without personal data. The columns
+# the mappings mark as personal data get fake values, derived from the real
+# ones by HMAC (the same value always gets the same fake one).
+[logging]
+format = "json"
+
+[privacy]
+anonymize = true
+secret = "${env:ETL_PRIVACY_SECRET}"
+
+# Environment variables are enough for a UAT copy; production reads its
+# secrets from mounted files (config/prod.toml).
+[databases.legacy]
+url = "${env:LEGACY_DATABASE_URL}"
+
+[databases.crm]
+url = "${env:UAT_CRM_DATABASE_URL}"
+
+[bookkeeping]
+database = "crm"
+schema_name = "etl"

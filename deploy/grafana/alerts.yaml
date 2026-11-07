@@ -1,0 +1,69 @@
+# Prometheus (or Mimir, or Grafana) alerting rules on the ETL's metrics, as
+# the collector writes them (`deploy/otel-collector/loki.yaml`, `seq.yaml`).
+groups:
+  - name: etl
+    rules:
+      - alert: EtlRunFailed
+        # A run fails when one of its steps does, whatever the step's
+        # policy; `partial_success` only ever means rows rejected.
+        expr: increase(etl_runs_total{etl_status="failed"}[1h]) > 0
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.etl_pipeline }} failed"
+          description: "See `etl runs {{ $labels.etl_pipeline }}` and its logs."
+      - alert: EtlStepFailed
+        # Which steps: a step that failed for good, after its retries, even
+        # one the pipeline went on without (CONTINUE).
+        expr: >
+          sum by (etl_pipeline, etl_step) (
+            increase(etl_step_duration_seconds_count{etl_status="failed"}[1h])
+          ) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.etl_pipeline }} {{ $labels.etl_step }} failed"
+          description: "See `etl runs --run <run id>` for its message."
+      - alert: EtlNoSuccessfulRun
+        # No success for 26 hours: a daily run missed, or failing.
+        expr: >
+          time() - max by (etl_pipeline) (
+            etl_run_last_completed_seconds{etl_status="success"}
+          ) > 26 * 3600
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.etl_pipeline }}: no successful run for a day"
+      - alert: EtlRejectRateHigh
+        expr: >
+          sum by (etl_pipeline, etl_step) (increase(etl_rows_rejected_total[1h]))
+          / sum by (etl_pipeline, etl_step) (increase(etl_rows_read_total[1h]))
+          > 0.05
+        labels:
+          severity: ticket
+        annotations:
+          summary: >
+            {{ $labels.etl_pipeline }} {{ $labels.etl_step }} rejects
+            {{ $value | humanizePercentage }} of its rows
+          description: "See `etl quarantine list --pipeline {{ $labels.etl_pipeline }}`."
+      - alert: EtlChangesLagging
+        expr: max by (etl_pipeline, etl_table) (etl_changes_lag_seconds) > 3600
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.etl_table }}: the changes loaded are over an hour old"
+      - alert: EtlMessagesLagging
+        expr: max by (etl_topic, etl_group) (etl_messages_lag) > 100000
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.etl_topic }}: {{ $value }} messages not loaded"
+      - alert: EtlLockLost
+        expr: increase(etl_lock_lost_total[1h]) > 0
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.etl_pipeline }} lost its run lock: cancelled"
+          description: "Its host stalled, or another one took the lock over."

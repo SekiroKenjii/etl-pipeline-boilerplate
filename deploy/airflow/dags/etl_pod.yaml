@@ -1,0 +1,62 @@
+# The pod of every ETL task: the KubernetesPodOperator fills in the image and
+# the arguments of its container, which must be named `base`.
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    # The NetworkPolicy of deploy/k8s/base selects the ETL's pods by it.
+    app.kubernetes.io/name: etl
+spec:
+  restartPolicy: Never
+  serviceAccountName: etl
+  automountServiceAccountToken: false
+  terminationGracePeriodSeconds: 300
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    fsGroup: 10001
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: base
+      # The operator's image: pin it by digest (ETL_IMAGE=...@sha256:...).
+      imagePullPolicy: Always
+      env:
+        - name: ETL_ENV
+          value: prod
+      resources:
+        requests:
+          cpu: 500m
+          memory: 512Mi
+        limits:
+          memory: 1Gi
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: [ALL]
+      volumeMounts:
+        # The `${file:/run/secrets/...}` of config/prod.toml.
+        - name: secrets
+          mountPath: /run/secrets
+          readOnly: true
+        - name: var
+          mountPath: /app/var
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: secrets
+      # Required: a missing Secret or key keeps the pod pending.
+      secret:
+        secretName: etl-secrets
+        defaultMode: 0440
+        items:
+          - key: legacy-database-url
+            path: legacy_database_url
+          - key: crm-database-url
+            path: crm_database_url
+    - name: var
+      emptyDir: {}
+    - name: tmp
+      emptyDir: {}

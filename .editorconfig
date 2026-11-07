@@ -1,0 +1,35 @@
+# https://editorconfig.org
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+indent_style = space
+indent_size = 4
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+# Google Python Style Guide: 4-space indentation, 80 columns.
+[*.{py,pyi}]
+indent_size = 4
+max_line_length = 80
+
+[*.{toml,yaml,yml,json,jsonl}]
+indent_size = 2
+
+# Compiled mappings and pyproject.toml are written with 4 spaces by their tools.
+[{pyproject.toml,mappings/compiled/*.json}]
+indent_size = 4
+
+[*.md]
+# Two trailing spaces are a line break in Markdown.
+trim_trailing_whitespace = false
+
+[Makefile]
+indent_style = tab
+
+[*.{xlsx,xlsm}]
+charset = unset
+end_of_line = unset
+insert_final_newline = unset
+trim_trailing_whitespace = unset

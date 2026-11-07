@@ -1,0 +1,42 @@
+# Editors and operating systems.
+*~
+*.orig
+.*.sw?
+.DS_Store
+/.idea
+/.vscode
+
+# Python.
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.eggs/
+/build/
+/dist/
+
+# Environments.
+/.venv*/
+.env
+.env.*
+!.env.example
+
+# Tool caches and reports.
+/.mypy_cache/
+/.pytest_cache/
+/.tox/
+/.coverage
+/.coverage.*
+/coverage.xml
+/htmlcov/
+
+# Excel lock files, left next to a workbook while it is open.
+~$*.xlsx
+
+# Local run outputs (quarantine, issue logs, state, key registries).
+/var/
+
+# Worktrees.
+/.wt
+
+# The documentation site, built by `make docs`.
+/docs/_build/

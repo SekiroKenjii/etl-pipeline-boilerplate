@@ -1,0 +1,19 @@
+# Local development: SQLite files under var/dev (`scripts/demo_crm.py`).
+[logging]
+format = "console"
+
+[databases.legacy]
+url = "sqlite:///var/dev/legacy.db"
+
+[databases.crm]
+url = "sqlite:///var/dev/crm.db"
+
+[bookkeeping]
+database = "crm"
+create = true
+
+[modules.crm.settings]
+orphans = "park"
+# The demo data is dirty on purpose (half the customers): production keeps
+# the strict default.
+max_reject_rate = 0.6

@@ -1,0 +1,130 @@
+# crm.full_load every night. One CronJob per pipeline: copy this one.
+#
+# Exit codes of `etl run` drive the Job:
+#   0  success; 3 partial success too, with --partial-ok (rows rejected only:
+#      alerts watch the rejects; a failed step is 1)
+#   1  failed: retried, up to backoffLimit
+#   2  invalid settings, mappings or keys: the Job fails at once, retrying
+#      would not help
+#   4  another job runs some of the same steps: the Job fails at once
+#   130 cancelled by SIGTERM: a node drain does not count as a failure
+#
+# The run is labelled with its Job (--label): a pod the Job retries resumes
+# that run (--resume), and runs only the steps it did not finish; it takes
+# over the step locks a pod that died left. The next night's Job is another
+# label: every step runs. A Job replaces a pod only once it has terminated
+# (podReplacementPolicy), so two pods of one label never run at once.
+#
+# To share a large load between Jobs, give each its own steps (--step
+# 'customer:0'...) and its own label: see docs/deployment.md.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: crm-full-load
+  labels:
+    app.kubernetes.io/name: etl
+    app.kubernetes.io/component: crm.full_load
+spec:
+  schedule: "0 2 * * *"
+  timeZone: Etc/UTC
+  # The run lock forbids overlapping runs anyway; this saves the pods.
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 28800
+      ttlSecondsAfterFinished: 604800
+      podReplacementPolicy: Failed
+      podFailurePolicy:
+        rules:
+          - action: FailJob
+            onExitCodes:
+              containerName: etl
+              operator: In
+              values: [2, 4]
+          - action: Ignore
+            onPodConditions:
+              - type: DisruptionTarget
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: etl
+            app.kubernetes.io/component: crm.full_load
+        spec:
+          restartPolicy: Never
+          serviceAccountName: etl
+          automountServiceAccountToken: false
+          # SIGTERM cancels the run; the steps finish their batch first.
+          terminationGracePeriodSeconds: 300
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            fsGroup: 10001
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: etl
+              image: etl-pipeline
+              # Checks the registry at each start: with a digest (see
+              # kustomization.yaml) the image cannot change, and the pod
+              # proves it may pull it rather than use a node's copy.
+              imagePullPolicy: Always
+              args:
+                - run
+                - crm.full_load
+                - --partial-ok
+                - --label
+                - $(JOB_NAME)
+                - --resume
+              env:
+                - name: ETL_ENV
+                  value: prod
+                - name: JOB_NAME
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.labels['batch.kubernetes.io/job-name']
+                - name: ETL_BUILD
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.labels['app.kubernetes.io/version']
+              resources:
+                requests:
+                  cpu: 500m
+                  memory: 512Mi
+                limits:
+                  memory: 1Gi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: [ALL]
+              volumeMounts:
+                # The `${file:/run/secrets/...}` of config/prod.toml: files,
+                # not variables, which every child process would inherit.
+                - name: secrets
+                  mountPath: /run/secrets
+                  readOnly: true
+                - name: var
+                  mountPath: /app/var
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: secrets
+              # Required: a missing Secret or key keeps the pod pending,
+              # visible at once, rather than an exit 2 in the night.
+              secret:
+                secretName: etl-secrets
+                defaultMode: 0440
+                items:
+                  - key: legacy-database-url
+                    path: legacy_database_url
+                  - key: crm-database-url
+                    path: crm_database_url
+            - name: var
+              emptyDir: {}
+            - name: tmp
+              emptyDir: {}

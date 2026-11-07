@@ -1,0 +1,67 @@
+# https://pre-commit.com: `uv run pre-commit install` once, then on every commit.
+# The project's own tools run through uv, with the versions locked in uv.lock;
+# the hooks of other repositories are pinned by commit
+# (`pre-commit autoupdate --freeze`). The same checks as `make lint
+# typecheck mappings` in CI.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: cef0300fd0fc4d2a87a85fa2093c6b283ea36f4b  # frozen: v5.0.0
+    hooks:
+      - id: check-added-large-files
+      - id: check-merge-conflict
+      - id: check-toml
+      - id: check-yaml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+
+  - repo: local
+    hooks:
+      - id: isort
+        name: isort
+        entry: uv run --frozen isort
+        language: system
+        types: [python]
+      - id: pyink
+        name: pyink
+        entry: uv run --frozen pyink
+        language: system
+        types: [python]
+      - id: pylint
+        name: pylint
+        entry: uv run --frozen pylint
+        language: system
+        types: [python]
+        files: ^src/
+      # Tests, scripts and benchmarks less strictly: the flags of
+      # TESTS_PYLINT in the Makefile.
+      - id: pylint-tests
+        name: pylint (tests, scripts, benchmarks)
+        entry: uv run --frozen pylint
+        args:
+          - --disable=missing-docstring,redefined-outer-name
+          - --disable=unused-argument,protected-access,duplicate-code
+          - --disable=too-many-locals,use-implicit-booleaness-not-comparison
+          - --disable=unbalanced-tuple-unpacking
+        language: system
+        types: [python]
+        files: ^(tests|scripts|benchmarks)/
+      - id: mypy
+        name: mypy
+        entry: uv run --frozen mypy
+        language: system
+        types: [python]
+        pass_filenames: false
+      - id: pyright
+        name: pyright
+        entry: uv run --frozen pyright
+        language: system
+        types: [python]
+        pass_filenames: false
+      - id: mappings
+        name: compiled mappings up to date
+        entry: >-
+          uv run --frozen etl-mappings
+          --registry modules.crm.transforms:registry check
+        language: system
+        files: ^mappings/
+        pass_filenames: false

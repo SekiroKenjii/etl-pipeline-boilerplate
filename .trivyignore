@@ -1,0 +1,2 @@
+# Vulnerabilities `make image-scan` (trivy) ignores, one ID a line, each
+# with a comment: why it does not apply, and when to look again. None yet.

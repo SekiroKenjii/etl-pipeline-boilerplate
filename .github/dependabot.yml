@@ -1,0 +1,18 @@
+# Updates of what is pinned by digest or SHA, proposed as pull requests: the
+# actions of the workflows (by commit SHA) and the base images of the
+# Dockerfile (by digest; a new digest of the same tag brings the OS
+# patches). The Makefile's tool images and versions, and the pre-commit
+# hooks (`pre-commit autoupdate --freeze`), are updated by hand.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly

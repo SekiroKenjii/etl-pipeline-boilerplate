@@ -1,0 +1,84 @@
+# Purges the quarantine past its retention (personal data), every week.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: etl-housekeeping
+  labels:
+    app.kubernetes.io/name: etl
+    app.kubernetes.io/component: housekeeping
+spec:
+  schedule: "30 3 * * 0"
+  timeZone: Etc/UTC
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      # A purge stuck on a slow database ends; next week's run starts anew.
+      activeDeadlineSeconds: 3600
+      ttlSecondsAfterFinished: 604800
+      podFailurePolicy:
+        rules:
+          # Invalid settings: retrying would not help.
+          - action: FailJob
+            onExitCodes:
+              containerName: etl
+              operator: In
+              values: [2]
+          - action: Ignore
+            onPodConditions:
+              - type: DisruptionTarget
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: etl
+            app.kubernetes.io/component: housekeeping
+        spec:
+          restartPolicy: Never
+          serviceAccountName: etl
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            fsGroup: 10001
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: etl
+              image: etl-pipeline
+              imagePullPolicy: Always
+              args: [housekeeping]
+              env:
+                - name: ETL_ENV
+                  value: prod
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+                limits:
+                  memory: 512Mi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: [ALL]
+              volumeMounts:
+                - name: secrets
+                  mountPath: /run/secrets
+                  readOnly: true
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: secrets
+              # Required: a missing Secret or key keeps the pod pending,
+              # visible at once, rather than an exit 2 in the night.
+              secret:
+                secretName: etl-secrets
+                defaultMode: 0440
+                items:
+                  - key: legacy-database-url
+                    path: legacy_database_url
+                  - key: crm-database-url
+                    path: crm_database_url
+            - name: tmp
+              emptyDir: {}

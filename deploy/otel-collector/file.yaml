@@ -1,0 +1,35 @@
+# Every signal to JSON files: for the integration tests, and for looking at
+# what the application sends without a backend. No TLS and no token, on
+# every interface of its container: never expose it outside a test machine.
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 1s
+
+exporters:
+  file/logs:
+    path: /out/logs.jsonl
+  file/traces:
+    path: /out/traces.jsonl
+  file/metrics:
+    path: /out/metrics.jsonl
+
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [file/logs]
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [file/traces]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [file/metrics]

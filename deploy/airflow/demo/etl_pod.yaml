@@ -1,0 +1,41 @@
+# The demo's pod: the dev settings, SQLite on a volume the tasks share (one
+# node: kind), the locally built image.
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    # The NetworkPolicy of deploy/k8s/base selects the ETL's pods by it.
+    app.kubernetes.io/name: etl
+spec:
+  restartPolicy: Never
+  serviceAccountName: etl
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    fsGroup: 10001
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: base
+      imagePullPolicy: Never
+      env:
+        - name: ETL_ENV
+          value: dev
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: [ALL]
+      volumeMounts:
+        - name: var
+          mountPath: /app/var
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: var
+      persistentVolumeClaim:
+        claimName: etl-demo-var
+    - name: tmp
+      emptyDir: {}

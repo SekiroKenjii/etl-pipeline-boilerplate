@@ -1,0 +1,64 @@
+# What the ETL's pods may reach: DNS, the databases, the OpenTelemetry
+# Collector; nothing may reach them. Everything else is denied, so a stolen
+# connection string or a compromised dependency cannot send data anywhere.
+#
+# An example to adapt: the addresses and ports below are placeholders.
+#   - Databases outside the cluster: their addresses (ipBlock), the narrower
+#     the better. A Service in front of them does not count: policies see the
+#     pods' (or endpoints') addresses, after the Service is resolved.
+#   - Databases in the cluster: a namespaceSelector and podSelector instead.
+#   - A secret manager (Vault, GCP Secret Manager, Azure Key Vault), Kafka
+#     (Debezium), a cloud identity endpoint: add a rule for each one used.
+# It is enforced only when the cluster's network plugin implements
+# NetworkPolicy (Calico, Cilium, kindnet from kind 0.24...).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: etl
+spec:
+  # The CronJobs' pods, and the Airflow tasks' (deploy/airflow/dags/).
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: etl
+  policyTypes: [Ingress, Egress]
+  # Nothing connects to the ETL: no ingress rule, so none is allowed.
+  egress:
+    # Name resolution, by the cluster's DNS.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # The databases: legacy (source), crm (target, and the ETL's records).
+    - to:
+        - ipBlock:
+            cidr: 10.0.0.0/8
+      ports:
+        - protocol: TCP
+          port: 5432  # PostgreSQL
+        - protocol: TCP
+          port: 1433  # SQL Server
+        - protocol: TCP
+          port: 1521  # Oracle
+        - protocol: TCP
+          port: 3306  # MySQL
+        - protocol: TCP
+          port: 27017  # MongoDB
+    # The OpenTelemetry Collector (logging.otlp in config/prod.toml).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: opentelemetry-collector
+      ports:
+        - protocol: TCP
+          port: 4318

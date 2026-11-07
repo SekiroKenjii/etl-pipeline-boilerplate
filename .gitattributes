@@ -1,0 +1,10 @@
+# Normalize line endings; keep binaries untouched.
+* text=auto eol=lf
+
+*.xlsx binary
+*.xlsm binary
+*.png binary
+
+# Generated files: collapsed in reviews, never merged by hand.
+uv.lock linguist-generated=true -diff
+mappings/compiled/*.json linguist-generated=true

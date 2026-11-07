@@ -1,0 +1,44 @@
+# Production: secrets come from mounted files (or a secret manager), never
+# here, and not from environment variables either: every process the ETL
+# starts inherits those, and /proc shows them.
+# Anonymization is refused here, as in every environment named prod, prd,
+# production (or `production = true`).
+[logging]
+format = "json"
+# To a collector over TLS, with its token (deploy/otel-collector/): https,
+# never http, outside the pod. A private CA: OTEL_EXPORTER_OTLP_CERTIFICATE
+# (and, for mutual TLS, OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE and _KEY).
+# [logging.otlp]
+# endpoint = "https://otel-collector.observability:4318"
+# headers = { Authorization = "Bearer ${file:/run/secrets/otlp_token}" }
+
+[databases.legacy]
+# The legacy application's own connection string works as it is.
+url = "${file:/run/secrets/legacy_database_url}"
+
+# Oracle has no change log the ETL reads itself: Debezium writes it to Kafka.
+# [databases.legacy.changes]
+# kind = "debezium"
+# kafka = "main"
+# topic_prefix = "legacy"
+#
+# [kafka.main]
+# bootstrap_servers = "${env:KAFKA_BOOTSTRAP_SERVERS}"
+# credentials = { "sasl.password" = "${file:/run/secrets/kafka_password}" }
+
+[databases.crm]
+url = "${file:/run/secrets/crm_database_url}"
+# Engine options (`EngineOptions`): unknown ones are refused at start-up. The
+# pool must hold 2 connections per range read in parallel (`partitions`),
+# plus 2 for the ETL records: raise max_overflow with the partitions.
+options = { pool_size = 10, max_overflow = 10, pool_pre_ping = true }
+# The rows read per query: the batch size of the pipelines reading it.
+# page_size = 1000
+
+[bookkeeping]
+database = "crm"
+schema_name = "etl"
+
+[modules.crm.settings]
+orphans = "park"
+deletes = "soft"

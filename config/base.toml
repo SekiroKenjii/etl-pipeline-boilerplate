@@ -1,0 +1,16 @@
+# Settings of every environment; `<env>.toml` and `ETL__*` variables win.
+service_name = "etl"
+
+[logging]
+level = "INFO"
+levels = { "sqlalchemy.engine" = "WARNING" }
+
+[modules.crm]
+module = "modules.crm:create"
+
+[modules.crm.settings]
+source = "legacy"
+target = "crm"
+# The demo tables have no schema.
+source_tables = { customer = "CUST_MASTER", order = "ORD_MASTER" }
+target_tables = { customer = "customer", order = "order" }

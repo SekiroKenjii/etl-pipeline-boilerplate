@@ -1,0 +1,255 @@
+{
+  "format_version": 1,
+  "labels": {
+    "default": "Default",
+    "format": "Format",
+    "ignored": "Ignored source fields",
+    "key": "Key",
+    "key_case": "Key case",
+    "key_hashing": "Key hashing",
+    "notes": "Notes",
+    "params": "Parameters",
+    "personal": "Personal data",
+    "references": "References",
+    "required": "Required",
+    "row_filter": "Row filter",
+    "row_split": "Row split",
+    "sources": "Source columns",
+    "status": "Status",
+    "target": "Target column",
+    "target_type": "Target type",
+    "transform": "Transform"
+  },
+  "lookups": {
+    "countries": {
+      "US": "US",
+      "VIETNAM": "VN",
+      "VN": "VN"
+    }
+  },
+  "mappings": [
+    {
+      "fields": [
+        {
+          "default": null,
+          "format": null,
+          "location": "crm.xlsx › customer › row 2",
+          "notes": null,
+          "params": {},
+          "personal": null,
+          "primary_key": false,
+          "references": null,
+          "required": true,
+          "sources": [
+            "CUST_NO"
+          ],
+          "target": "customer_id",
+          "target_type": "NUMBER(10)",
+          "transform": null
+        },
+        {
+          "default": null,
+          "format": null,
+          "location": "crm.xlsx › customer › row 3",
+          "notes": null,
+          "params": {
+            "separator": " "
+          },
+          "personal": "name",
+          "primary_key": false,
+          "references": null,
+          "required": true,
+          "sources": [
+            "FIRST_NM",
+            "LAST_NM"
+          ],
+          "target": "full_name",
+          "target_type": "VARCHAR(200)",
+          "transform": "concat"
+        },
+        {
+          "default": "unknown",
+          "format": null,
+          "location": "crm.xlsx › customer › row 4",
+          "notes": null,
+          "params": {
+            "A": "active",
+            "I": "inactive"
+          },
+          "personal": null,
+          "primary_key": false,
+          "references": null,
+          "required": false,
+          "sources": [
+            "STAT_CD"
+          ],
+          "target": "status",
+          "target_type": "VARCHAR(20)",
+          "transform": "value_map"
+        },
+        {
+          "default": null,
+          "format": "dd/MM/yyyy",
+          "location": "crm.xlsx › customer › row 5",
+          "notes": null,
+          "params": {},
+          "personal": null,
+          "primary_key": false,
+          "references": null,
+          "required": false,
+          "sources": [
+            "CRT_DT"
+          ],
+          "target": "created_at",
+          "target_type": "DATE",
+          "transform": null
+        },
+        {
+          "default": null,
+          "format": null,
+          "location": "crm.xlsx › customer › row 6",
+          "notes": null,
+          "params": {
+            "table": "countries"
+          },
+          "personal": null,
+          "primary_key": false,
+          "references": null,
+          "required": false,
+          "sources": [
+            "CTRY"
+          ],
+          "target": "country",
+          "target_type": "VARCHAR(2)",
+          "transform": "lookup"
+        },
+        {
+          "default": null,
+          "format": null,
+          "location": "crm.xlsx › customer › row 7",
+          "notes": null,
+          "params": {},
+          "personal": null,
+          "primary_key": true,
+          "references": null,
+          "required": false,
+          "sources": [
+            "CUST_NO"
+          ],
+          "target": "customer_key",
+          "target_type": "UUID",
+          "transform": null
+        }
+      ],
+      "ignored_source_fields": [
+        "LEGACY_FLAG",
+        "UPDATED_AT"
+      ],
+      "key_case": "upper",
+      "key_hashing": "uuid5",
+      "key_namespace": null,
+      "key_version": 1,
+      "location": "crm.xlsx › Mappings › row 2",
+      "name": "customer",
+      "owner": null,
+      "row_filter": null,
+      "row_split": null,
+      "source": "legacy.CUST_MASTER",
+      "status": "approved",
+      "target": "crm.customer",
+      "unmapped_source_fields": "error",
+      "version": 1
+    },
+    {
+      "fields": [
+        {
+          "default": null,
+          "format": null,
+          "location": "crm.xlsx › order › row 2",
+          "notes": null,
+          "params": {},
+          "personal": null,
+          "primary_key": true,
+          "references": null,
+          "required": false,
+          "sources": [
+            "ORD_NO"
+          ],
+          "target": "order_key",
+          "target_type": "UUID",
+          "transform": null
+        },
+        {
+          "default": null,
+          "format": null,
+          "location": "crm.xlsx › order › row 3",
+          "notes": null,
+          "params": {},
+          "personal": null,
+          "primary_key": false,
+          "references": "customer",
+          "required": true,
+          "sources": [
+            "CUST_NO"
+          ],
+          "target": "customer_key",
+          "target_type": "UUID",
+          "transform": null
+        },
+        {
+          "default": null,
+          "format": null,
+          "location": "crm.xlsx › order › row 4",
+          "notes": null,
+          "params": {},
+          "personal": null,
+          "primary_key": false,
+          "references": null,
+          "required": true,
+          "sources": [
+            "AMT"
+          ],
+          "target": "total",
+          "target_type": "NUMBER(12,2)",
+          "transform": null
+        },
+        {
+          "default": null,
+          "format": "dd/MM/yyyy",
+          "location": "crm.xlsx › order › row 5",
+          "notes": null,
+          "params": {},
+          "personal": null,
+          "primary_key": false,
+          "references": null,
+          "required": false,
+          "sources": [
+            "ORD_DT"
+          ],
+          "target": "ordered_at",
+          "target_type": "DATE",
+          "transform": null
+        }
+      ],
+      "ignored_source_fields": [
+        "UPDATED_AT"
+      ],
+      "key_case": "preserve",
+      "key_hashing": "uuid5",
+      "key_namespace": null,
+      "key_version": 1,
+      "location": "crm.xlsx › Mappings › row 3",
+      "name": "order",
+      "owner": null,
+      "row_filter": null,
+      "row_split": null,
+      "source": "legacy.ORD_MASTER",
+      "status": "approved",
+      "target": "crm.order",
+      "unmapped_source_fields": "error",
+      "version": 1
+    }
+  ],
+  "name": "crm",
+  "source_file": "crm.xlsx"
+}

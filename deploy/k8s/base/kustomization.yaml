@@ -1,0 +1,34 @@
+# The ETL on Kubernetes: a CronJob per pipeline, housekeeping, and the
+# NetworkPolicy of their pods (adapt its addresses first).
+#
+#   kubectl create secret generic etl-secrets \
+#     --from-file=legacy-database-url=legacy.url \
+#     --from-file=crm-database-url=crm.url
+#   kubectl apply -k deploy/k8s/base
+#   kubectl create job --from=cronjob/crm-full-load crm-full-load-now
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: etl
+      app.kubernetes.io/version: "0.1.0"
+    includeTemplates: true
+resources:
+  - serviceaccount.yaml
+  - networkpolicy.yaml
+  - cronjob-crm-full-load.yaml
+  - cronjob-housekeeping.yaml
+# Deploy the image by its digest, which the release prints (and signs): a tag
+# can be moved, a digest cannot. With a digest the tag is only a reminder.
+#
+#   kustomize edit set image \
+#     etl-pipeline=ghcr.io/<owner>/etl-pipeline:0.1.0@sha256:<digest>
+#   cosign verify ghcr.io/<owner>/etl-pipeline@sha256:<digest> \
+#     --certificate-identity-regexp \
+#       '^https://github.com/<owner>/<repo>/.github/workflows/release.yml@' \
+#     --certificate-oidc-issuer https://token.actions.githubusercontent.com
+images:
+  - name: etl-pipeline
+    newName: ghcr.io/example/etl-pipeline
+    newTag: "0.1.0"
+    # digest: sha256:<digest of 0.1.0, from the release>

@@ -1,0 +1,13 @@
+# Only what the image needs: pyproject.toml, uv.lock, src/, config/,
+# mappings/, README.md, LICENSE.
+*
+!pyproject.toml
+!uv.lock
+!README.md
+!LICENSE
+!src/
+!config/
+!mappings/
+**/__pycache__
+**/*.pyc
+mappings/~$*

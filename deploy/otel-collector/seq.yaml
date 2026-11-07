@@ -1,0 +1,66 @@
+# Who may send: the receivers listen on the pod's address only (MY_POD_IP,
+# from the Downward API `status.podIP`; 0.0.0.0 in a container started by
+# hand), over TLS, and take an export only with the bearer token, which the
+# ETL sends with `logging.otlp.headers` (see config/prod.toml).
+#   /etc/otelcol/tls/tls.crt, tls.key  the collector's certificate (a
+#       kubernetes.io/tls Secret, cert-manager...)
+#   /etc/otelcol/auth/token            the token (a Secret), re-read when it
+#       changes
+# Mutual TLS on top of the token (or instead of it: drop `auth`): uncomment
+# client_ca_file; the ETL then sends its own certificate
+# (OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE, OTEL_EXPORTER_OTLP_CLIENT_KEY).
+# The ETL trusts a private CA with OTEL_EXPORTER_OTLP_CERTIFICATE.
+extensions:
+  bearertokenauth:
+    filename: /etc/otelcol/auth/token
+
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: ${env:MY_POD_IP}:4318
+        tls: &tls
+          cert_file: /etc/otelcol/tls/tls.crt
+          key_file: /etc/otelcol/tls/tls.key
+          # client_ca_file: /etc/otelcol/tls/ca.crt
+        auth: &auth
+          authenticator: bearertokenauth
+      grpc:
+        endpoint: ${env:MY_POD_IP}:4317
+        tls: *tls
+        auth: *auth
+
+processors:
+  batch: {}
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 20
+
+exporters:
+  otlphttp/seq:
+    endpoint: "${env:SEQ_URL}/ingest/otlp"
+    headers:
+      X-Seq-ApiKey: "${env:SEQ_API_KEY}"
+  # Seq takes traces, not metrics: Prometheus scrapes these.
+  prometheus:
+    # Scraped by Prometheus inside the cluster; a NetworkPolicy limits who.
+    endpoint: ${env:MY_POD_IP}:8889
+    resource_to_telemetry_conversion:
+      enabled: true
+
+service:
+  extensions: [bearertokenauth]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp/seq]
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp/seq]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [prometheus]
