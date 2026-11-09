@@ -505,3 +505,21 @@ foreign keys of the schema `legacy` (declared, or inferred from names and
 values, with their orphans) for BAs and DBAs to confirm in the mapping
 workbooks. It connects with `$ETL_DATABASE_URL` (or `--url`), not the
 settings.
+
+## Branches and commits
+
+Git-flow: `main` is what runs in production, `develop` is where the next
+release grows. Work happens on `feature/<name>` branches cut from `develop`
+and merged back by pull request; a `release/vX.Y` branch cut from `develop`
+is merged into `main` (tagged `vX.Y`) and back into `develop`; a
+`hotfix/<name>` branch cut from `main` goes the same two ways. `main` and
+`develop` take pull requests only, with the CI green (`conventions`,
+`check`, `deploy`), and are never force-pushed or deleted.
+
+A commit message is one line of at most 72 characters,
+`type(scope)!: subject` with a Conventional Commits type (`feat`, `fix`,
+`docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`,
+`revert`); no body, no trailers. `uv run pre-commit install --hook-type
+commit-msg` checks it locally; the `conventions` job checks the branch name
+and every commit of a pull request (`scripts/check_conventions.py`).
+

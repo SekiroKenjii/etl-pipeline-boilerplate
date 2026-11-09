@@ -246,7 +246,11 @@ k8s-demo: kind-load  ## Run the demo as a Job of the crm-full-load CronJob.
 	kubectl --context kind-$(KIND_CLUSTER) apply -k deploy/k8s/overlays/demo
 	$(KUBECTL) delete job crm-full-load-demo --ignore-not-found --wait
 	$(KUBECTL) create job --from=cronjob/crm-full-load crm-full-load-demo
-	$(KUBECTL) wait --for=condition=Complete job/crm-full-load-demo --timeout=300s
+	# On a timeout, the pods' events and logs say why before the target fails.
+	$(KUBECTL) wait --for=condition=Complete job/crm-full-load-demo --timeout=300s \
+		|| { $(KUBECTL) get pods -o wide; \
+		     $(KUBECTL) describe pods -l job-name=crm-full-load-demo | sed -n '/Events:/,$$p'; \
+		     $(KUBECTL) logs job/crm-full-load-demo --all-containers --tail=60 || true; exit 1; }
 	$(KUBECTL) logs job/crm-full-load-demo -c etl | tail -3
 
 airflow-demo: kind-load  ## Run the CRM DAG in Airflow, its tasks as pods.

@@ -444,6 +444,15 @@ This release follows three independent reviews of 0.1.0 and of its fixes
   `ResourceSpec.health` may return warnings. On SQL Server the derived
   IN-list chunk is 500 (1,000 keys read back 17% faster than with 1,000);
   the other databases keep 1,000; a set `[tuning] in_chunk` still wins.
+- **Git-flow in the repository.** CI runs on pushes to `develop` too, and a
+  `conventions` job checks the branch name and the one-line Conventional
+  Commit messages of every pull request (`scripts/check_conventions.py`,
+  also a `commit-msg` pre-commit hook); Dependabot targets `develop`.
+- **CI in parallel jobs**: `static` (lint, types, mappings, security,
+  docs, SBOM), `unit`, `integration` (every database) and `e2e` (Postgres)
+  run on separate runners; `coverage` combines their data against the floor;
+  `check` sums them up for the rulesets. The image upgrades `apt` and
+  `zlib1g` until the next base digest (fixable CVEs trivy found).
 
 ### Fixed
 
@@ -593,6 +602,11 @@ This release follows three independent reviews of 0.1.0 and of its fixes
   few times when reading the catalog fails transiently, as upgrading already
   did: on SQL Server the catalog reads of a process starting deadlock with the
   DDL of another one upgrading at the same time (1205).
+- Settings load in a container without a writable temporary directory (a
+  read-only root filesystem and no `/tmp` volume, as the demo's seed init
+  container): the key cache's disk tier is then off instead of the start-up
+  failing with "No usable temporary directory"; the demo mounts `/tmp` in
+  that container too.
 
 ## [0.1.0]
 

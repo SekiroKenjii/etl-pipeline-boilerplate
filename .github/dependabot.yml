@@ -7,6 +7,7 @@ version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
+    target-branch: develop
     schedule:
       interval: weekly
     groups:
@@ -14,5 +15,6 @@ updates:
         patterns: ["*"]
   - package-ecosystem: docker
     directory: /
+    target-branch: develop
     schedule:
       interval: weekly

@@ -65,3 +65,8 @@ repos:
         language: system
         files: ^mappings/
         pass_filenames: false
+      - id: commit-message
+        name: one-line conventional commit message
+        entry: uv run --frozen python scripts/check_conventions.py --message-file
+        language: system
+        stages: [commit-msg]
