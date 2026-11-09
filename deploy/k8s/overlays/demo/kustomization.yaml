@@ -45,6 +45,9 @@ patches:
             volumeMounts:
               - name: var
                 mountPath: /app/var
+              # A read-only root filesystem needs a writable /tmp too.
+              - name: tmp
+                mountPath: /tmp
   # Each run's SQLite lives in its pod's emptyDir and goes with it: no
   # quarantine outlives a run for housekeeping to purge.
   - patch: |-
