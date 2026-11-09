@@ -602,6 +602,11 @@ This release follows three independent reviews of 0.1.0 and of its fixes
   few times when reading the catalog fails transiently, as upgrading already
   did: on SQL Server the catalog reads of a process starting deadlock with the
   DDL of another one upgrading at the same time (1205).
+- Settings load in a container without a writable temporary directory (a
+  read-only root filesystem and no `/tmp` volume, as the demo's seed init
+  container): the key cache's disk tier is then off instead of the start-up
+  failing with "No usable temporary directory"; the demo mounts `/tmp` in
+  that container too.
 
 ## [0.1.0]
 

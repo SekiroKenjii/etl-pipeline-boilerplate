@@ -185,16 +185,34 @@ class TuningSettings(pydantic.BaseModel):
         """Every value as this process uses it, with its source; the
         budgets are read on the first call and kept."""
         if self._effective is None:
-            try:
-                free: int | None = shutil.disk_usage(tempfile.gettempdir()).free
-            except OSError:
-                free = None
-            self._effective = resolve_tuning(self, utils.limits(), free)
+            temp_dir = _temp_dir()
+            free: int | None = None
+            if temp_dir is not None:
+                try:
+                    free = shutil.disk_usage(temp_dir).free
+                except OSError:
+                    free = None
+            self._effective = resolve_tuning(
+                self, utils.limits(), free, temp_dir=temp_dir
+            )
         return self._effective
 
 
+def _temp_dir() -> str | None:
+    """The temporary directory, or None where none is writable: a container
+    with a read-only root filesystem and no `/tmp` volume."""
+    try:
+        return tempfile.gettempdir()
+    except OSError:
+        return None
+
+
 def resolve_tuning(
-    tuning: TuningSettings, limits: utils.Limits, free_disk: int | None
+    tuning: TuningSettings,
+    limits: utils.Limits,
+    free_disk: int | None,
+    *,
+    temp_dir: str | None = "the temporary directory",
 ) -> EffectiveTuning:
     """Derives every `[tuning]` value not set from the limits found.
 
@@ -202,6 +220,8 @@ def resolve_tuning(
         tuning: The section, as set.
         limits: The memory and CPU limits of the process.
         free_disk: The free bytes of the temporary directory, if known.
+        temp_dir: The temporary directory the disk tier would use; None
+            where none is writable (then no disk tier).
     """
     memory = _memory_budget(tuning.memory_budget, limits)
     cpus = _cpu_budget(tuning.cpu_budget, limits)
@@ -209,7 +229,9 @@ def resolve_tuning(
         memory_budget=memory,
         cpu_budget=cpus,
         key_cache_memory=_key_cache_memory(tuning.key_cache_memory, memory),
-        key_cache_disk=_key_cache_disk(tuning.key_cache_disk, free_disk),
+        key_cache_disk=_key_cache_disk(
+            tuning.key_cache_disk, free_disk, temp_dir
+        ),
         spill_rows=_spill_rows(tuning.spill_rows, memory),
         max_parallel_steps=_count_or(
             tuning.max_parallel_steps, cpus.value, "cpu_budget"
@@ -287,15 +309,21 @@ def _key_cache_memory(given: int | _Auto, memory: Chosen[int]) -> Chosen[int]:
     return Chosen(budget, f"{percent}% of memory_budget", size_text(budget))
 
 
-def _key_cache_disk(given: int | _Auto, free_disk: int | None) -> Chosen[int]:
+def _key_cache_disk(
+    given: int | _Auto, free_disk: int | None, temp_dir: str | None
+) -> Chosen[int]:
     """Half the free space of the temporary directory, capped; or as
-    given."""
+    given; none without a writable temporary directory."""
     if isinstance(given, int):
         return Chosen(given, SET, size_text(given))
+    if temp_dir is None:
+        return Chosen(
+            0, "no writable temporary directory: no disk tier", size_text(0)
+        )
     if free_disk is None:
         return Chosen(
             MAX_KEY_CACHE_DISK,
-            f"the free space of {tempfile.gettempdir()} is unknown: the cap",
+            f"the free space of {temp_dir} is unknown: the cap",
             size_text(MAX_KEY_CACHE_DISK),
         )
     half = int(free_disk * KEY_CACHE_DISK_SHARE) // MIB * MIB
@@ -304,7 +332,7 @@ def _key_cache_disk(given: int | _Auto, free_disk: int | None) -> Chosen[int]:
     return Chosen(
         budget,
         f"the lesser of {human_size(MAX_KEY_CACHE_DISK)} and {percent}% of"
-        f" the {human_size(free_disk)} free under {tempfile.gettempdir()}",
+        f" the {human_size(free_disk)} free under {temp_dir}",
         size_text(budget),
     )
 

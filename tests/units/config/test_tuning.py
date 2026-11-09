@@ -6,6 +6,7 @@ from __future__ import annotations
 import io
 import pathlib
 import shutil
+import tempfile
 import types
 from typing import Any
 
@@ -281,3 +282,20 @@ class TestInTheApplication:
         assert "spill_rows = 20000" in text
         assert "# 60% of memory.max 4.0GiB" in text
         assert tuning.MIN_MEMORY_BUDGET == 256 * MIB
+
+
+def test_without_a_writable_temporary_directory_the_disk_tier_is_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A container with a read-only root filesystem and no /tmp volume (the
+    demo's seed init container) must still load its settings."""
+
+    def no_temp_dir() -> str:
+        raise FileNotFoundError("No usable temporary directory found")
+
+    monkeypatch.setattr(tempfile, "gettempdir", no_temp_dir)
+
+    effective = tuning.TuningSettings().effective()
+
+    assert effective.key_cache_disk.value == 0
+    assert "temporary directory" in effective.key_cache_disk.source
