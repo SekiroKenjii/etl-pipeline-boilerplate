@@ -39,6 +39,13 @@ COPY src ./src
 RUN uv sync --frozen --no-dev --no-editable ${EXTRAS}
 
 FROM python
+# Stopgap until the next base digest (Dependabot proposes it): the fixable
+# vulnerabilities trivy found in debian 13.7, CVE-2026-109518 (apt) and
+# CVE-2026-76844, CVE-2026-85091 (zlib1g). Remove with the new digest.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends --only-upgrade \
+        apt libapt-pkg7.0 zlib1g \
+    && rm -rf /var/lib/apt/lists/*
 LABEL org.opencontainers.image.title="etl-pipeline" \
       org.opencontainers.image.description="ETL and data migration pipelines" \
       org.opencontainers.image.licenses="MIT"

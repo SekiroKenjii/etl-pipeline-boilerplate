@@ -448,6 +448,11 @@ This release follows three independent reviews of 0.1.0 and of its fixes
   `conventions` job checks the branch name and the one-line Conventional
   Commit messages of every pull request (`scripts/check_conventions.py`,
   also a `commit-msg` pre-commit hook); Dependabot targets `develop`.
+- **CI in parallel jobs**: `static` (lint, types, mappings, security,
+  docs, SBOM), `unit`, `integration` (every database) and `e2e` (Postgres)
+  run on separate runners; `coverage` combines their data against the floor;
+  `check` sums them up for the rulesets. The image upgrades `apt` and
+  `zlib1g` until the next base digest (fixable CVEs trivy found).
 
 ### Fixed
 
