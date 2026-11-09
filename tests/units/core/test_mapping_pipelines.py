@@ -39,6 +39,9 @@ def _billing(**settings: Any) -> _Billing:
                 "billing": {"url": "mssql+pyodbc://db/billing"},
             },
             "modules": {"billing": {"settings": settings}},
+            # The CPU budget caps the parallel steps on small runners; the
+            # pool check must see every partition.
+            "tuning": {"max_parallel_steps": 64},
         },
     )
     return app.module_settings("billing", _Billing)

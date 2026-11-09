@@ -5,7 +5,7 @@ name: CI
 # (.github/dependabot.yml).
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
   pull_request:
   # Weekly, for the vulnerabilities published since the last push: the
   # Python dependencies (make security) and the image (make image-scan).
@@ -20,6 +20,23 @@ env:
   UV_VERSION: "0.13.6"
 
 jobs:
+  # Git-flow: branch names and one-line Conventional Commits, the rules a
+  # personal repository's rulesets cannot hold. Skipped for Dependabot.
+  conventions:
+    if: github.event_name == 'pull_request' && !startsWith(github.head_ref, 'dependabot/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Branch name and commit messages
+        env:
+          HEAD: ${{ github.head_ref }}
+          BASE: ${{ github.base_ref }}
+        run: |
+          python3 scripts/check_conventions.py --branch "$HEAD" \
+            --range "origin/$BASE..HEAD"
   check:
     runs-on: ubuntu-latest
     # The databases of the conformance suite; SQLite needs none.

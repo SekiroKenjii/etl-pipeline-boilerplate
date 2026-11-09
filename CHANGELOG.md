@@ -444,6 +444,10 @@ This release follows three independent reviews of 0.1.0 and of its fixes
   `ResourceSpec.health` may return warnings. On SQL Server the derived
   IN-list chunk is 500 (1,000 keys read back 17% faster than with 1,000);
   the other databases keep 1,000; a set `[tuning] in_chunk` still wins.
+- **Git-flow in the repository.** CI runs on pushes to `develop` too, and a
+  `conventions` job checks the branch name and the one-line Conventional
+  Commit messages of every pull request (`scripts/check_conventions.py`,
+  also a `commit-msg` pre-commit hook); Dependabot targets `develop`.
 
 ### Fixed
 
