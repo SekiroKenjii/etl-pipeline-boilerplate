@@ -1,7 +1,8 @@
 """Checks the Git-flow conventions a personal repository's rulesets cannot:
 branch names, and one-line Conventional Commit messages.
 
-    python3 scripts/check_conventions.py --branch feature/x --range origin/develop..HEAD
+    python3 scripts/check_conventions.py --branch feature/x \\
+        --range origin/develop..HEAD
     python3 scripts/check_conventions.py --message-file .git/COMMIT_EDITMSG
 
 Branches: `main`, `develop`, `feature/<name>`, `release/vX.Y[.Z]`,
@@ -86,7 +87,9 @@ def messages_of(revision_range: str) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser = argparse.ArgumentParser(
+        description=__doc__.split("\n\n", maxsplit=1)[0]
+    )
     parser.add_argument("--branch", help="the branch name to check")
     parser.add_argument("--range", help="a git revision range of commits")
     parser.add_argument(
