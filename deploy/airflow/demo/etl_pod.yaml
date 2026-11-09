@@ -23,6 +23,14 @@ spec:
       env:
         - name: ETL_ENV
           value: dev
+      resources:
+        requests:
+          cpu: 250m
+          memory: 256Mi
+          ephemeral-storage: 256Mi
+        limits:
+          memory: 1Gi
+          ephemeral-storage: 2Gi
       securityContext:
         allowPrivilegeEscalation: false
         readOnlyRootFilesystem: true

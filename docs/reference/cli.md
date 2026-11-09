@@ -9,14 +9,14 @@ reads them the same way.
 | Code | Name | When | Retry? |
 | --- | --- | --- | --- |
 | 0 | `SUCCESS` | Done. `etl run --partial-ok` also exits 0 for a partial success. | |
-| 1 | `FAILED` | A run failed: a source down, a lock lost, a step's error. Also a cutover report whose verdict is `FAILED`, and an `etl cutover verify` or `compare` that finds a report changed, which a retry does not change. | Yes, for a run (`--resume`) |
-| 2 | `INVALID` | Bad arguments, settings, workbook or file; a pipeline that cannot be built; keys changed without `--rekey`; a question answered no (`etl state reset`). Nothing ran. | No: fix it |
+| 1 | `FAILED` | A run failed: a source down, a lock lost, a step's error, records failed. Any command whose bookkeeping database or resource is down (one line, `FAILED <reason>`, or the JSON summary of `etl run --format json`). Also a cutover report whose verdict is `FAILED`, an `etl cutover verify` or `compare` that finds a report changed or unrecorded, and an `etl cutover record` that refuses one (then it records none), which a retry does not change. | Yes, for a run (`--resume`) |
+| 2 | `INVALID` | Bad arguments, settings, workbook or file; a pipeline that cannot be built; keys changed without `--rekey`; a question answered no (`etl state reset`). Nothing ran; or a step refused until the run confirms it (`--param confirm_deletes=...`). | No: fix it |
 | 3 | `PARTIAL_SUCCESS` | Done, some rows rejected (`etl run`); `PASSED-WITH-REJECTS` (`etl cutover report`). | No |
-| 4 | `LOCKED` | Another run holds some of the steps: nothing ran. | Later |
+| 4 | `LOCKED` | Another run holds some of the steps: nothing ran. A run of a `--label` held by another run of that label exits 4 after waiting up to `runs.lease_seconds`. | Later |
 | 5 | `NOT_READY` | `etl check`: a resource cannot be reached. `etl-db check`: the ETL tables need `etl-db upgrade`. | Later; after the upgrade |
 | 6 | `CHANGED` | `etl-mappings diff` finds changes; `etl-mappings check` finds a compiled file missing, stale or without workbook. | No |
 | 7 | `NOT_FOUND` | Nothing matched: `etl keys lookup`, `etl keys forget`, `etl parked release` (some identities), `etl state reset` (nothing saved), `etl runs --run`. | No |
-| 130 | `CANCELLED` | Stopped by SIGINT or SIGTERM; a run goes on from its last batch. | Yes |
+| 130 | `CANCELLED` | Stopped by SIGINT or SIGTERM; a run goes on from its last batch. `etl cutover` exits 130 too, once it has removed the source rows it spilled to disk. | Yes |
 
 An invalid workbook in `etl-mappings validate`, `compile` or `check` is 2;
 a database `etl-db` cannot reach is 1. `argparse` itself exits 2 on a
@@ -31,6 +31,13 @@ Every `etl` command takes `--env` and `--config` before the command:
 `etl --env prod config show`, not `etl config show --env prod`.
 `--format json` (`run`, `runs`) prints one JSON document for scripts and
 tests; with `run` it is the last line of the output, after the logs.
+
+A run that failed or was cancelled tells why: its `message` (the JSON
+summary, `etl runs`, and a second line of the text summary) is the first
+step that did, `<step>: failed after <n> attempt(s): <error>`, the error's
+own message redacted like the ledger's. A refusal (exit 2) thus carries its
+hint, e.g. `--param confirm_deletes=...`, and is logged without a
+traceback.
 
 ```{program-output} etl --help
 :cwd: ../..
@@ -60,6 +67,28 @@ tests; with `run` it is the last line of the output, after the logs.
 :cwd: ../..
 ```
 
+A line per resource: `ok <name>`, or `FAIL <name>: <why>` (exit 5). A
+resource that works but not as the ETL expects is still `ok`, followed by
+`WARN <name>: <what>` lines (a Postgres session whose messages are not in
+English: `WARN database.<name>: lc_messages is ...`); warnings alone leave
+the exit code 0.
+
+```text
+tuning ... (* derived; etl config tuning)
+ok   database.crm
+WARN database.crm: lc_messages is 'de_DE.utf8': ...
+FAIL database.legacy: RetryableError: checking the database: ...
+```
+
+### etl calibrate
+
+Measures a database on a scratch table and prints a `[tuning]` snippet
+({doc}`../tuning`); writes nothing else.
+
+```{program-output} etl calibrate --help
+:cwd: ../..
+```
+
 ### etl runs
 
 ```{program-output} etl runs --help
@@ -81,6 +110,12 @@ tests; with `run` it is the last line of the output, after the logs.
 ### etl cutover verify
 
 ```{program-output} etl cutover verify --help
+:cwd: ../..
+```
+
+### etl cutover record
+
+```{program-output} etl cutover record --help
 :cwd: ../..
 ```
 
@@ -159,6 +194,12 @@ tests; with `run` it is the last line of the output, after the logs.
 ### etl config show
 
 ```{program-output} etl config show --help
+:cwd: ../..
+```
+
+### etl config tuning
+
+```{program-output} etl config tuning --help
 :cwd: ../..
 ```
 

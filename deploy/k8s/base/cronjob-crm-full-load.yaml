@@ -6,14 +6,17 @@
 #   1  failed: retried, up to backoffLimit
 #   2  invalid settings, mappings or keys: the Job fails at once, retrying
 #      would not help
-#   4  another job runs some of the same steps: the Job fails at once
+#   4  another job runs some of the same steps, or the pod before this one
+#      still runs them (after a wait of up to lease_seconds): the Job fails
+#      at once
 #   130 cancelled by SIGTERM: a node drain does not count as a failure
 #
 # The run is labelled with its Job (--label): a pod the Job retries resumes
-# that run (--resume), and runs only the steps it did not finish; it takes
-# over the step locks a pod that died left. The next night's Job is another
-# label: every step runs. A Job replaces a pod only once it has terminated
-# (podReplacementPolicy), so two pods of one label never run at once.
+# that run (--resume), and runs only the steps it did not finish. The step
+# locks are the process's: the retry waits, up to lease_seconds, for those
+# of the pod before it; a pod that died frees them within that time, one
+# still running (a node cut off from the API server) keeps them, and the
+# retry exits 4. The next night's Job is another label: every step runs.
 #
 # To share a large load between Jobs, give each its own steps (--step
 # 'customer:0'...) and its own label: see docs/deployment.md.
@@ -95,8 +98,12 @@ spec:
                 requests:
                   cpu: 500m
                   memory: 512Mi
+                  ephemeral-storage: 1Gi
+                # Past its ephemeral-storage (/tmp, /app/var, logs), the pod
+                # is evicted: a cutover diff spills to /tmp, give it more.
                 limits:
                   memory: 1Gi
+                  ephemeral-storage: 4Gi
               securityContext:
                 allowPrivilegeEscalation: false
                 readOnlyRootFilesystem: true

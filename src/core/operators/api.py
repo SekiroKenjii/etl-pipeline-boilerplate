@@ -2,15 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable, Mapping
-from typing import Any
+from collections.abc import AsyncIterator, Mapping
 
 from core import contract
 from core import pipeline
-
-type Params = Mapping[str, Any] | Callable[
-    [contract.ETLContext], Mapping[str, Any]
-]
+from core.operators import types as operators_types
 
 
 class ApiExtractor[T](pipeline.IAsyncDataExtractor[T]):
@@ -31,7 +27,7 @@ class ApiExtractor[T](pipeline.IAsyncDataExtractor[T]):
     def __init__(
         self,
         source: contract.IAsyncRecordSource[T],
-        params: Params | None = None,
+        params: operators_types.Params | None = None,
     ) -> None:
         """Initializes the extractor.
 
@@ -60,7 +56,7 @@ class ApiExtractor[T](pipeline.IAsyncDataExtractor[T]):
         async for record in self.source.records(self.params_for(ctx)):
             yield record
 
-    def params_for(self, ctx: contract.ETLContext) -> Mapping[str, Any]:
+    def params_for(self, ctx: contract.ETLContext) -> Mapping[str, object]:
         """Returns the parameters of the source for this run."""
         if self._params is None:
             return {}

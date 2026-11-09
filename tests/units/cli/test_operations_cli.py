@@ -7,6 +7,7 @@ import datetime
 import io
 import json
 import pathlib
+import re
 
 import pytest
 
@@ -17,6 +18,8 @@ from core import contract
 from core import runtime
 from core.mapping import catalog as mapping_catalog
 from core.operators import corrections
+
+ROOT = pathlib.Path(__file__).resolve().parents[3]
 
 # What spreadsheets run as formulas, and a quote that must stay a quote.
 NASTY = [
@@ -96,6 +99,36 @@ def test_every_command_line_shares_one_table_of_exit_codes() -> None:
         assert exit_codes.of_run(code) == exit_codes.ExitCode[code.name]
     values = [code.value for code in exit_codes.ExitCode]
     assert len(values) == len(set(values))
+
+
+@pytest.mark.parametrize("code", list(runtime.ExitCode), ids=str)
+def test_a_code_of_a_run_is_the_same_code_of_the_command_line(
+    code: runtime.ExitCode,
+) -> None:
+    converted = exit_codes.of_run(code)
+
+    assert (converted.name, converted.value) == (code.name, code.value)
+    assert exit_codes.ExitCode[code.name].value == code.value
+
+
+# `| 4    | LOCKED  |` in the docstring, `| 4 | `LOCKED` |` in the docs.
+_TABLE_ROW = re.compile(r"^\|\s*(\d+)\s*\|\s*`?([A-Z_]+)`?\s*\|", re.MULTILINE)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        exit_codes.__doc__ or "",
+        (ROOT / "docs" / "reference" / "cli.md").read_text(encoding="utf-8"),
+    ],
+    ids=["docstring", "docs"],
+)
+def test_the_tables_of_exit_codes_list_every_code_once(text: str) -> None:
+    rows = [(int(value), name) for value, name in _TABLE_ROW.findall(text)]
+
+    assert sorted(rows) == sorted(
+        (code.value, code.name) for code in exit_codes.ExitCode
+    )
 
 
 def test_a_diff_with_changes_is_not_an_invalid_file(

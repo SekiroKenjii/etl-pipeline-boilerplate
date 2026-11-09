@@ -9,8 +9,8 @@ import itertools
 from core import contract
 from core.cutover import checksum
 
-# Databases cap the values of an IN list (Oracle: 1000).
-_CHUNK = 1000
+# Values per IN list: what every database takes (Oracle: 1,000).
+DEFAULT_CHUNK = 1000
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -31,6 +31,7 @@ class LoadedRowsCheck[T]:
         row: The target row of a record; None to skip it (a delete).
         name: The rule's name in the reports.
         on_violation: What the gate does with a row that differs.
+        chunk: The keys read back per query (the values of its IN list).
     """
 
     target: contract.ITableReader
@@ -40,6 +41,7 @@ class LoadedRowsCheck[T]:
     row: Callable[[T], contract.Row | None]
     name: str = "loaded_rows_match"
     on_violation: contract.QualityAction = contract.QualityAction.FAIL
+    chunk: int = DEFAULT_CHUNK
 
     def check_batch(
         self, records: Sequence[T], ctx: contract.ETLContext
@@ -75,7 +77,7 @@ class LoadedRowsCheck[T]:
         found: dict[str, tuple[checksum.Canonical, ...]] = {}
         first = self.key[0]
         values = list(dict.fromkeys(row[first] for row in rows))
-        for chunk in itertools.batched(values, _CHUNK):
+        for chunk in itertools.batched(values, self.chunk):
             query = contract.TableQuery(
                 self.table,
                 order_by=self.key,

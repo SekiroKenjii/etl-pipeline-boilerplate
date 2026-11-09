@@ -4,16 +4,17 @@ that keep their order, and no personal value in the issues."""
 from __future__ import annotations
 
 import datetime
+import decimal
 
 import pytest
 
 from core import contract
 from core import mapping
 from core import quality
+from core.mapping import casts
 from core.mapping import compiled as mapping_compiled
 from core.mapping import privacy
 from core.mapping import transforms
-from core.mapping import types
 from tests.factories import fakes
 from tests.factories import mapping_specs
 
@@ -92,7 +93,7 @@ class TestKindsFitTheirType:
             spec,
             transforms.IDENTITY,
             transforms.IDENTITY.fn,
-            types.parse_type("VARCHAR(5)"),
+            casts.parse_type("VARCHAR(5)"),
             anonymize=privacy.anonymizer("name", SECRET),
         )
 
@@ -150,6 +151,78 @@ class TestDates:
         (again,) = compiled.map({**row, "END": datetime.date(2021, 1, 1)})
 
         assert first.data["starts"] == again.data["starts"]
+
+
+class TestDatesOfRecordsWithoutIdentity:
+    """No primary key, no source key: knowing one real date must not tell
+    every other."""
+
+    def _compiled(self) -> mapping.CompiledMapping:
+        return mapping.compile_catalog(
+            mapping_specs.catalog(
+                mapping_specs.mapping(
+                    field("name", "NAME"),
+                    field(
+                        "starts", "START", target_type="DATE", personal="date"
+                    ),
+                    field("ends", "END", target_type="DATE", personal="date"),
+                )
+            ),
+            mapping_specs.registry,
+            anonymize=SECRET,
+        )["customer"]
+
+    def _shift(self, record: mapping.MappedRecord, start: datetime.date) -> int:
+        starts = record.data["starts"]
+        assert isinstance(starts, datetime.date)
+        return (starts - start).days
+
+    def test_rows_get_unrelated_shifts_their_dates_one(self) -> None:
+        compiled = self._compiled()
+        start = datetime.date(2020, 1, 1)
+        shifts = set()
+
+        for n in range(200):
+            end = start + datetime.timedelta(days=n)
+            (record,) = compiled.map(
+                {"NAME": f"n{n}", "START": start, "END": end}
+            )
+            ends = record.data["ends"]
+            assert isinstance(ends, datetime.date)
+            shift = self._shift(record, start)
+            assert ends - end == datetime.timedelta(days=shift)
+            shifts.add(shift)
+
+        assert len(shifts) > 50
+
+    def test_the_same_row_gets_the_same_shift(self) -> None:
+        compiled = self._compiled()
+        row = {
+            "NAME": decimal.Decimal("1.5"),
+            "START": datetime.date(2020, 1, 1),
+            "END": datetime.datetime(2020, 2, 1, 10, 0),
+        }
+
+        (first,) = compiled.map(row)
+        (again,) = compiled.map(dict(reversed(row.items())))
+
+        assert first.data == again.data
+
+    def test_a_source_key_still_identifies_the_record(self) -> None:
+        compiled = self._compiled()
+        start = datetime.date(2020, 1, 1)
+
+        shifts = {
+            self._shift(
+                compiled.apply(
+                    {"NAME": f"n{n}", "START": start, "END": None}, "K1"
+                ),
+                start,
+            )
+            for n in range(20)
+        }
+
+        assert len(shifts) == 1
 
 
 class TestIssuesHoldNoPersonalValue:

@@ -4,10 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 import datetime
-from typing import Any, cast
+from typing import cast
+
+from bson import timestamp
 
 from core import contract
 from infra.database.mongodb import client
+from infra.database.mongodb import documents
 
 _STREAM_ENDING_OPERATIONS = frozenset(
     {"drop", "rename", "dropDatabase", "invalidate"}
@@ -91,9 +94,10 @@ class MongoChangeStream(client.MongoAdapter, contract.IChangeSource):
             ) as stream,
         ):
             while True:
-                event = stream.try_next()
-                if event is None:
+                found = stream.try_next()
+                if found is None:
                     return
+                event = cast(documents.ChangeEventDocument, found)
                 time = event["clusterTime"]
                 if limit is not None and (time.time, time.inc) > limit:
                     return
@@ -101,7 +105,9 @@ class MongoChangeStream(client.MongoAdapter, contract.IChangeSource):
                 if change is not None:
                     yield change
 
-    def _event(self, event: dict[str, Any]) -> contract.ChangeEvent | None:
+    def _event(
+        self, event: documents.ChangeEventDocument
+    ) -> contract.ChangeEvent | None:
         """Turns a change stream event into a change; None to skip it.
 
         Raises:
@@ -115,7 +121,7 @@ class MongoChangeStream(client.MongoAdapter, contract.IChangeSource):
         key = event["documentKey"]["_id"]
         committed = event.get("wallTime")
         if operation == "delete":
-            row: dict[str, Any] = dict(event["documentKey"])
+            row = dict(event["documentKey"])
             kind = contract.ChangeOperation.DELETE
         elif operation in ("insert", "update", "replace"):
             document = event.get("fullDocument")
@@ -143,12 +149,16 @@ class MongoChangeStream(client.MongoAdapter, contract.IChangeSource):
         )
 
 
-def _position(token: dict[str, Any], time: Any) -> contract.StateValue:
+def _position(
+    token: documents.ResumeToken, time: timestamp.Timestamp
+) -> contract.StateValue:
     """A position: a resume token and its cluster time (a BSON Timestamp)."""
     return {"token": token, "time": [time.time, time.inc]}
 
 
-def _split(position: contract.StateValue) -> tuple[Any, tuple[int, int]]:
+def _split(
+    position: contract.StateValue,
+) -> tuple[documents.ResumeToken | None, tuple[int, int]]:
     """Returns the resume token and the cluster time of a position.
 
     Raises:
@@ -158,5 +168,8 @@ def _split(position: contract.StateValue) -> tuple[Any, tuple[int, int]]:
         position.get("time"), list
     ):
         raise contract.FatalError(f"Not a change stream position: {position!r}")
+    token = position.get("token")
+    if token is not None and not isinstance(token, dict):
+        raise contract.FatalError(f"Not a change stream position: {position!r}")
     seconds, increment = cast(list[int], position["time"])
-    return position.get("token"), (int(seconds), int(increment))
+    return token, (int(seconds), int(increment))

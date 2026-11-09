@@ -8,12 +8,14 @@ from core.contract.changes import ChangeEvent
 from core.contract.changes import ChangeOperation
 from core.contract.changes import IChangeLog
 from core.contract.changes import IChangeSource
+from core.contract.cutover import DifferenceKind
+from core.contract.cutover import EntityStatus
 from core.contract.cutover import Expected
 from core.contract.cutover import Reconciliation
+from core.contract.cutover import Verdict
 from core.contract.etl import ETLContext
 from core.contract.etl import ETLError
 from core.contract.etl import ETLPhase
-from core.contract.etl import ETLResult
 from core.contract.etl import ETLRunInfo
 from core.contract.etl import ETLStats
 from core.contract.etl import ETLStatus
@@ -42,6 +44,8 @@ from core.contract.messages import IDeadLetters
 from core.contract.messages import IMessageLog
 from core.contract.messages import IMessageSource
 from core.contract.messages import Message
+from core.contract.observability import Attribute
+from core.contract.observability import Attributes
 from core.contract.parking import IParkingLot
 from core.contract.parking import ParkedEntry
 from core.contract.pipeline import Dataset
@@ -69,6 +73,7 @@ from core.contract.quality import RejectedRecord
 from core.contract.quality import RuleStats
 from core.contract.quality import SamplingStrategy
 from core.contract.quality import Violation
+from core.contract.results import ETLResult
 from core.contract.runs import IRunLedger
 from core.contract.runs import IRunLock
 from core.contract.runs import RunRecord
@@ -81,6 +86,7 @@ from core.contract.storage import ObjectInfo
 from core.contract.tables import ColumnInfo
 from core.contract.tables import ColumnProfile
 from core.contract.tables import Condition
+from core.contract.tables import family_of
 from core.contract.tables import ForeignKeyInfo
 from core.contract.tables import InclusionCheck
 from core.contract.tables import ISchemaInspector
@@ -98,6 +104,8 @@ from core.contract.tables import WriteResult
 __all__ = [
     "DEFAULT_MAX_SAMPLES_PER_RULE",
     "AsyncLifecycle",
+    "Attribute",
+    "Attributes",
     "BatchRule",
     "ChangeEvent",
     "ChangeOperation",
@@ -106,6 +114,7 @@ __all__ = [
     "ColumnProfile",
     "Condition",
     "Dataset",
+    "DifferenceKind",
     "ETLContext",
     "ETLError",
     "ETLPhase",
@@ -113,6 +122,7 @@ __all__ = [
     "ETLRunInfo",
     "ETLStats",
     "ETLStatus",
+    "EntityStatus",
     "Expected",
     "FatalError",
     "FieldSpec",
@@ -182,8 +192,10 @@ __all__ = [
     "TableTarget",
     "TypeFamily",
     "UnmappedPolicy",
+    "Verdict",
     "Violation",
     "WriteMode",
     "WriteResult",
+    "family_of",
     "matches",
 ]

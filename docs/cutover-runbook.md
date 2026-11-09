@@ -15,8 +15,14 @@ gets a status, and the report gets a verdict:
 | --- | --- | --- |
 | `PASSED` | Every expected row is in the target, equal; nothing extra; every missing row is a parked orphan with that key | 0 |
 | `PASSED-WITH-REJECTS` | The same, but some source rows are rejected by the mapping, and every one of them is accepted (`--accept-rejections`) | 3 |
-| `FAILED` | Something is missing, extra, different, duplicated or rejected that nothing explains | 1 |
-| `COUNTED` | `--counts-only`: rows counted, none compared. Not a verdict: never sign it off | 0 |
+| `FAILED` | Something is missing, extra, different, duplicated or rejected that nothing explains; or an entity is `empty` | 1 |
+| `COUNTED` | `--counts-only`: rows counted, none compared. Not a verdict: it exits 0 whatever the counts, even 10 source rows against 0 in the target. Read them; never sign it off | 0 |
+
+An entity with no row expected, none rejected and none in the target is
+`empty`: nothing was compared, which is what a wrong source table or a
+filter that drops every row would give. It fails the report unless the BAs
+accept it, `--accept-empty <entity>` (`*` for any), quoted in the
+provenance.
 
 Two rules make the verdict one an auditor can rely on:
 
@@ -65,7 +71,15 @@ The form has a number (`canonical_form`, 2 since this release), kept in the
 provenance and shown by `verify` and `compare`. A new form can count as
 `different` rows that an older one matched: after an upgrade, run the
 sign-off rehearsal again and save it, rather than compare with a report of
-the old form. Reports saved before still verify.
+the old form.
+
+Reports saved by 0.1.0 are in no run ledger: `verify` says `UNRECORDED`.
+`etl cutover record <report>...` records them, once each, after checking
+their seal, with the operator; `verify` then says `ADOPTED`, with who
+recorded them and when: only their seal vouches for them, not the ledger
+of the day they were saved. `record` refuses a report made by this version
+(it has a `provenance`), which `--save` recorded then or never; and records
+nothing when one of the reports is refused.
 
 ### Timestamps on a coarser side
 
@@ -111,8 +125,8 @@ it counts in the databases, and decides nothing.
 
    `crm.deletes` refuses to delete when the source has no row at all, or
    when more than `max_delete_share` of an entity's loaded rows are missing
-   (half, by default): the step fails and deletes nothing, as a source
-   pointed at the wrong schema would look. Its message gives the number;
+   (a tenth, by default): the run exits 2 and deletes nothing, as a source
+   pointed at the wrong schema would look; schedulers do not retry it. Its message gives the number;
    once it is checked, confirm exactly that number for one run:
 
    ```sh
@@ -150,7 +164,8 @@ it counts in the databases, and decides nothing.
    (environment, build, mappings, keys, canonical form); `CHANGED` when the
    content was edited;
    `UNRECORDED` when it was edited and sealed again, which anyone can do,
-   since the ledger never saw that digest. `verify` reads the run ledger:
+   since the ledger never saw that digest; `ADOPTED` for a report of 0.1.0
+   recorded later (`etl cutover record`). `verify` reads the run ledger:
    run it with the settings of the environment that saved the report.
 
 ## The cutover

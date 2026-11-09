@@ -31,10 +31,11 @@ from __future__ import annotations
 from collections.abc import Iterator, Mapping, Sequence
 import dataclasses
 import threading
-from typing import Any, cast
+from typing import cast, Unpack
 
 from core import contract
 from core.operators import tables
+from core.operators import types as operators_types
 from shared import utils
 
 
@@ -47,8 +48,8 @@ class KeyRange:
         upper: The value after the largest, excluded; None for no bound.
     """
 
-    lower: Any = None
-    upper: Any = None
+    lower: operators_types.Ordered | None = None
+    upper: operators_types.Ordered | None = None
 
     def conditions(self, column: str) -> tuple[contract.Condition, ...]:
         """The conditions selecting the range on `column`."""
@@ -87,10 +88,10 @@ def split(
     if count == 1 or total < 2 * count:
         return [KeyRange()]
     marks = sorted({round(total * i / count) for i in range(1, count)})
-    bounds: list[Any] = []
+    bounds: list[operators_types.Ordered] = []
     for found in reader.keys_at(table, key, marks, filters):
         if not bounds or found[0] != bounds[-1]:
-            bounds.append(found[0])
+            bounds.append(cast(operators_types.Ordered, found[0]))
     edges = [None, *bounds, None]
     return [KeyRange(edges[i], edges[i + 1]) for i in range(len(edges) - 1)]
 
@@ -177,7 +178,9 @@ class KeyPartitions:
         found = self.ranges(ctx, compute=not ctx.run.steps)
         return found[index] if index < len(found) else None
 
-    def extractors(self, **options: Any) -> list[PartitionExtractor]:
+    def extractors(
+        self, **options: Unpack[operators_types.ExtractorOptions]
+    ) -> list[PartitionExtractor]:
         """One extractor per partition; `options` of `TableExtractor`
         (`watermark`, `columns`...), the state and filters aside."""
         return [
@@ -200,7 +203,10 @@ class KeyPartitions:
                     f" {saved.get('count')} partition(s) of {saved.get('key')};"
                     " reset that state key to split the table again"
                 )
-            bounds = cast(list[Any], utils.from_tagged(saved["bounds"]))
+            bounds = cast(
+                list[operators_types.Ordered],
+                utils.from_tagged(saved["bounds"]),
+            )
             edges = [None, *bounds, None]
             return [
                 KeyRange(edges[i], edges[i + 1]) for i in range(len(edges) - 1)
@@ -241,9 +247,9 @@ class _FirstPass:
         done: Whether every row was read.
     """
 
-    until: Any
-    acknowledged: tuple[Any, ...] | None
-    read: tuple[Any, ...] | None = None
+    until: object
+    acknowledged: tuple[object, ...] | None
+    read: tuple[object, ...] | None = None
     done: bool = False
 
     def __post_init__(self) -> None:
@@ -267,7 +273,10 @@ class PartitionExtractor(tables.TableExtractor):
     """
 
     def __init__(
-        self, partitions: KeyPartitions, index: int, **options: Any
+        self,
+        partitions: KeyPartitions,
+        index: int,
+        **options: Unpack[operators_types.ExtractorOptions],
     ) -> None:
         super().__init__(
             partitions.reader,
@@ -321,7 +330,7 @@ class PartitionExtractor(tables.TableExtractor):
                     f"{self.name}: state key {self._state_key!r} is corrupted"
                 )
             until = utils.from_tagged(first["until"])
-            after = tuple(cast(list[Any], utils.from_tagged(first["after"])))
+            after = tuple(cast(list[object], utils.from_tagged(first["after"])))
         else:
             until = self.reader.max_value(
                 self.table, self.watermark, self._filters
@@ -348,7 +357,7 @@ class PartitionExtractor(tables.TableExtractor):
             return
         first = self._first
         if first is None:
-            yield from self.reader.read(query)
+            yield from self._read(query, ctx)
             return
         for row in self.reader.read(query):
             first.read = tuple(row[column] for column in self.key)
@@ -412,13 +421,11 @@ class PartitionExtractor(tables.TableExtractor):
             },
         )
 
-    def _saved(
-        self, ctx: contract.ETLContext
-    ) -> tuple[tuple[Any, ...] | None, bool]:
+    def _saved(self, ctx: contract.ETLContext) -> tables.SavedPosition:
         """See `TableExtractor._saved`; no position during a first read."""
         saved = self._saved_state(ctx)
         if saved is not None and "first" in saved:
-            return None, False
+            return tables.SavedPosition()
         return super()._saved(ctx)
 
     def _saved_state(

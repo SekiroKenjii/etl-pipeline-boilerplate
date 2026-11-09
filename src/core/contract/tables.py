@@ -9,11 +9,13 @@ from __future__ import annotations
 import abc
 from collections.abc import Collection, Iterator, Sequence
 import dataclasses
+import datetime
+import decimal
 import enum
 import fnmatch
 import itertools
 import typing
-from typing import Any
+import uuid
 
 from core.contract import formats
 
@@ -129,8 +131,16 @@ class ITableReader(abc.ABC):
         table: str,
         column: str,
         filters: Sequence[Condition] = (),
-    ) -> Any:
+    ) -> object:
         """Returns the largest value of `column`, None for an empty table."""
+
+    def column_family(self, table: str, column: str) -> TypeFamily:
+        """Returns the family of the type of a column.
+
+        This default guesses it from the largest value (`family_of`), for
+        readers without a catalog; adapters with one reflect the column.
+        """
+        return family_of(self.max_value(table, column))
 
     @abc.abstractmethod
     def count(self, table: str, filters: Sequence[Condition] = ()) -> int:
@@ -142,7 +152,7 @@ class ITableReader(abc.ABC):
         order_by: Sequence[str],
         offsets: Sequence[int],
         filters: Sequence[Condition] = (),
-    ) -> list[tuple[Any, ...]]:
+    ) -> list[tuple[object, ...]]:
         """Returns the values of `order_by` of the rows at `offsets`.
 
         Rows matching `filters` are numbered from 0 in `order_by` order (unique
@@ -164,7 +174,7 @@ class ITableReader(abc.ABC):
             raise ValueError(f"offsets must be ascending, from 0: {offsets}")
         wanted = iter(offsets)
         target = next(wanted, None)
-        found: list[tuple[Any, ...]] = []
+        found: list[tuple[object, ...]] = []
         if target is None:
             return found
         query = TableQuery(
@@ -292,6 +302,30 @@ class TypeFamily(enum.StrEnum):
         if self in numbers and other in numbers:
             return True
         return self is other and self is not TypeFamily.OTHER
+
+
+# Subclasses first: a bool is an int, a datetime a date.
+_VALUE_FAMILIES: tuple[tuple[type, TypeFamily], ...] = (
+    (bool, TypeFamily.BOOLEAN),
+    (int, TypeFamily.INTEGER),
+    (decimal.Decimal, TypeFamily.DECIMAL),
+    (float, TypeFamily.FLOAT),
+    (str, TypeFamily.TEXT),
+    (bytes, TypeFamily.BINARY),
+    (datetime.datetime, TypeFamily.DATETIME),
+    (datetime.date, TypeFamily.DATE),
+    (datetime.time, TypeFamily.TIME),
+    (uuid.UUID, TypeFamily.UUID),
+)
+
+
+def family_of(value: object) -> TypeFamily:
+    """Returns the family of a value as a driver gives it; OTHER for None
+    or a type of no family."""
+    for base, family in _VALUE_FAMILIES:
+        if isinstance(value, base):
+            return family
+    return TypeFamily.OTHER
 
 
 @dataclasses.dataclass(frozen=True, slots=True)

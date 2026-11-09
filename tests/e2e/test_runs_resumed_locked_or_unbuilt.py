@@ -1,12 +1,13 @@
-"""Resuming a run that died, sharing a pipeline's steps between processes
-(`--step`), and a pipeline that cannot be built, with the installed `etl`
-command."""
+"""Resuming a run that died, the locks of the steps (processes of other
+steps at once, two processes of one label never), and a pipeline that
+cannot be built, with the installed `etl` command."""
 
 from __future__ import annotations
 
 import os
 import pathlib
 import signal
+import time
 import uuid
 
 import pytest
@@ -156,6 +157,82 @@ def test_processes_of_other_steps_run_at_once(tmp_path: pathlib.Path) -> None:
         "orders",
         "split",
     ]
+
+
+def _bookkeeping(tmp_path: pathlib.Path, backend: str) -> str | None:
+    """The URL of the demo's CRM database on `backend`; None if it is not
+    reachable."""
+    if backend == "sqlite":
+        return f"sqlite:///{tmp_path / 'crm.db'}"
+    url = os.environ.get("ETL_TEST_POSTGRES_URL")
+    if not url:
+        return None
+    return url
+
+
+@pytest.mark.parametrize("backend", ["sqlite", "postgres"])
+def test_two_processes_of_one_label_never_run_at_once(
+    tmp_path: pathlib.Path, backend: str
+) -> None:
+    url = _bookkeeping(tmp_path, backend)
+    if url is None:
+        pytest.skip("set ETL_TEST_POSTGRES_URL to run it on Postgres")
+    schema = f"label_{uuid.uuid4().hex[:8]}"
+    admin = sa.create_engine(url)
+    if backend == "postgres":
+        with admin.begin() as connection:
+            connection.exec_driver_sql(f'CREATE SCHEMA "{schema}"')
+        url = (
+            sa.make_url(url)
+            .update_query_dict({"options": f"-csearch_path={schema}"})
+            .render_as_string(False)
+        )
+    lease = 3.0
+    project = harness.Project(
+        legacy=url
+        if backend == "postgres"
+        else f"sqlite:///{tmp_path / 'l.db'}",
+        crm=url,
+        extra={
+            "ETL__MODULES__CRM__SETTINGS__BATCH_SIZE": "500",
+            "ETL__MODULES__CRM__SETTINGS__PARTITIONS": "2",
+            "ETL__RUNS__LEASE_SECONDS": str(lease),
+        },
+    )
+    same = ("run", PIPELINE, "--partial-ok", "--label", "same")
+    try:
+        project.seed()
+        harness.add_customers(project.legacy, CUSTOMERS)
+        first = project.start(*same, "--format", "json")
+        harness.wait_for(
+            lambda: harness.count(url, SQL_LOADED) >= 2_000,
+            what="rows loaded",
+        )
+        # A retry of the job while its first try runs: a zombie pod.
+        started = time.monotonic()
+        retry = project.etl(*same, "--resume", "--format", "json")
+        took = time.monotonic() - started
+        output = first.communicate(timeout=300)[0]
+        loaded = harness.count(url, SQL_LOADED)
+        runs = project.runs(PIPELINE)
+    finally:
+        if backend == "postgres":
+            with admin.begin() as connection:
+                connection.exec_driver_sql(f'DROP SCHEMA "{schema}" CASCADE')
+        admin.dispose()
+
+    assert first.returncode == 0, output
+    assert loaded == CUSTOMERS + 2
+    if retry.returncode == 4:
+        # It waited for the lease a dead try would have let expire.
+        assert took >= lease, retry.stdout
+        assert harness.outcome(retry.stdout)["message"] == "already running"
+        assert [run["meta"]["label"] for run in runs] == ["same"]
+    else:
+        # The first try ended while the retry waited: one after the other.
+        assert retry.returncode == 0, retry.stdout + retry.stderr
+        later, earlier = runs[0], runs[1]
+        assert later["started_at"] >= earlier["completed_at"]
 
 
 def test_a_pipeline_that_cannot_be_built_exits_2(

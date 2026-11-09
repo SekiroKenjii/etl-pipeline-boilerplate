@@ -15,11 +15,12 @@ import dataclasses
 import enum
 import logging
 import threading
-from typing import Any
+import typing
 
 from core import contract
 
 _LOG = logging.getLogger(__name__)
+OK = "ok"
 
 
 class Scope(enum.StrEnum):
@@ -38,7 +39,8 @@ class ResourceSpec[T]:
         factory: Creates it; asks `Resources` for what it needs.
         scope: How long it lives.
         close: Releases it; nothing by default.
-        health: Raises if it does not work, e.g. pings a database.
+        health: Raises if it does not work, e.g. pings a database; returns
+            what works but is not as the ETL expects, or None.
         description: What it is, for `etl check`.
     """
 
@@ -46,8 +48,78 @@ class ResourceSpec[T]:
     factory: Callable[[Resources], T]
     scope: Scope = Scope.PROCESS
     close: Callable[[T], None] | None = None
-    health: Callable[[T], None] | None = None
+    health: Callable[[T], Sequence[str] | None] | None = None
     description: str = ""
+
+    @property
+    def checked(self) -> bool:
+        """Whether it has a health check."""
+        return self.health is not None
+
+    def create(self, resources: Resources) -> T:
+        """Creates the resource."""
+        return self.factory(resources)
+
+    def check(self, resource: object) -> Sequence[str]:
+        """Raises if the resource, which `create` made, does not work;
+        returns its warnings."""
+        if self.health is None:
+            return ()
+        return self.health(typing.cast(T, resource)) or ()
+
+    def release(self, resource: object) -> None:
+        """Closes the resource, which `create` made."""
+        if self.close is not None:
+            self.close(typing.cast(T, resource))
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class Health:
+    """What the check of a resource found.
+
+    Attributes:
+        status: `ok`, or what is wrong.
+        warnings: What works but is not as the ETL expects, e.g. a session
+            whose messages are not in English.
+    """
+
+    status: str
+    warnings: tuple[str, ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        """Whether the resource works."""
+        return self.status == OK
+
+
+class Declaration(typing.Protocol):
+    """A `ResourceSpec` of any type, as `Resources` uses it: what it creates
+    goes back to the same spec only."""
+
+    @property
+    def name(self) -> str:
+        ...
+
+    @property
+    def scope(self) -> Scope:
+        ...
+
+    @property
+    def description(self) -> str:
+        ...
+
+    @property
+    def checked(self) -> bool:
+        ...
+
+    def create(self, resources: Resources) -> object:
+        ...
+
+    def check(self, resource: object) -> Sequence[str]:
+        ...
+
+    def release(self, resource: object) -> None:
+        ...
 
 
 @dataclasses.dataclass(slots=True)
@@ -76,7 +148,7 @@ class Resources:
 
     def __init__(
         self,
-        specs: Sequence[ResourceSpec[Any]],
+        specs: Sequence[Declaration],
         *,
         scope: Scope = Scope.PROCESS,
         parent: Resources | None = None,
@@ -86,7 +158,7 @@ class Resources:
         Raises:
             PipelineConfigError: If two resources have the same name.
         """
-        by_name: dict[str, ResourceSpec[Any]] = {}
+        by_name: dict[str, Declaration] = {}
         for spec in specs:
             if spec.name in by_name:
                 raise contract.PipelineConfigError(
@@ -111,7 +183,7 @@ class Resources:
         """Every resource name, of this scope and the process's."""
         return sorted(self._specs)
 
-    def spec(self, name: str) -> ResourceSpec[Any]:
+    def spec(self, name: str) -> Declaration:
         """Returns the declaration of a resource.
 
         Raises:
@@ -187,12 +259,12 @@ class Resources:
                     del self._waiting[threading.get_ident()]
         return self._create(spec, creation)
 
-    def _create(self, spec: ResourceSpec[Any], creation: _Creation) -> object:
+    def _create(self, spec: Declaration, creation: _Creation) -> object:
         """Creates a resource this thread has claimed, out of the lock."""
         stack: list[str] = self._stack()
         stack.append(spec.name)
         try:
-            created = spec.factory(self)
+            created = spec.create(self)
         except BaseException:
             with self._lock:
                 del self._creating[spec.name]
@@ -209,8 +281,7 @@ class Resources:
         creation.done.set()
         if closed:
             # Closed meanwhile: nobody else would close it.
-            if spec.close is not None:
-                spec.close(created)
+            spec.release(created)
             self._check_open(spec.name)
         return created
 
@@ -273,22 +344,22 @@ class Resources:
         finally:
             run.close()
 
-    def health(self) -> dict[str, str]:
+    def health(self) -> dict[str, Health]:
         """Checks every process resource that can be checked.
 
         Returns:
-            `ok`, or what is wrong, by resource name.
+            By resource name, `ok` and its warnings, or what is wrong.
         """
-        report: dict[str, str] = {}
+        report: dict[str, Health] = {}
         for name, spec in sorted(self._specs.items()):
-            if spec.health is None or spec.scope is not Scope.PROCESS:
+            if not spec.checked or spec.scope is not Scope.PROCESS:
                 continue
             try:
-                spec.health(self.resolve(name))
-                report[name] = "ok"
+                warnings = tuple(spec.check(self.resolve(name)))
+                report[name] = Health(OK, warnings)
             # A check reports what is wrong, whatever it is.
             except Exception as exc:  # pylint: disable=broad-exception-caught
-                report[name] = f"{type(exc).__name__}: {exc}"
+                report[name] = Health(f"{type(exc).__name__}: {exc}")
         return report
 
     def close(self) -> None:
@@ -309,10 +380,8 @@ class Resources:
         for name in order:
             spec = self._specs[name]
             resource = self._created.pop(name)
-            if spec.close is None:
-                continue
             try:
-                spec.close(resource)
+                spec.release(resource)
             # Every resource gets closed: keep going, report the first.
             except Exception as exc:  # pylint: disable=broad-exception-caught
                 _LOG.exception("closing resource %s failed", name)

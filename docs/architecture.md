@@ -156,7 +156,8 @@ rules on every import; here are the ones that matter most:
   the calls through. Any other part of `infra` fails the test.
 
 `from core import mapping` counts as an import of `core.mapping`: the test
-reads the imports the way the project writes them.
+reads the imports the way the project writes them. `from x import *` is
+refused anywhere: it hides what it imports from the rules.
 
 Inside `core`:
 
@@ -180,6 +181,7 @@ flowchart TB
     keys --> pipeline
     mapping --> keys
     operators --> pipeline
+    operators -.-> keys
     cutover --> contract
     runtime --> pipeline
     observability --> contract
@@ -189,8 +191,26 @@ flowchart TB
     mapping_pipelines --> operators
 ```
 
-`mapping_pipelines` composes the others into the pipelines of a module built from
-a mapping workbook; no other part of `core` imports it.
+Each part imports only the parts below it, never one beside or above:
+the test holds each to an allow-list (`CORE_LAYERS`), so a new edge is
+refused until it is added there, and the list is ordered so that there is
+no cycle. `quality`, `state` and `cutover` import `contract` only;
+`observability` too (its run listeners implement
+`contract.PipelineListener`), so the engine logs through it without a
+cycle. `operators` also imports `keys` (the reconciliation canonicalises
+keys as the registry does) and `observability` (the metrics of change
+feeds). `mapping_pipelines` composes the others into the pipelines of a
+module built from a mapping workbook; no other part of `core` imports it.
+
+The same test refuses any cycle in `src/`: between two modules, or between
+two parts of a package through different modules, at every level. Every
+import counts, those of a `TYPE_CHECKING` block or of a function body too.
+And there are none: every import is at the top of its module, so what a
+module needs is what it imports, read at the top. The libraries the code
+imports are dependencies of the package; only the drivers SQLAlchemy loads
+by URL (SQL Server, Oracle, MySQL) are extras. Inside `contract`, the run context (`etl`) comes before the quality
+contract, which audits it, and the result of a step (`results`), which
+merges the quality reports, after both.
 
 ## 4. Ports and adapters
 
@@ -249,6 +269,22 @@ Only the components of a step (extractor, transformer, loader) have
 Messages are broker-neutral: an id, a key, a value, headers, a timestamp,
 and an opaque position the source compares (`covers`) and confirms. Kafka's
 partitions and offsets stay inside `infra.messaging.kafka`.
+
+### Where types live
+
+A type has one of three homes. What two layers or more share is a contract,
+in `core.contract` (generic value types, `JsonValue`, in `shared.utils`).
+What a package keeps to itself is in one file of each kind: `documents.py`
+for the shapes it stores or serializes (the MongoDB documents, the compiled
+mappings' JSON), `clients.py` for what it uses of a library's objects (the
+Google, Azure and confluent-kafka SDKs, openpyxl), `types.py` for the rest
+its modules share; only the package, `app`, the benchmarks and the tests
+import these files. A module's own aliases stay in it, private. The
+architecture tests refuse a `TypedDict`, a `Protocol` or a public alias
+anywhere else, a package's file used by another package, and a public enum
+out of `core.contract` and `cli.exit_codes`, unless it is listed with its
+reason;
+[the types reference](reference/types.md) shows them all.
 
 ## 5. A run
 
@@ -322,8 +358,8 @@ sequenceDiagram
   primary key's index is enough); the later runs read it by watermark, and
   want an index on `(watermark, key)`.
 - **Retries.** `--label` names the scheduler's job; with `--resume` a retry
-  resumes the run of its job, and takes over the locks a try that died
-  left. See {doc}`adr/0010-steps-locked-scale-out-by-the-scheduler`.
+  resumes the run of its job. It waits, up to the lease, for the locks
+  another try of the job holds: a dead try's expire, a live one's do not. See {doc}`adr/0010-steps-locked-scale-out-by-the-scheduler`.
 
 ## 6. A batch
 
@@ -360,6 +396,9 @@ flowchart TB
 - **Rejects never stop a run.** The circuit breaker (`max_reject_rate`)
   fails a batch that rejects too much, which is the sign of a broken
   mapping rather than of bad rows.
+- **No path holds a table.** [Algorithms](algorithms.md) lists the paths
+  that touch every row or key, each with its time and memory bound and the
+  test or benchmark that proves it.
 
 ## 7. The life of a migration
 

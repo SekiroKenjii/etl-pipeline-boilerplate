@@ -318,6 +318,40 @@ class TestWriter:
 
         assert backend.rows(contacts, "email") == []
 
+    @pytest.mark.parametrize(
+        "rows",
+        [
+            [{"tenant": "a", "email": None}],
+            # Half the batch matches: none of it is deleted.
+            [
+                {"tenant": "a", "email": "x@a.example"},
+                {"tenant": None, "email": "y"},
+            ],
+        ],
+        ids=["null", "null-after-a-match"],
+    )
+    def test_null_in_a_column_to_delete_by_is_refused(
+        self, backend: conftest.Backend, rows: list[contract.Row]
+    ) -> None:
+        # It would match no row: the delete would be lost, silently.
+        contacts = backend.table(
+            "contact",
+            sa.Column("tenant", sa.Unicode(10)),
+            sa.Column("email", sa.Unicode(50)),
+        )
+        backend.create()
+        backend.insert(
+            contacts,
+            {"tenant": "a", "email": "x@a.example"},
+            {"tenant": "a", "email": None},
+        )
+        writer = relational.RelationalTableWriter(backend.db)
+
+        with pytest.raises(contract.FatalError, match="NULL"):
+            writer.delete(contacts.name, rows)
+
+        assert len(backend.rows(contacts, "tenant", "email")) == 2
+
     def test_keys_equal_to_the_target_are_one_key(
         self, backend: conftest.Backend
     ) -> None:

@@ -1,16 +1,14 @@
-"""The resources of the settings: which adapter each setting means.
-
-Adapters are imported when their resource is first used: a deployment using
-SQL databases only needs no MongoDB driver.
-"""
+"""The resources of the settings: which adapter each setting means."""
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 import socket
-from typing import Any
 import urllib.parse
 
+import sqlalchemy as sa
+
+from app import types as app_types
 import config
 from core import contract
 from core import keys
@@ -18,9 +16,12 @@ from core import quality
 from core import runtime
 from core import state as core_state
 from core.runtime import names
-
-# Adapters need their family's extra: imported when a resource is created.
-# pylint: disable=import-outside-toplevel
+from infra import messaging
+from infra import storage
+from infra.database import mongodb
+from infra.database import relational
+from infra.messaging import kafka
+from infra.storage import gcs
 
 # Creating it creates or upgrades the ETL tables (`bookkeeping.create`).
 ETL_TABLES = "etl.tables"
@@ -30,19 +31,20 @@ OTLP = "endpoint.otlp"
 
 def resource_specs(
     settings: config.AppSettings,
-) -> list[runtime.ResourceSpec[Any]]:
+) -> list[runtime.Declaration]:
     """Returns every resource the settings describe."""
-    specs: list[runtime.ResourceSpec[Any]] = []
+    specs: list[runtime.Declaration] = []
+    tuning = settings.tuning.effective()
     for name, database in settings.databases.items():
         specs.extend(
             _mongodb_specs(name, database)
             if database.is_mongodb
-            else _relational_specs(name, database)
+            else _relational_specs(name, database, tuning)
         )
     for name, store in settings.stores.items():
         specs.append(_store_spec(name, store))
     for name, cluster in settings.kafka.items():
-        specs.append(_kafka_spec(name, cluster))
+        specs.append(_kafka_spec(name, cluster, settings.logging.redact))
     specs.extend(_bookkeeping_specs(settings))
     if settings.lineage is not None:
         specs.append(
@@ -86,15 +88,18 @@ def _endpoint_spec(
 
 
 def _relational_specs(
-    name: str, settings: config.DatabaseSettings
-) -> list[runtime.ResourceSpec[Any]]:
+    name: str,
+    settings: config.DatabaseSettings,
+    tuning: config.EffectiveTuning,
+) -> list[runtime.Declaration]:
     """A SQL database, and its table reader, writer and inspector."""
-    from infra.database import relational
 
     def create(_: runtime.Resources) -> relational.Database:
         db = relational.Database(
             settings.url.get_secret_value(),
             dialect=settings.dialect,
+            bulk_copy_rows=tuning.bulk_copy_rows.value,
+            in_chunk=tuning.in_chunk.value,
             **settings.options.arguments(),
         )
         return db
@@ -102,15 +107,14 @@ def _relational_specs(
     def close(db: relational.Database) -> None:
         db.close()
 
-    def ping(db: relational.Database) -> None:
-        import sqlalchemy as sa
-
+    def ping(db: relational.Database) -> list[str]:
         with db.connect("checking the database") as connection:
             connection.execute(sa.select(1))
+            return db.dialect.session_warnings(connection)
 
     database = names.database(name)
     return [
-        runtime.ResourceSpec(
+        runtime.ResourceSpec[relational.Database](
             database,
             create,
             close=close,
@@ -150,13 +154,14 @@ def _relational_specs(
 
 def _mongodb_specs(
     name: str, settings: config.DatabaseSettings
-) -> list[runtime.ResourceSpec[Any]]:
+) -> list[runtime.Declaration]:
     """A MongoDB database, and its collection reader, writer and inspector."""
-    from infra.database import mongodb
 
     def create(_: runtime.Resources) -> mongodb.MongoDatabase:
         db = mongodb.MongoDatabase(
-            settings.url.get_secret_value(), **settings.options.arguments()
+            settings.url.get_secret_value(),
+            database=None,
+            **settings.options.arguments(),
         )
         return db
 
@@ -168,7 +173,7 @@ def _mongodb_specs(
 
     database = names.database(name)
     return [
-        runtime.ResourceSpec(
+        runtime.ResourceSpec[mongodb.MongoDatabase](
             database,
             create,
             close=close,
@@ -216,9 +221,6 @@ def _changes_spec(
     cluster = names.kafka(changes.kafka)
 
     def debezium(resources: runtime.Resources) -> contract.IChangeLog:
-        from infra import messaging
-        from infra.messaging import kafka
-
         found = resources.get(cluster, kafka.KafkaCluster)
         return messaging.DebeziumChangeLog(
             found,
@@ -239,20 +241,19 @@ def _changes_spec(
 
 
 def _kafka_spec(
-    name: str, settings: config.KafkaSettings
-) -> runtime.ResourceSpec[Any]:
+    name: str, settings: config.KafkaSettings, redact: Collection[str]
+) -> runtime.ResourceSpec[kafka.KafkaCluster]:
     """A Kafka cluster: its topics."""
 
-    def create(_: runtime.Resources) -> contract.IMessageLog:
-        from infra.messaging import kafka
-
+    def create(_: runtime.Resources) -> kafka.KafkaCluster:
         return kafka.KafkaCluster(
             settings.librdkafka(),
             group_id=settings.group_id,
             timeout_seconds=settings.timeout_seconds,
+            redact=redact,
         )
 
-    def ping(cluster: Any) -> None:
+    def ping(cluster: kafka.KafkaCluster) -> None:
         cluster.ping()
 
     return runtime.ResourceSpec(
@@ -265,17 +266,13 @@ def _kafka_spec(
 
 def _store_spec(
     name: str, settings: config.StoreSettings
-) -> runtime.ResourceSpec[Any]:
+) -> runtime.ResourceSpec[contract.IObjectStore]:
     """A file or blob store."""
 
     def create(_: runtime.Resources) -> contract.IObjectStore:
         if settings.kind == "gcs" and settings.bucket is not None:
-            from infra.storage import gcs
-
             return gcs.GcsObjectStore(settings.bucket, project=settings.project)
         if settings.kind == "local" and settings.path is not None:
-            from infra import storage
-
             return storage.LocalObjectStore(settings.path)
         raise contract.PipelineConfigError(f"Store {name!r} is incomplete")
 
@@ -298,9 +295,10 @@ def _store_spec(
 
 def _bookkeeping_specs(
     settings: config.AppSettings,
-) -> list[runtime.ResourceSpec[Any]]:
+) -> list[runtime.Declaration]:
     """The ETL's records: in a database if named, else in files."""
     book = settings.bookkeeping
+    tuning = settings.tuning.effective()
     if book.database is None:
         directory = book.directory
 
@@ -314,11 +312,8 @@ def _bookkeeping_specs(
                 names.STATE,
                 lambda _: core_state.JsonFileStateStore(directory / "state"),
             ),
-            runtime.ResourceSpec(
-                names.KEYS,
-                lambda _: keys.CachedKeyRegistry(
-                    keys.JsonLinesKeyRegistry(directory / "keys")
-                ),
+            _key_cache(
+                tuning, lambda _: keys.JsonLinesKeyRegistry(directory / "keys")
             ),
             runtime.ResourceSpec(
                 names.QUARANTINE,
@@ -339,20 +334,38 @@ def _bookkeeping_specs(
 
     database = settings.databases[book.database]
     if database.is_mongodb:
-        return _mongodb_bookkeeping(names.database(book.database), book)
-    return _relational_bookkeeping(names.database(book.database), book)
+        return _mongodb_bookkeeping(names.database(book.database), book, tuning)
+    return _relational_bookkeeping(names.database(book.database), book, tuning)
+
+
+def _key_cache(
+    tuning: config.EffectiveTuning,
+    registry: Callable[[runtime.Resources], contract.IKeyRegistry],
+) -> runtime.ResourceSpec[keys.TieredKeyCache]:
+    """The key registry behind the process's cache, in memory then on disk
+    under `$TMPDIR`, as `tuning.key_cache_memory` and `key_cache_disk` size
+    them."""
+    return runtime.ResourceSpec(
+        names.KEYS,
+        lambda r: keys.TieredKeyCache(
+            registry(r),
+            memory_budget=tuning.key_cache_memory.value,
+            disk_budget=tuning.key_cache_disk.value,
+        ),
+        close=lambda cache: cache.close(),
+        description="the key registry, behind the key cache",
+    )
 
 
 def _relational_bookkeeping(
-    database: str, book: config.BookkeepingSettings
-) -> list[runtime.ResourceSpec[Any]]:
+    database: str,
+    book: config.BookkeepingSettings,
+    tuning: config.EffectiveTuning,
+) -> list[runtime.Declaration]:
     """The ETL's records in the `etl_*` tables of a SQL database."""
-    from infra.database import relational
-
-    options: dict[str, Any] = {
-        "schema": book.schema_name,
-        "prefix": book.prefix,
-    }
+    options = app_types.TablesOptions(
+        schema=book.schema_name, prefix=book.prefix
+    )
 
     def tables(resources: runtime.Resources) -> relational.Database:
         found = resources.get(database, relational.Database)
@@ -374,7 +387,7 @@ def _relational_bookkeeping(
         return resources.get(ETL_TABLES, relational.Database)
 
     return [
-        runtime.ResourceSpec(
+        runtime.ResourceSpec[relational.Database](
             ETL_TABLES,
             tables,
             health=check,
@@ -384,11 +397,9 @@ def _relational_bookkeeping(
             names.STATE,
             lambda r: relational.RelationalStateStore(db(r), **options),
         ),
-        runtime.ResourceSpec(
-            names.KEYS,
-            lambda r: keys.CachedKeyRegistry(
-                relational.RelationalKeyRegistry(db(r), **options)
-            ),
+        _key_cache(
+            tuning,
+            lambda r: relational.RelationalKeyRegistry(db(r), **options),
         ),
         runtime.ResourceSpec(
             names.QUARANTINE,
@@ -413,10 +424,11 @@ def _relational_bookkeeping(
 
 
 def _mongodb_bookkeeping(
-    database: str, book: config.BookkeepingSettings
-) -> list[runtime.ResourceSpec[Any]]:
+    database: str,
+    book: config.BookkeepingSettings,
+    tuning: config.EffectiveTuning,
+) -> list[runtime.Declaration]:
     """The ETL's records in the `etl_*` collections of MongoDB."""
-    from infra.database import mongodb
 
     def collections(resources: runtime.Resources) -> mongodb.MongoDatabase:
         found = resources.get(database, mongodb.MongoDatabase)
@@ -428,6 +440,7 @@ def _mongodb_bookkeeping(
         return resources.get(ETL_TABLES, mongodb.MongoDatabase)
 
     prefix = book.prefix
+    chunk = tuning.in_chunk.value
     return [
         runtime.ResourceSpec(
             ETL_TABLES,
@@ -437,10 +450,10 @@ def _mongodb_bookkeeping(
         runtime.ResourceSpec(
             names.STATE, lambda r: mongodb.MongoStateStore(db(r), prefix=prefix)
         ),
-        runtime.ResourceSpec(
-            names.KEYS,
-            lambda r: keys.CachedKeyRegistry(
-                mongodb.MongoKeyRegistry(db(r), prefix=prefix)
+        _key_cache(
+            tuning,
+            lambda r: mongodb.MongoKeyRegistry(
+                db(r), prefix=prefix, in_chunk=chunk
             ),
         ),
         runtime.ResourceSpec(
@@ -467,13 +480,13 @@ class _RelationalChangeLog(contract.IChangeLog):
     """The change log a SQL database has: Change Tracking, or logical
     replication."""
 
-    def __init__(self, db: Any, settings: config.DatabaseSettings) -> None:
+    def __init__(
+        self, db: relational.Database, settings: config.DatabaseSettings
+    ) -> None:
         self._db = db
         self._prefix = settings.replication_prefix
 
     def source(self, table: str) -> contract.IChangeSource:
-        from infra.database import relational
-
         dialect = self._db.name
         if dialect == "mssql":
             return relational.SqlServerChangeTracking(self._db, table)
@@ -492,10 +505,8 @@ class _RelationalChangeLog(contract.IChangeLog):
 class _MongoChangeLog(contract.IChangeLog):
     """MongoDB change streams."""
 
-    def __init__(self, db: Any) -> None:
+    def __init__(self, db: mongodb.MongoDatabase) -> None:
         self._db = db
 
     def source(self, table: str) -> contract.IChangeSource:
-        from infra.database import mongodb
-
         return mongodb.MongoChangeStream(self._db, table)

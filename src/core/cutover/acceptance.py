@@ -10,6 +10,9 @@ A CSV in the columns of the report's rejected rows:
 Each line accepts up to `rows` rows rejected for that reason; `*` for any
 reason. A row rejected for several reasons is accepted when each of them is,
 or by a `*`. Rejected rows beyond what is accepted are a mismatch.
+
+The entities accepted empty on both sides (`empty`) are given apart
+(`etl cutover report --accept-empty`): an empty entity fails otherwise.
 """
 
 from __future__ import annotations
@@ -20,7 +23,6 @@ import dataclasses
 import hashlib
 import io
 import pathlib
-from typing import Any
 
 ANY = "*"
 _COLUMNS = ("entity", "reason", "rows")
@@ -34,11 +36,13 @@ class AcceptedRejections:
         rows: Per entity, per reason (`ANY` for any), the most rows accepted.
         source: The file the decision was read from.
         digest: Its SHA-256: the report quotes it.
+        empty: The entities accepted empty on both sides (`ANY` for any).
     """
 
     rows: Mapping[str, Mapping[str, int]]
     source: str = ""
     digest: str = ""
+    empty: frozenset[str] = frozenset()
 
     @classmethod
     def from_csv(cls, path: pathlib.Path | str) -> AcceptedRejections:
@@ -89,7 +93,11 @@ class AcceptedRejections:
         """What is accepted of an entity: rows by reason."""
         return self.rows.get(entity, {})
 
-    def as_dict(self) -> dict[str, Any]:
+    def accepts_empty(self, entity: str) -> bool:
+        """Whether an entity may be empty on both sides."""
+        return bool({entity, ANY} & self.empty)
+
+    def as_dict(self) -> dict[str, object]:
         """The decision as JSON-compatible data, for the report."""
         return {
             "source": self.source,
@@ -97,6 +105,7 @@ class AcceptedRejections:
             "rows": {
                 entity: dict(found) for entity, found in self.rows.items()
             },
+            "empty": sorted(self.empty),
         }
 
 

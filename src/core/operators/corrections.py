@@ -14,10 +14,10 @@ from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
 import csv
 import dataclasses
 import pathlib
-from typing import Any
 
 from core import contract
 from core import pipeline
+from core.operators import types as operators_types
 
 # Export's own columns (`_id`, `_issues`): never taken for source columns.
 EXPORT_PREFIX = "_"
@@ -122,17 +122,24 @@ class Corrections:
         return {**row, **fixed} if fixed else row
 
     def transformer(
-        self, scope: str, key: Callable[[Any], str]
+        self, scope: str, key: Callable[[operators_types.SourceRecord], str]
     ) -> CorrectionsTransformer:
         """Returns a transformer correcting the rows (or changes) of `scope`."""
         return CorrectionsTransformer(self, scope, key)
 
 
-class CorrectionsTransformer(pipeline.IDataTransformer[Any, Any]):
+class CorrectionsTransformer(
+    pipeline.IDataTransformer[
+        operators_types.SourceRecord, operators_types.SourceRecord
+    ]
+):
     """Corrects rows, or the rows of changes, before their mapping."""
 
     def __init__(
-        self, corrections: Corrections, scope: str, key: Callable[[Any], str]
+        self,
+        corrections: Corrections,
+        scope: str,
+        key: Callable[[operators_types.SourceRecord], str],
     ) -> None:
         self._corrections = corrections
         self._scope = scope
@@ -144,8 +151,13 @@ class CorrectionsTransformer(pipeline.IDataTransformer[Any, Any]):
         return f"{type(self).__name__}({self._scope})"
 
     def transform(
-        self, records: Iterable[Any], ctx: contract.ETLContext
-    ) -> Iterator[Any]:
+        self,
+        records: Iterable[operators_types.SourceRecord],
+        ctx: contract.ETLContext,
+    ) -> Iterator[operators_types.SourceRecord]:
+        if not self._corrections.fixes.get(self._scope):
+            yield from records
+            return
         for record in records:
             row = (
                 record.row

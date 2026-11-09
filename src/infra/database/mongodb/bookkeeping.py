@@ -11,24 +11,31 @@ from __future__ import annotations
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 import dataclasses
 import datetime
+import itertools
 import json
+import re
 import time
-from typing import Any
+from typing import cast
 
 from bson import objectid
 import pymongo
+from pymongo import collection as mongo_collection
 from pymongo import errors as mongo_errors
 
 from core import contract
 from infra.database.mongodb import client
+from infra.database.mongodb import documents as mongo_documents
 from shared import utils
 
 DEFAULT_PREFIX = "etl_"
-_CHUNK = 1000
+# Ids per `$in` where nothing else bounds them (`tuning.in_chunk`).
+DEFAULT_IN_CHUNK = 1000
 _PAGE_SIZE = 1000
 
 _ENTITY = "_id.entity"
+_OPENED = contract.QuarantineStatus.OPEN.value
 _SET_ON_INSERT = "$setOnInsert"
+_READING_RUNS = "reading the runs"
 
 
 def create_etl_collections(
@@ -51,9 +58,7 @@ def create_etl_collections(
         db.collection(f"{prefix}quarantine").create_index(
             [("status", 1), ("pipeline", 1)]
         )
-        db.collection(f"{prefix}quarantine").create_index(
-            [("pipeline", 1), ("record_key", 1)]
-        )
+        _one_open_entry_per_record(db.collection(f"{prefix}quarantine"))
         db.collection(f"{prefix}quality_issues").create_index(
             [("record_id", 1)]
         )
@@ -62,6 +67,100 @@ def create_etl_collections(
             [("pipeline", 1), ("started_at", -1)]
         )
         db.collection(f"{prefix}run_steps").create_index([("run_id", 1)])
+
+
+_OPEN_ENTRY_INDEX = "one_open_entry_per_record"
+# The index of `record_key` of release 0.1.0, not unique.
+_RECORD_KEY_INDEX = "pipeline_1_record_key_1"
+_INDEX_NOT_FOUND = 27
+
+
+def _one_open_entry_per_record(
+    quarantine: mongo_collection.Collection[mongo_documents.Document],
+) -> None:
+    """Makes the open entries of a record unique, once.
+
+    Of the open entries of a record an older release left, the latest keeps
+    the key; the others, still open, get one of their own, `legacy-<id>`.
+    Nothing is deleted. The unique index replaces the index of older
+    releases.
+
+    Raises:
+        FatalError: If writers of an older release keep adding open entries
+            of a record while the index is created.
+    """
+    indexes = quarantine.index_information()
+    if _OPEN_ENTRY_INDEX not in indexes:
+
+        def attempt() -> None:
+            with client.errors("making the open quarantine entries unique"):
+                _rekey_older_open_entries(quarantine)
+                quarantine.create_index(
+                    [("pipeline", 1), ("record_key", 1)],
+                    name=_OPEN_ENTRY_INDEX,
+                    unique=True,
+                    partialFilterExpression={"status": _OPENED},
+                )
+
+        try:
+            utils.retry(
+                attempt,
+                when=lambda exc: client.is_duplicate_key(exc.__cause__),
+                attempts=3,
+            )
+        except contract.FatalError as exc:
+            if not client.is_duplicate_key(exc.__cause__):
+                raise
+            raise contract.FatalError(
+                f"{quarantine.name}: records keep getting a second open entry"
+                " while their open entries are made unique. Stop the ETL"
+                " processes of release 0.1.0, then run `etl-db upgrade`"
+                " again."
+            ) from exc
+    if _RECORD_KEY_INDEX in indexes:
+        with client.errors("dropping the index of 0.1.0 of the quarantine"):
+            try:
+                quarantine.drop_index(_RECORD_KEY_INDEX)
+            except mongo_errors.OperationFailure as exc:
+                # Another process upgrading at once dropped it first.
+                if exc.code != _INDEX_NOT_FOUND:
+                    raise
+
+
+def _rekey_older_open_entries(
+    quarantine: mongo_collection.Collection[mongo_documents.Document],
+) -> None:
+    """Gives every open entry but the latest of a record a key of its own."""
+    doubled = quarantine.aggregate(
+        [
+            {"$match": {"status": _OPENED}},
+            {"$sort": {"rejected_at": 1, "_id": 1}},
+            {
+                "$group": {
+                    "_id": {"p": "$pipeline", "k": "$record_key"},
+                    "ids": {"$push": "$_id"},
+                }
+            },
+            {"$match": {"ids.1": {"$exists": True}}},
+        ],
+        allowDiskUse=True,
+    )
+    older = [
+        id_
+        for group in doubled
+        for id_ in cast(mongo_documents.DuplicatesDocument, group)["ids"][:-1]
+    ]
+    for chunk in itertools.batched(older, DEFAULT_IN_CHUNK):
+        quarantine.bulk_write(
+            [
+                pymongo.UpdateOne(
+                    {"_id": id_, "status": _OPENED},
+                    {"$set": {"record_key": f"legacy-{id_}"}},
+                )
+                for id_ in chunk
+            ],
+            ordered=False,
+        )
 
 
 def drop_etl_collections(
@@ -82,9 +181,22 @@ def drop_etl_collections(
             db.collection(f"{prefix}{name}").drop()
 
 
-def _jsonable(value: object) -> Any:
+def _jsonable(value: object) -> contract.StateValue:
     """Turns any value into BSON-friendly data, through `to_jsonable`."""
-    return json.loads(json.dumps(value, default=utils.to_jsonable))
+    loaded: contract.StateValue = json.loads(
+        json.dumps(value, default=utils.to_jsonable)
+    )
+    return loaded
+
+
+def _jsonable_fields(
+    fields: Mapping[str, object],
+) -> dict[str, contract.StateValue]:
+    """`_jsonable`, of fields: a dict."""
+    loaded: dict[str, contract.StateValue] = json.loads(
+        json.dumps(fields, default=utils.to_jsonable)
+    )
+    return loaded
 
 
 class _Bookkeeper(client.MongoAdapter):
@@ -105,10 +217,14 @@ class _Bookkeeper(client.MongoAdapter):
         self.collection_name = f"{prefix}{self.suffix}"
 
     @property
-    def collection(self) -> Any:
+    def collection(
+        self,
+    ) -> mongo_collection.Collection[mongo_documents.Document]:
         return self.db.collection(self.collection_name)
 
-    def _upsert(self, action: str, operations: list[Any]) -> None:
+    def _upsert(
+        self, action: str, operations: Sequence[pymongo.UpdateOne]
+    ) -> None:
         """Runs upserts, again when a concurrent writer inserted first."""
 
         def attempt() -> None:
@@ -123,10 +239,35 @@ class _Bookkeeper(client.MongoAdapter):
 class MongoKeyRegistry(_Bookkeeper, contract.IKeyRegistry):
     """The crosswalk of loaded keys, in `etl_key_registry`.
 
-    Put a `keys.CachedKeyRegistry` in front of it to save round trips.
+    Put a `keys.TieredKeyCache` in front of it to save round trips.
+
+    Attributes:
+        in_chunk: The keys looked up per `$in` query.
     """
 
     suffix = "key_registry"
+
+    def __init__(
+        self,
+        db: client.MongoDatabase | str,
+        *,
+        prefix: str = DEFAULT_PREFIX,
+        in_chunk: int | None = None,
+    ) -> None:
+        """Initializes the registry.
+
+        Args:
+            db: A shared database, or a MongoDB URI.
+            prefix: The prefix of the collection names.
+            in_chunk: The keys looked up per `$in` query; 1,000 if None.
+
+        Raises:
+            ValueError: If `in_chunk` is below 1.
+        """
+        if in_chunk is not None and in_chunk < 1:
+            raise ValueError("in_chunk must be >= 1")
+        super().__init__(db, prefix=prefix)
+        self.in_chunk = in_chunk or DEFAULT_IN_CHUNK
 
     def register(self, entries: Sequence[contract.KeyEntry]) -> None:
         unique = {(e.entity, e.surrogate_key): e for e in entries}
@@ -154,10 +295,13 @@ class MongoKeyRegistry(_Bookkeeper, contract.IKeyRegistry):
         keys = list(surrogate_keys)
         found: set[str] = set()
         with client.errors(f"looking up {entity} keys"):
-            for start in range(0, len(keys), _CHUNK):
-                ids = [_key_id(entity, k) for k in keys[start : start + _CHUNK]]
+            for start in range(0, len(keys), self.in_chunk):
+                ids = [
+                    _key_id(entity, k)
+                    for k in keys[start : start + self.in_chunk]
+                ]
                 found.update(
-                    document["_id"]["key"]
+                    cast(mongo_documents.KeyDocument, document)["_id"]["key"]
                     for document in self.collection.find(
                         {"_id": {"$in": ids}}, {"_id": 1}
                     )
@@ -167,7 +311,7 @@ class MongoKeyRegistry(_Bookkeeper, contract.IKeyRegistry):
     def entries(self, entity: str) -> Iterator[contract.KeyEntry]:
         after: str | None = None
         while True:
-            query: client.Document = {_ENTITY: entity}
+            query: mongo_documents.Document = {_ENTITY: entity}
             if after is not None:
                 query["_id.key"] = {"$gt": after}
             with client.errors(f"reading the {entity} keys"):
@@ -178,15 +322,18 @@ class MongoKeyRegistry(_Bookkeeper, contract.IKeyRegistry):
                         limit=_PAGE_SIZE,
                     )
                 )
-            for document in page:
+            keys = [
+                cast(mongo_documents.KeyDocument, document) for document in page
+            ]
+            for document in keys:
                 yield contract.KeyEntry(
                     entity,
                     document["_id"]["key"],
                     tuple(document["natural_key"]),
                 )
-            if len(page) < _PAGE_SIZE:
+            if len(keys) < _PAGE_SIZE:
                 return
-            after = page[-1]["_id"]["key"]
+            after = keys[-1]["_id"]["key"]
 
     def natural_key(
         self, entity: str, surrogate_key: str
@@ -195,13 +342,18 @@ class MongoKeyRegistry(_Bookkeeper, contract.IKeyRegistry):
             found = self.collection.find_one(
                 {"_id": _key_id(entity, surrogate_key)}
             )
-        return None if found is None else tuple(found["natural_key"])
+        return (
+            None
+            if found is None
+            else tuple(cast(mongo_documents.KeyDocument, found)["natural_key"])
+        )
 
     def forget(self, entity: str, natural_key: Sequence[str]) -> list[str]:
         query = {_ENTITY: entity, "natural_key": list(natural_key)}
         with client.errors(f"forgetting a key of {entity}"):
             gone = [
-                d["_id"]["key"] for d in self.collection.find(query, {"_id": 1})
+                cast(mongo_documents.KeyDocument, d)["_id"]["key"]
+                for d in self.collection.find(query, {"_id": 1})
             ]
             self.collection.delete_many(query)
         return gone
@@ -220,8 +372,11 @@ class MongoStateStore(_Bookkeeper, contract.IStateStore):
     def get(self, namespace: str, key: str) -> contract.StateValue:
         with client.errors(f"reading the state {namespace}/{key}"):
             found = self.collection.find_one({"_id": _state_id(namespace, key)})
-        value: contract.StateValue = None if found is None else found["value"]
-        return value
+        return (
+            None
+            if found is None
+            else cast(mongo_documents.StateDocument, found)["value"]
+        )
 
     def set(self, namespace: str, key: str, value: contract.StateValue) -> None:
         with client.errors(f"saving the state {namespace}/{key}"):
@@ -273,7 +428,7 @@ class MongoParkingLot(_Bookkeeper, contract.IParkingLot):
     def entries(self, queue: str) -> Iterator[contract.ParkedEntry]:
         after: str | None = None
         while True:
-            query: client.Document = {"_id.queue": queue}
+            query: mongo_documents.Document = {"_id.queue": queue}
             if after is not None:
                 query["_id.identity"] = {"$gt": after}
             with client.errors(f"reading the parked {queue}"):
@@ -284,7 +439,11 @@ class MongoParkingLot(_Bookkeeper, contract.IParkingLot):
                         limit=_PAGE_SIZE,
                     )
                 )
-            for document in page:
+            parked = [
+                cast(mongo_documents.ParkedDocument, document)
+                for document in page
+            ]
+            for document in parked:
                 yield contract.ParkedEntry(
                     document["_id"]["identity"],
                     document["payload"],
@@ -292,9 +451,9 @@ class MongoParkingLot(_Bookkeeper, contract.IParkingLot):
                     document["attempts"],
                     document["parked_at"],
                 )
-            if len(page) < _PAGE_SIZE:
+            if len(parked) < _PAGE_SIZE:
                 return
-            after = page[-1]["_id"]["identity"]
+            after = parked[-1]["_id"]["identity"]
 
     def release(
         self, queue: str, entries: Sequence[contract.ParkedEntry]
@@ -344,17 +503,21 @@ class MongoQuarantine(_Bookkeeper, contract.IQuarantine):
 
     def put(
         self,
-        records: Sequence[contract.RejectedRecord[Any]],
+        records: Sequence[contract.RejectedRecord[object]],
         ctx: contract.ETLContext,
     ) -> None:
         """See `contract.IQuarantine.put`: a record rejected again updates
-        its open entry, keeping its id."""
+        its open entry, keeping its id.
+
+        Safe for steps rejecting the same record at once once the open
+        entries are unique (`create_etl_collections`): a writer whose upsert
+        collides with another's tries again, then updates its entry.
+        """
         if not records:
             return
         pipeline = ctx.run.pipeline_name
-        opened = contract.QuarantineStatus.OPEN.value
         now = utils.utc_now()
-        documents: dict[str, dict[str, Any]] = {}
+        documents: dict[str, dict[str, object]] = {}
         for rejected in records:
             record = _jsonable(
                 self._serialize(rejected.record)
@@ -374,37 +537,21 @@ class MongoQuarantine(_Bookkeeper, contract.IQuarantine):
                 ),
                 "rejected_at": now,
             }
-        with client.errors(f"quarantining {len(documents)} record(s)"):
-            open_ids = {
-                found["record_key"]: found["_id"]
-                for found in self.collection.find(
+        self._upsert(
+            f"quarantining {len(documents)} record(s)",
+            [
+                pymongo.UpdateOne(
                     {
                         "pipeline": pipeline,
-                        "status": opened,
-                        "record_key": {"$in": list(documents)},
+                        "record_key": key,
+                        "status": _OPENED,
                     },
-                    {"record_key": 1},
+                    {"$set": document},
+                    upsert=True,
                 )
-            }
-            self.collection.bulk_write(
-                [
-                    (
-                        pymongo.UpdateOne(
-                            {"_id": open_ids[key], "status": opened},
-                            {"$set": document},
-                        )
-                        if key in open_ids
-                        else pymongo.InsertOne({
-                            "pipeline": pipeline,
-                            "record_key": key,
-                            "status": opened,
-                            **document,
-                        })
-                    )
-                    for key, document in documents.items()
-                ],
-                ordered=False,
-            )
+                for key, document in documents.items()
+            ],
+        )
 
     def entries(
         self,
@@ -413,13 +560,14 @@ class MongoQuarantine(_Bookkeeper, contract.IQuarantine):
             contract.QuarantineStatus.OPEN
         ),
     ) -> Iterator[contract.QuarantineEntry]:
-        query: dict[str, Any] = {}
+        query: mongo_documents.Document = {}
         if pipeline is not None:
             query["pipeline"] = pipeline
         if status is not None:
             query["status"] = status.value
         with client.errors("reading the quarantine"):
-            for document in self.collection.find(query).sort("_id", 1):
+            for found in self.collection.find(query).sort("_id", 1):
+                document = cast(mongo_documents.QuarantineDocument, found)
                 yield contract.QuarantineEntry(
                     id=str(document["_id"]),
                     pipeline=document["pipeline"],
@@ -482,7 +630,7 @@ class MongoIssueSink(_Bookkeeper, contract.IIssueSink):
                 {
                     "pipeline": ctx.run.pipeline_name,
                     "run_id": ctx.run.run_id,
-                    **_jsonable(issue.as_dict()),
+                    **_jsonable_fields(issue.as_dict()),
                     "found_at": now,
                 }
                 for issue in issues
@@ -575,7 +723,7 @@ class MongoRunLedger(_Bookkeeper, contract.IRunLedger):
         self, pipeline_name: str | None, limit: int = 20
     ) -> list[contract.RunRecord]:
         query = {} if pipeline_name is None else {"pipeline": pipeline_name}
-        with client.errors("reading the runs"):
+        with client.errors(_READING_RUNS):
             documents = list(
                 self.collection.find(
                     query,
@@ -605,12 +753,48 @@ class MongoRunLedger(_Bookkeeper, contract.IRunLedger):
                     host=step.get("host", ""),
                     attempts=int(step.get("attempts", 1)),
                 )
-                for step in steps
+                for step in (
+                    cast(mongo_documents.StepDocument, found) for found in steps
+                )
             },
         )
 
+    def latest(
+        self,
+        pipeline_prefix: str,
+        statuses: Collection[contract.ETLStatus],
+        meta_key: str,
+    ) -> contract.RunRecord | None:
+        query = {
+            "pipeline": {"$regex": f"^{re.escape(pipeline_prefix)}"},
+            "status": {"$in": [status.value for status in statuses]},
+            "dry_run": {"$ne": True},
+            f"meta.{meta_key}": {"$exists": True},
+        }
+        with client.errors(_READING_RUNS):
+            document = self.collection.find_one(
+                query, sort=[("started_at", pymongo.DESCENDING)]
+            )
+        return None if document is None else _run_record(document)
 
-def _run_record(document: Mapping[str, Any]) -> contract.RunRecord:
+    def last_run(
+        self, pipeline_name: str, label: str | None = None
+    ) -> contract.RunRecord | None:
+        query: dict[str, object] = {
+            "pipeline": pipeline_name,
+            "dry_run": {"$ne": True},
+        }
+        if label is not None:
+            query["meta.label"] = label
+        with client.errors(_READING_RUNS):
+            document = self.collection.find_one(
+                query, sort=[("started_at", pymongo.DESCENDING)]
+            )
+        return None if document is None else _run_record(document)
+
+
+def _run_record(found: mongo_documents.Document) -> contract.RunRecord:
+    document = cast(mongo_documents.RunDocument, found)
     return contract.RunRecord(
         run_id=document["_id"],
         pipeline=document["pipeline"],
@@ -665,3 +849,10 @@ class MongoRunLock(_Bookkeeper, contract.IRunLock):
     def release(self, name: str, owner: str) -> None:
         with client.errors(f"releasing the lock {name}"):
             self.collection.delete_one({"_id": name, "owner": owner})
+
+    def holder(self, name: str) -> str | None:
+        with client.errors(f"reading the lock {name}"):
+            found = self.collection.find_one(
+                {"_id": name, "expires_at": {"$gte": time.time()}}
+            )
+        return None if found is None else str(found["owner"])

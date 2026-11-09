@@ -11,11 +11,12 @@ deletes, then the cutover counts. Each task runs the ETL's image with
   run, say). A locked night fails, and alerts: it is never skipped.
 
 Each run is labelled with its DAG run and task (`--label`), and a retry
-resumes it (`--resume`): it runs the steps the failed try did not finish,
-and takes over the locks of a try that died (OOM). The next DAG run is
-another label: every step runs. Airflow starts a retry once the try
-failed: its pod exited, or was deleted on a timeout, and `retry_delay`
-outlasts the pod's grace period, so two tries of a task never run at once.
+resumes it (`--resume`): it runs the steps the failed try did not finish.
+The step locks are the try's process's: a retry waits, up to the lease,
+for those of the try before it. A try that died (OOM) frees them within
+that time; a zombie try still running (its worker lost, its pod alive)
+keeps them, and the retry exits 4 rather than run the same steps at once.
+The next DAG run is another label: every step runs.
 
 Settings come from the environment of the Airflow workers:
 

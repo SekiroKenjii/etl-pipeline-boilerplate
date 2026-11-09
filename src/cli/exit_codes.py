@@ -6,8 +6,11 @@ One table, whichever command a scheduler, a CI job or a script runs:
 |------|-----------------|--------------------------------------------|--------|
 | 0    | SUCCESS         | Done.                                      |        |
 | 1    | FAILED          | A run failed (a source down, a lock lost), | yes    |
+|      |                 | a command's bookkeeping is unreachable,    | yes    |
 |      |                 | or a cutover report or verification did.   | no     |
-| 2    | INVALID         | Bad arguments, settings, workbook or file. | no     |
+| 2    | INVALID         | Bad arguments, settings, workbook or file; | no     |
+|      |                 | a refusal the operator must confirm        |        |
+|      |                 | (`--param confirm_deletes=...`).           |        |
 | 3    | PARTIAL_SUCCESS | Done, some rows rejected.                  | no     |
 | 4    | LOCKED          | Steps held by another run: nothing ran.    | later  |
 | 5    | NOT_READY       | `etl check`: a resource cannot be reached; | later  |

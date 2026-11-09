@@ -3,19 +3,14 @@
 from __future__ import annotations
 
 import abc
-from collections.abc import Callable, Mapping, Sequence
-from typing import Any
+from collections.abc import Mapping, Sequence
 
 from core import contract
-from core import pipeline
 from core.runtime import resources as runtime_resources
+from core.runtime import types as runtime_types
 
 # A change of this fingerprint entry blocks runs, unless `etl run --rekey`.
 KEYS = "keys"
-
-type PipelineFactory = Callable[
-    [runtime_resources.Resources], pipeline.BaseOrchestrator
-]
 
 
 class Module(abc.ABC):
@@ -36,12 +31,12 @@ class Module(abc.ABC):
     def name(self) -> str:
         """The name of the module: the prefix of its pipelines."""
 
-    def resources(self) -> Sequence[runtime_resources.ResourceSpec[Any]]:
+    def resources(self) -> Sequence[runtime_resources.Declaration]:
         """Returns the resources only this module uses; none by default."""
         return ()
 
     @abc.abstractmethod
-    def pipelines(self) -> Mapping[str, PipelineFactory]:
+    def pipelines(self) -> Mapping[str, runtime_types.PipelineFactory]:
         """Returns the pipelines of the module, by name (`full_load`...)."""
 
     def fingerprint(self) -> Mapping[str, str]:

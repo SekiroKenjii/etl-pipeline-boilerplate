@@ -4,14 +4,15 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
 import threading
-from typing import Any
 
 import pymongo
+from pymongo import collection as mongo_collection
 from pymongo import errors as mongo_errors
 
 from core import contract
 from infra.database import batches
 from infra.database.mongodb import client
+from infra.database.mongodb import documents
 from shared import utils
 
 _OPERATORS = {
@@ -26,13 +27,13 @@ _OPERATORS = {
 }
 
 
-def conditions(filters: Sequence[contract.Condition]) -> client.Document:
+def conditions(filters: Sequence[contract.Condition]) -> documents.Document:
     """Translates the conditions of the port into a MongoDB filter.
 
     Columns are field paths: `address.city`. IS_NULL matches a missing field
     too, as a document database has no other way to say "no value".
     """
-    clauses: list[client.Document] = []
+    clauses: list[documents.Document] = []
     for condition in filters:
         if condition.operator is contract.Operator.IS_NULL:
             clauses.append({condition.column: None})
@@ -93,13 +94,13 @@ class MongoTableReader(client.MongoAdapter, contract.ITableReader):
         base = conditions(query.filters)
         self._check_nulls(collection, query, base)
 
-        window: list[client.Document] = [base] if base else []
+        window: list[documents.Document] = [base] if base else []
         first = query.order_by[0]
         if query.lower is not None:
             window.append({first: {"$gte": query.lower}})
         if query.upper is not None:
             window.append({first: {"$lte": query.upper}})
-        projection: client.Document | None = None
+        projection: documents.Document | None = None
         if query.columns:
             projection = dict.fromkeys(query.columns, 1)
             if "_id" not in query.columns:
@@ -134,7 +135,7 @@ class MongoTableReader(client.MongoAdapter, contract.ITableReader):
         table: str,
         column: str,
         filters: Sequence[contract.Condition] = (),
-    ) -> Any:
+    ) -> object:
         clauses = [conditions(filters), {column: {"$ne": None}}]
         with client.errors(f"reading the max of {table}.{column}"):
             found = self.db.collection(table).find_one(
@@ -158,7 +159,7 @@ class MongoTableReader(client.MongoAdapter, contract.ITableReader):
         order_by: Sequence[str],
         offsets: Sequence[int],
         filters: Sequence[contract.Condition] = (),
-    ) -> list[tuple[Any, ...]]:
+    ) -> list[tuple[object, ...]]:
         """See `contract.ITableReader.keys_at`.
 
         One query per offset, each after the document of the previous one,
@@ -175,11 +176,11 @@ class MongoTableReader(client.MongoAdapter, contract.ITableReader):
             ),
             base,
         )
-        projection: client.Document = dict.fromkeys(order_by, 1)
+        projection: documents.Document = dict.fromkeys(order_by, 1)
         if "_id" not in order_by:
             projection["_id"] = 0
         sort = [(column, pymongo.ASCENDING) for column in order_by]
-        found: list[tuple[Any, ...]] = []
+        found: list[tuple[object, ...]] = []
         for skipped in skips:
             clauses = [base] if base else []
             if found:
@@ -200,9 +201,9 @@ class MongoTableReader(client.MongoAdapter, contract.ITableReader):
 
     def _check_nulls(
         self,
-        collection: Any,
+        collection: mongo_collection.Collection[documents.Document],
         query: contract.TableQuery,
-        base: client.Document,
+        base: documents.Document,
     ) -> None:
         """Fails if a document lacks an `order_by` field, or has it null.
 
@@ -217,7 +218,7 @@ class MongoTableReader(client.MongoAdapter, contract.ITableReader):
         with self._checked_lock:
             if checked in self._checked:
                 return
-        missing: client.Document = {
+        missing: documents.Document = {
             "$or": [{column: None} for column in query.order_by]
         }
         with client.errors(f"reading {query.table}"):
@@ -250,18 +251,22 @@ def _skips(offsets: Sequence[int]) -> list[int]:
     return found
 
 
-def _after(columns: Sequence[str], values: Sequence[Any]) -> client.Document:
+def _after(
+    columns: Sequence[str], values: Sequence[object]
+) -> documents.Document:
     """Returns `(columns) > (values)`: `c1 >= v1` and one of `c1 > v1`,
     `c1 = v1 and c2 > v2`..."""
-    alternatives: list[client.Document] = []
+    alternatives: list[documents.Document] = []
     for i, column in enumerate(columns):
-        clause: client.Document = dict(zip(columns[:i], values[:i]))
+        clause: documents.Document = dict(zip(columns[:i], values[:i]))
         clause[column] = {"$gt": values[i]}
         alternatives.append(clause)
     return {columns[0]: {"$gte": values[0]}, "$or": alternatives}
 
 
-def _shaped(document: client.Document, columns: Sequence[str]) -> contract.Row:
+def _shaped(
+    document: documents.Document, columns: Sequence[str]
+) -> contract.Row:
     """Returns a document with every requested top-level field, None if
     missing."""
     for column in columns:
@@ -351,7 +356,11 @@ class MongoTableWriter(client.MongoAdapter, contract.ITableWriter):
 
 def _operation(
     target: contract.TableTarget, row: contract.Row, updates: Sequence[str]
-) -> Any:
+) -> (
+    pymongo.InsertOne[documents.Document]
+    | pymongo.UpdateMany
+    | pymongo.UpdateOne
+):
     """Returns the bulk operation writing one row, in the target's mode."""
     if target.mode is contract.WriteMode.INSERT:
         return pymongo.InsertOne(_nested(row))
@@ -362,7 +371,7 @@ def _operation(
     others = {
         name: value for name, value in row.items() if name not in target.key
     }
-    changes: client.Document = {}
+    changes: documents.Document = {}
     if target.mode is contract.WriteMode.UPSERT:
         changed = {name: others.pop(name) for name in updates if name in others}
         if changed:
@@ -375,14 +384,17 @@ def _operation(
     return pymongo.UpdateOne(key, changes, upsert=True)
 
 
-def _nested(row: contract.Row) -> client.Document:
+def _nested(row: contract.Row) -> documents.Document:
     """Turns field paths (`address.city`) into nested documents."""
-    document: client.Document = {}
+    document: documents.Document = {}
     for path, value in row.items():
         parts = path.split(".")
         current = document
         for part in parts[:-1]:
-            current = current.setdefault(part, {})
+            found = current.setdefault(part, {})
+            if not isinstance(found, dict):
+                raise TypeError(f"{path}: {part!r} holds a value, not fields")
+            current = found
         current[parts[-1]] = value
     return document
 

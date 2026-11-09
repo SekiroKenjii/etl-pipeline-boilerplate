@@ -20,6 +20,7 @@ from typing import Literal, Self
 import pydantic
 
 from config import settings as app_settings
+from config import tuning as config_tuning
 
 
 class LookupTable(pydantic.BaseModel):
@@ -60,8 +61,8 @@ class MappingModuleSettings(pydantic.BaseModel):
             until it is.
         deletes: What `sync` and `deletes` do with deleted rows.
         max_delete_share: The share of an entity's loaded rows `deletes` may
-            delete in a run; above it, or when the source has no row at all,
-            the step fails until the run confirms the number
+            delete in a run, a tenth by default; above it, or when the source
+            has no row at all, the run exits 2 until it confirms the number
             (`--param confirm_deletes=<entity>:<count>`). None for no limit.
         snapshot: Where the first `sync` gets the rows from: the source
             `table`, or the change `log` from its beginning when it holds its
@@ -80,6 +81,10 @@ class MappingModuleSettings(pydantic.BaseModel):
             loaded batch.
         retry_backoff_seconds: The pause before the second attempt; it
             doubles at each one.
+        spill_rows: The rows `deletes` holds in memory before it sorts the
+            keys on disk; `tuning.spill_rows` unless set.
+        in_chunk: The values per IN list when the loads are verified
+            (`verify_loads`); `tuning.in_chunk`, else 1,000, unless set.
     """
 
     model_config = pydantic.ConfigDict(extra="forbid", frozen=True)
@@ -94,7 +99,7 @@ class MappingModuleSettings(pydantic.BaseModel):
     max_reject_rate: float | None = pydantic.Field(default=0.05, ge=0, le=1)
     orphans: Literal["reject", "park"] = "reject"
     deletes: Literal["soft", "hard", "ignore"] = "soft"
-    max_delete_share: float | None = pydantic.Field(default=0.5, ge=0, le=1)
+    max_delete_share: float | None = pydantic.Field(default=0.1, ge=0, le=1)
     snapshot: Literal["table", "log"] = "table"
     verify_loads: bool = False
     corrections: pathlib.Path | None = None
@@ -102,6 +107,26 @@ class MappingModuleSettings(pydantic.BaseModel):
     lookups: dict[str, LookupTable] = {}
     step_attempts: int = pydantic.Field(default=3, ge=1, le=10)
     retry_backoff_seconds: float = pydantic.Field(default=5.0, ge=0)
+    spill_rows: int = pydantic.Field(default=50_000, ge=1)
+    in_chunk: int = pydantic.Field(default=config_tuning.IN_CHUNK_CAP, ge=1)
+
+    @pydantic.model_validator(mode="before")
+    @classmethod
+    def _tuned(cls, data: object, info: pydantic.ValidationInfo) -> object:
+        """Gives `spill_rows` and `in_chunk` the application's tuning
+        values when the module does not set them (`module_settings`)."""
+        settings = (info.context or {}).get("settings")
+        if not isinstance(data, dict) or not isinstance(
+            settings, app_settings.AppSettings
+        ):
+            return data
+        effective = settings.tuning.effective()
+        given: dict[str, object] = dict(data)
+        given.setdefault("spill_rows", effective.spill_rows.value)
+        given.setdefault(
+            "in_chunk", effective.in_chunk.value or config_tuning.IN_CHUNK_CAP
+        )
+        return given
 
     @pydantic.model_validator(mode="after")
     def _pools(self, info: pydantic.ValidationInfo) -> Self:
@@ -110,9 +135,10 @@ class MappingModuleSettings(pydantic.BaseModel):
         settings = (info.context or {}).get("settings")
         if not isinstance(settings, app_settings.AppSettings):
             return self
-        steps = self.partitions
-        if settings.runs.max_parallel_steps is not None:
-            steps = min(steps, settings.runs.max_parallel_steps)
+        steps = min(
+            self.partitions,
+            settings.tuning.effective().max_parallel_steps.value,
+        )
         needs: collections.Counter[str] = collections.Counter()
         # Target: a transaction, plus SQL Server's bulk-copy connection.
         needs[self.source] += steps

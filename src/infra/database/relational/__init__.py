@@ -1,6 +1,7 @@
 """Relational databases through SQLAlchemy Core: SQL Server, Oracle,
-Postgres, MySQL, SQLite... Needs the `sql` extra, and the driver's extra
-(`mssql`, `oracle`, `postgres`).
+Postgres, MySQL, SQLite... Postgres and SQLite need nothing more; SQL
+Server, Oracle and MySQL need their driver's extra (`mssql`, `oracle`,
+`mysql`).
 
     from infra.database import relational
 

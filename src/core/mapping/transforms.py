@@ -14,9 +14,8 @@ import inspect
 import re
 import typing
 
+from core.mapping import types
 from shared import utils
-
-type TransformFn = Callable[..., object]
 
 _CUSTOM_NAME = re.compile(r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$")
 
@@ -99,7 +98,7 @@ class Transform:
     """
 
     name: str
-    fn: TransformFn
+    fn: types.TransformFn
     builtin: bool
 
     @property
@@ -112,7 +111,7 @@ class Transform:
 _EXPLODE = re.compile(r"^explode\(\s*([A-Za-z_$][\w$]*(?:\.[\w$]+)*)\s*\)$")
 
 
-def explode(path: str) -> TransformFn:
+def explode(path: str) -> types.TransformFn:
     """Returns the row splitter making one row per element of an array.
 
     Each row is the source row with the array at `path` replaced by one of
@@ -161,7 +160,7 @@ def _replaced(
     return copy
 
 
-BUILTIN_TRANSFORMS: dict[str, TransformFn] = {
+BUILTIN_TRANSFORMS: dict[str, types.TransformFn] = {
     "concat": _concat,
     "coalesce": _coalesce,
     "trim": _trim,
@@ -207,7 +206,7 @@ class TransformRegistry:
             for name, fn in BUILTIN_TRANSFORMS.items():
                 self._transforms[name] = Transform(name, fn, builtin=True)
 
-    def register[F: TransformFn](self, name: str) -> Callable[[F], F]:
+    def register[F: types.TransformFn](self, name: str) -> Callable[[F], F]:
         """Returns a decorator registering a custom transform as `name`."""
 
         def decorator(fn: F) -> F:
@@ -216,7 +215,9 @@ class TransformRegistry:
 
         return decorator
 
-    def register_filter[F: TransformFn](self, name: str) -> Callable[[F], F]:
+    def register_filter[F: types.TransformFn](
+        self, name: str
+    ) -> Callable[[F], F]:
         """Returns a decorator registering a row filter as `name`."""
 
         def decorator(fn: F) -> F:
@@ -225,7 +226,9 @@ class TransformRegistry:
 
         return decorator
 
-    def register_splitter[F: TransformFn](self, name: str) -> Callable[[F], F]:
+    def register_splitter[F: types.TransformFn](
+        self, name: str
+    ) -> Callable[[F], F]:
         """Returns a decorator registering a row splitter as `name`."""
 
         def decorator(fn: F) -> F:
@@ -234,7 +237,7 @@ class TransformRegistry:
 
         return decorator
 
-    def add(self, name: str, fn: TransformFn) -> None:
+    def add(self, name: str, fn: types.TransformFn) -> None:
         """Registers a custom transform.
 
         Raises:
@@ -299,7 +302,7 @@ class TransformRegistry:
 
 
 def _add(
-    target: dict[str, Transform], kind: str, name: str, fn: TransformFn
+    target: dict[str, Transform], kind: str, name: str, fn: types.TransformFn
 ) -> None:
     if not _CUSTOM_NAME.match(name):
         raise ValueError(

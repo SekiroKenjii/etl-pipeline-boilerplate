@@ -9,10 +9,19 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 import dataclasses
+from typing import Literal
 
 from core.contract import formats
 from core.contract import parking
 from core.contract import tables
+
+# What a cutover report writes, in its JSON too: the kind of a difference,
+# the status of an entity, the verdict.
+type DifferenceKind = Literal["missing", "extra", "different", "duplicate"]
+type EntityStatus = Literal[
+    "match", "match-with-rejects", "mismatch", "counted", "empty"
+]
+type Verdict = Literal["PASSED", "PASSED-WITH-REJECTS", "FAILED", "COUNTED"]
 
 
 @dataclasses.dataclass(frozen=True, slots=True)

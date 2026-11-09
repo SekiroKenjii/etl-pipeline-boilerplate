@@ -107,8 +107,11 @@ class Migration(pipeline.BaseOrchestrator):
         db, prefix = backend.db, backend.prefix
         self.prefix = prefix
         self.compiled = mapping.compile_catalog(CRM, mapping_specs.registry)
-        self.registry = core_keys.CachedKeyRegistry(
-            relational.RelationalKeyRegistry(db, prefix=prefix)
+        # Memory for a dozen keys: the rest of them go through the disk tier.
+        self.registry = core_keys.TieredKeyCache(
+            relational.RelationalKeyRegistry(db, prefix=prefix),
+            memory_budget=4096,
+            disk_budget=10**7,
         )
         self.reader = relational.RelationalTableReader(db, page_size=2)
         self.writer = relational.RelationalTableWriter(db)

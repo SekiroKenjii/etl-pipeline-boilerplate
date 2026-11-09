@@ -13,12 +13,13 @@ messages are redacted before they leave.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 import datetime
+import email.message
 import json
 import logging
 import threading
-from typing import Any
+from typing import IO
 import urllib.error
 import urllib.request
 import uuid
@@ -40,7 +41,7 @@ _ERROR = (
 _RUN_NAMESPACE = uuid.UUID("5d1f6a1e-2c4b-5e8a-9f3d-0b7c6e4a2d91")
 _LOG = logging.getLogger(__name__)
 
-type Transport = Callable[[dict[str, Any]], None]
+type _Transport = Callable[[dict[str, object]], None]
 
 
 def http_transport(
@@ -48,7 +49,7 @@ def http_transport(
     *,
     api_key: str | None = None,
     timeout_seconds: float = 5.0,
-) -> Transport:
+) -> _Transport:
     """Posts events to an OpenLineage HTTP endpoint.
 
     Args:
@@ -72,7 +73,7 @@ def http_transport(
 
     opener = urllib.request.build_opener(_NoRedirects())
 
-    def send(event: dict[str, Any]) -> None:
+    def send(event: dict[str, object]) -> None:
         request = urllib.request.Request(
             endpoint,
             data=json.dumps(event).encode(),
@@ -102,10 +103,10 @@ class _NoRedirects(urllib.request.HTTPRedirectHandler):
     def redirect_request(  # pylint: disable=too-many-positional-arguments
         self,
         req: urllib.request.Request,
-        fp: Any,
+        fp: IO[bytes],
         code: int,
         msg: str,
-        headers: Any,
+        headers: email.message.Message,
         newurl: str,
     ) -> None:
         del req, fp, code, msg, headers, newurl
@@ -116,10 +117,18 @@ class LineageListener(contract.PipelineListener):
 
     Attributes:
         namespace: The namespace of the jobs: the service, by default.
+        redact: More secret names hidden in the errors, on top of
+            `observability.SECRET_NAMES`: the logs' `redact`.
     """
 
-    def __init__(self, transport: Transport, namespace: str = "etl") -> None:
+    def __init__(
+        self,
+        transport: _Transport,
+        namespace: str = "etl",
+        redact: Collection[str] = (),
+    ) -> None:
         self.namespace = namespace
+        self.redact = tuple(redact)
         self._send = transport
         self._lock = threading.Lock()
 
@@ -135,7 +144,7 @@ class LineageListener(contract.PipelineListener):
             _run_id(ctx),
             error=None
             if result.succeeded
-            else _error(result.message, result.errors),
+            else _error(result.message, result.errors, self.redact),
         )
 
     def on_step_start(
@@ -158,7 +167,7 @@ class LineageListener(contract.PipelineListener):
             step,
             ctx,
             error=(
-                _error(result.message, result.errors)
+                _error(result.message, result.errors, self.redact)
                 if result.status is contract.ETLStatus.FAILED
                 else None
             ),
@@ -195,7 +204,7 @@ class LineageListener(contract.PipelineListener):
         error: str | None = None,
     ) -> None:
         """Sends one event; a failure to send is only logged."""
-        facets: dict[str, Any] = {}
+        facets: dict[str, object] = {}
         if parent is not None:
             facets["parent"] = {
                 "_producer": PRODUCER,
@@ -210,7 +219,7 @@ class LineageListener(contract.PipelineListener):
                 "message": error,
                 "programmingLanguage": "python",
             }
-        event = {
+        event: dict[str, object] = {
             "eventType": event_type,
             "eventTime": datetime.datetime.now(datetime.UTC).isoformat(),
             "producer": PRODUCER,
@@ -227,10 +236,14 @@ class LineageListener(contract.PipelineListener):
             _LOG.warning("lineage event of %s not sent: %s", job, exc)
 
 
-def _error(message: str | None, errors: Sequence[contract.ETLError]) -> str:
+def _error(
+    message: str | None,
+    errors: Sequence[contract.ETLError],
+    redact: Collection[str],
+) -> str:
     """What went wrong, redacted: the first error, else the summary."""
     found = errors[0].message if errors else message or "failed"
-    return observability.redact_text(found)
+    return observability.redact_text(found, redact)
 
 
 def _run_id(ctx: contract.ETLContext) -> str:

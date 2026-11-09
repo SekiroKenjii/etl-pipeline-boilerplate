@@ -9,10 +9,9 @@ Names are dotted, the unit apart (`etl.step.duration`, in `s`).
 from __future__ import annotations
 
 import abc
-from collections.abc import Mapping
 import threading
 
-type Attributes = Mapping[str, str | bool | int | float]
+from core import contract
 
 
 class IMeter(abc.ABC):
@@ -23,7 +22,7 @@ class IMeter(abc.ABC):
         self,
         name: str,
         value: float,
-        attributes: Attributes | None = None,
+        attributes: contract.Attributes | None = None,
         *,
         unit: str = "1",
         description: str = "",
@@ -35,7 +34,7 @@ class IMeter(abc.ABC):
         self,
         name: str,
         value: float,
-        attributes: Attributes | None = None,
+        attributes: contract.Attributes | None = None,
         *,
         unit: str = "1",
         description: str = "",
@@ -47,7 +46,7 @@ class IMeter(abc.ABC):
         self,
         name: str,
         value: float,
-        attributes: Attributes | None = None,
+        attributes: contract.Attributes | None = None,
         *,
         unit: str = "1",
         description: str = "",
@@ -62,7 +61,7 @@ class NoopMeter(IMeter):
         self,
         name: str,
         value: float,
-        attributes: Attributes | None = None,
+        attributes: contract.Attributes | None = None,
         *,
         unit: str = "1",
         description: str = "",
@@ -73,7 +72,7 @@ class NoopMeter(IMeter):
         self,
         name: str,
         value: float,
-        attributes: Attributes | None = None,
+        attributes: contract.Attributes | None = None,
         *,
         unit: str = "1",
         description: str = "",
@@ -84,7 +83,7 @@ class NoopMeter(IMeter):
         self,
         name: str,
         value: float,
-        attributes: Attributes | None = None,
+        attributes: contract.Attributes | None = None,
         *,
         unit: str = "1",
         description: str = "",
@@ -111,7 +110,7 @@ class InMemoryMeter(IMeter):
         self,
         name: str,
         value: float,
-        attributes: Attributes | None = None,
+        attributes: contract.Attributes | None = None,
         *,
         unit: str = "1",
         description: str = "",
@@ -124,7 +123,7 @@ class InMemoryMeter(IMeter):
         self,
         name: str,
         value: float,
-        attributes: Attributes | None = None,
+        attributes: contract.Attributes | None = None,
         *,
         unit: str = "1",
         description: str = "",
@@ -137,7 +136,7 @@ class InMemoryMeter(IMeter):
         self,
         name: str,
         value: float,
-        attributes: Attributes | None = None,
+        attributes: contract.Attributes | None = None,
         *,
         unit: str = "1",
         description: str = "",

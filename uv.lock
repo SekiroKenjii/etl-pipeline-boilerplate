@@ -630,79 +630,37 @@ wheels = [
 name = "etl-pipeline-boilerplate"
 version = "0.1.0"
 source = { editable = "." }
+dependencies = [
+    { name = "alembic" },
+    { name = "azure-identity" },
+    { name = "azure-keyvault-secrets" },
+    { name = "confluent-kafka" },
+    { name = "google-cloud-secret-manager" },
+    { name = "google-cloud-storage" },
+    { name = "httpx" },
+    { name = "openpyxl" },
+    { name = "opentelemetry-exporter-otlp-proto-http" },
+    { name = "opentelemetry-sdk" },
+    { name = "psycopg", extra = ["binary"] },
+    { name = "pydantic-settings" },
+    { name = "pymongo" },
+    { name = "sqlalchemy" },
+]
 
 [package.optional-dependencies]
 all = [
-    { name = "alembic" },
-    { name = "azure-identity" },
-    { name = "azure-keyvault-secrets" },
-    { name = "confluent-kafka" },
-    { name = "google-cloud-secret-manager" },
-    { name = "google-cloud-storage" },
-    { name = "httpx" },
     { name = "mssql-python" },
-    { name = "openpyxl" },
-    { name = "opentelemetry-exporter-otlp-proto-http" },
-    { name = "opentelemetry-sdk" },
     { name = "oracledb" },
-    { name = "psycopg", extra = ["binary"] },
-    { name = "pydantic-settings" },
-    { name = "pymongo" },
     { name = "pymysql" },
-    { name = "sqlalchemy" },
-]
-app = [
-    { name = "pydantic-settings" },
-]
-azure-secrets = [
-    { name = "azure-identity" },
-    { name = "azure-keyvault-secrets" },
-]
-gcp-secrets = [
-    { name = "google-cloud-secret-manager" },
-]
-gcs = [
-    { name = "google-cloud-storage" },
-]
-http = [
-    { name = "httpx" },
-]
-kafka = [
-    { name = "confluent-kafka" },
-]
-mappings = [
-    { name = "openpyxl" },
-]
-mongodb = [
-    { name = "pymongo" },
 ]
 mssql = [
-    { name = "alembic" },
     { name = "mssql-python" },
-    { name = "sqlalchemy" },
 ]
 mysql = [
-    { name = "alembic" },
     { name = "pymysql" },
-    { name = "sqlalchemy" },
 ]
 oracle = [
-    { name = "alembic" },
     { name = "oracledb" },
-    { name = "sqlalchemy" },
-]
-otel = [
-    { name = "opentelemetry-exporter-otlp-proto-http" },
-    { name = "opentelemetry-sdk" },
-]
-postgres = [
-    { name = "alembic" },
-    { name = "psycopg", extra = ["binary"] },
-    { name = "sqlalchemy" },
-]
-sql = [
-    { name = "alembic" },
-    { name = "sqlalchemy" },
 ]
 
 [package.dev-dependencies]
@@ -711,34 +669,20 @@ coverage = [
     { name = "pytest-cov" },
 ]
 dev = [
-    { name = "alembic" },
-    { name = "azure-identity" },
-    { name = "azure-keyvault-secrets" },
-    { name = "confluent-kafka" },
     { name = "coverage" },
-    { name = "google-cloud-secret-manager" },
-    { name = "google-cloud-storage" },
-    { name = "httpx" },
     { name = "hypothesis" },
     { name = "isort" },
     { name = "mssql-python" },
     { name = "mypy" },
-    { name = "openpyxl" },
-    { name = "opentelemetry-exporter-otlp-proto-http" },
-    { name = "opentelemetry-sdk" },
     { name = "oracledb" },
     { name = "pre-commit" },
-    { name = "psycopg", extra = ["binary"] },
-    { name = "pydantic-settings" },
     { name = "pyink" },
     { name = "pylint" },
-    { name = "pymongo" },
     { name = "pymysql" },
     { name = "pyright" },
     { name = "pytest" },
     { name = "pytest-cov" },
     { name = "pytest-xdist" },
-    { name = "sqlalchemy" },
     { name = "types-openpyxl" },
 ]
 docs = [
@@ -756,26 +700,12 @@ lint = [
     { name = "pylint" },
 ]
 tests = [
-    { name = "alembic" },
-    { name = "azure-identity" },
-    { name = "azure-keyvault-secrets" },
-    { name = "confluent-kafka" },
-    { name = "google-cloud-secret-manager" },
-    { name = "google-cloud-storage" },
-    { name = "httpx" },
     { name = "hypothesis" },
     { name = "mssql-python" },
-    { name = "openpyxl" },
-    { name = "opentelemetry-exporter-otlp-proto-http" },
-    { name = "opentelemetry-sdk" },
     { name = "oracledb" },
-    { name = "psycopg", extra = ["binary"] },
-    { name = "pydantic-settings" },
-    { name = "pymongo" },
     { name = "pymysql" },
     { name = "pytest" },
     { name = "pytest-xdist" },
-    { name = "sqlalchemy" },
 ]
 tox = [
     { name = "tox" },
@@ -789,32 +719,26 @@ typecheck = [
 
 [package.metadata]
 requires-dist = [
-    { name = "alembic", marker = "extra == 'sql'", specifier = ">=1.16" },
-    { name = "azure-identity", marker = "extra == 'azure-secrets'", specifier = ">=1.17" },
-    { name = "azure-keyvault-secrets", marker = "extra == 'azure-secrets'", specifier = ">=4.8" },
-    { name = "confluent-kafka", marker = "extra == 'kafka'", specifier = ">=2.6" },
-    { name = "etl-pipeline-boilerplate", extras = ["gcp-secrets", "azure-secrets"], marker = "extra == 'all'" },
-    { name = "etl-pipeline-boilerplate", extras = ["http", "mappings", "gcs", "postgres", "mssql", "oracle", "mysql"], marker = "extra == 'all'" },
-    { name = "etl-pipeline-boilerplate", extras = ["mongodb", "kafka", "app", "otel"], marker = "extra == 'all'" },
-    { name = "etl-pipeline-boilerplate", extras = ["sql"], marker = "extra == 'mssql'" },
-    { name = "etl-pipeline-boilerplate", extras = ["sql"], marker = "extra == 'mysql'" },
-    { name = "etl-pipeline-boilerplate", extras = ["sql"], marker = "extra == 'oracle'" },
-    { name = "etl-pipeline-boilerplate", extras = ["sql"], marker = "extra == 'postgres'" },
-    { name = "google-cloud-secret-manager", marker = "extra == 'gcp-secrets'", specifier = ">=2.20" },
-    { name = "google-cloud-storage", marker = "extra == 'gcs'", specifier = ">=2.18" },
-    { name = "httpx", marker = "extra == 'http'", specifier = ">=0.28" },
+    { name = "alembic", specifier = ">=1.16" },
+    { name = "azure-identity", specifier = ">=1.17" },
+    { name = "azure-keyvault-secrets", specifier = ">=4.8" },
+    { name = "confluent-kafka", specifier = ">=2.6" },
+    { name = "etl-pipeline-boilerplate", extras = ["mssql", "oracle", "mysql"], marker = "extra == 'all'" },
+    { name = "google-cloud-secret-manager", specifier = ">=2.20" },
+    { name = "google-cloud-storage", specifier = ">=2.18" },
+    { name = "httpx", specifier = ">=0.28" },
     { name = "mssql-python", marker = "extra == 'mssql'", specifier = ">=1.0" },
-    { name = "openpyxl", marker = "extra == 'mappings'", specifier = ">=3.1" },
-    { name = "opentelemetry-exporter-otlp-proto-http", marker = "extra == 'otel'", specifier = ">=1.27" },
-    { name = "opentelemetry-sdk", marker = "extra == 'otel'", specifier = ">=1.27" },
+    { name = "openpyxl", specifier = ">=3.1" },
+    { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.27" },
+    { name = "opentelemetry-sdk", specifier = ">=1.27" },
     { name = "oracledb", marker = "extra == 'oracle'", specifier = ">=2.5" },
-    { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3.2" },
-    { name = "pydantic-settings", marker = "extra == 'app'", specifier = ">=2.6" },
-    { name = "pymongo", marker = "extra == 'mongodb'", specifier = ">=4.10" },
+    { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
+    { name = "pydantic-settings", specifier = ">=2.6" },
+    { name = "pymongo", specifier = ">=4.10" },
     { name = "pymysql", marker = "extra == 'mysql'", specifier = ">=1.1" },
-    { name = "sqlalchemy", marker = "extra == 'sql'", specifier = ">=2.0.41" },
+    { name = "sqlalchemy", specifier = ">=2.0.41" },
 ]
-provides-extras = ["http", "mappings", "gcs", "gcp-secrets", "azure-secrets", "sql", "postgres", "mssql", "oracle", "mysql", "mongodb", "kafka", "app", "otel", "all"]
+provides-extras = ["mssql", "oracle", "mysql", "all"]
 
 [package.metadata.requires-dev]
 coverage = [
@@ -822,34 +746,20 @@ coverage = [
     { name = "pytest-cov", specifier = ">=7.1.0" },
 ]
 dev = [
-    { name = "alembic", specifier = ">=1.16" },
-    { name = "azure-identity", specifier = ">=1.17" },
-    { name = "azure-keyvault-secrets", specifier = ">=4.8" },
-    { name = "confluent-kafka", specifier = ">=2.6" },
     { name = "coverage", specifier = ">=7.17.0" },
-    { name = "google-cloud-secret-manager", specifier = ">=2.20" },
-    { name = "google-cloud-storage", specifier = ">=2.18" },
-    { name = "httpx", specifier = ">=0.28" },
     { name = "hypothesis", specifier = ">=6.120" },
     { name = "isort", specifier = ">=6.0" },
     { name = "mssql-python", specifier = ">=1.0" },
     { name = "mypy", specifier = ">=1.18" },
-    { name = "openpyxl", specifier = ">=3.1" },
-    { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.27" },
-    { name = "opentelemetry-sdk", specifier = ">=1.27" },
     { name = "oracledb", specifier = ">=2.5" },
     { name = "pre-commit", specifier = ">=4.0" },
-    { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
-    { name = "pydantic-settings", specifier = ">=2.6" },
     { name = "pyink", specifier = ">=24.10" },
     { name = "pylint", specifier = ">=3.3" },
-    { name = "pymongo", specifier = ">=4.10" },
     { name = "pymysql", specifier = ">=1.1" },
     { name = "pyright", specifier = ">=1.1.406" },
     { name = "pytest", specifier = ">=9.2.0" },
     { name = "pytest-cov", specifier = ">=7.1.0" },
     { name = "pytest-xdist", specifier = ">=3.8.0" },
-    { name = "sqlalchemy", specifier = ">=2.0.41" },
     { name = "types-openpyxl" },
 ]
 docs = [
@@ -867,26 +777,12 @@ lint = [
     { name = "pylint", specifier = ">=3.3" },
 ]
 tests = [
-    { name = "alembic", specifier = ">=1.16" },
-    { name = "azure-identity", specifier = ">=1.17" },
-    { name = "azure-keyvault-secrets", specifier = ">=4.8" },
-    { name = "confluent-kafka", specifier = ">=2.6" },
-    { name = "google-cloud-secret-manager", specifier = ">=2.20" },
-    { name = "google-cloud-storage", specifier = ">=2.18" },
-    { name = "httpx", specifier = ">=0.28" },
     { name = "hypothesis", specifier = ">=6.120" },
     { name = "mssql-python", specifier = ">=1.0" },
-    { name = "openpyxl", specifier = ">=3.1" },
-    { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.27" },
-    { name = "opentelemetry-sdk", specifier = ">=1.27" },
     { name = "oracledb", specifier = ">=2.5" },
-    { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
-    { name = "pydantic-settings", specifier = ">=2.6" },
-    { name = "pymongo", specifier = ">=4.10" },
     { name = "pymysql", specifier = ">=1.1" },
     { name = "pytest", specifier = ">=9.2.0" },
     { name = "pytest-xdist", specifier = ">=3.8.0" },
-    { name = "sqlalchemy", specifier = ">=2.0.41" },
 ]
 tox = [
     { name = "tox", specifier = ">=4.21" },

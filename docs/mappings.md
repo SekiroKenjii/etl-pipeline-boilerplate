@@ -50,11 +50,11 @@ The **Mappings** sheet has one row per mapping:
 
 | Column | What it holds |
 | --- | --- |
-| Target column, Target type | The column, and its type as the database writes it: `VARCHAR(200)`, `NUMBER(12,2)`, `DATE`... |
+| Target column, Target type | The column, and its type as the database writes it: `VARCHAR(200)`, `NUMBER(12,2)`, `DATE`... The length of a text type counts characters (code points). A column whose length counts bytes (Oracle's `VARCHAR2(n)` under the default `BYTE` semantics, SQL Server's `VARCHAR(n)` under a UTF-8 collation) may refuse at load a value the mapping accepted: `é` is 2 bytes in UTF-8. Declare such columns with room, or as `VARCHAR2(n CHAR)` / `NVARCHAR(n)` |
 | Required | `Y` or `N`: an empty value rejects the row |
 | Source columns | One, or several separated by commas; `address.city` in a document |
-| Transform, Parameters | `concat` with `separator=" "`, `value_map` with `A=active; I=inactive`, `lookup` with `table=countries`... Parameters are separated by `;`; a value in quotes keeps its spaces and may hold `;` (`separator=";"`), `""` is a quote in it |
-| Format | How dates are written in the source: `dd/MM/yyyy`. Only `yyyy`, `yy`, `MM`, `dd`, `HH`, `mm` (minutes) and `ss` are understood, case matters; put other letters in quotes (`yyyy-MM-dd'T'HH:mm`). `yy` reads 69-99 as 1969-1999 and 00-68 as 2000-2068 |
+| Transform, Parameters | `concat` with `separator=" "`, `value_map` with `A=active; I=inactive`, `lookup` with `table=countries`... Parameters are separated by `;`; a value in quotes keeps its spaces and may hold `;` (`separator=";"`), `""` is a quote in it. Text after the closing quote (`separator=", "x`) is refused: put it inside the quotes |
+| Format | How dates are written in the source: `dd/MM/yyyy`. Only `yyyy`, `yy`, `MM`, `dd`, `HH`, `mm` (minutes) and `ss` are understood, case matters; put other letters in quotes (`yyyy-MM-dd'T'HH:mm`). `yy` reads 69-99 as 1969-1999 and 00-68 as 2000-2068. Month names (`MMM`, `MMMM`) and fractions of a second (`SSS`) are refused: write the format with Python's codes instead, `%d-%b-%Y` for `05-Mar-2020` (English month names), `%Y-%m-%d %H:%M:%S.%f` for fractions |
 | Default | The value of an empty result |
 | Key | `PK` on the surrogate key: its source columns are the natural key |
 | References | The mapping a foreign key points to |
@@ -91,15 +91,24 @@ A surrogate key is derived from the natural key (the source columns of the
 - **Key case**: `upper` or `lower` for a source ignoring case, so that
   `c001` and `C001` stay one key.
 
-Changing any of them, the natural key columns, or the key secret, makes
-other keys: the rows loaded before no longer match. The run ledger records
-what keys are made from (`keys=` in `etl runs`), and `etl run` refuses to
-run once it changed since the last successful run, unless `--rekey`: run
+Changing any of them, the natural key columns (the `PK` row's source
+columns, or their order), or the key secret, makes other keys: the rows
+loaded before no longer match. The run ledger records what keys are made
+from (`keys=` in `etl runs`: an entry per mapping, and one per mapping's
+natural key, `customer:natural_key`), and `etl run` refuses to run once it
+changed since the last successful run of any pipeline of the module, unless
+`--rekey`: run
 `etl-mappings diff` before compiling to see which mappings it hits, and
 `etl run <pipeline> --rekey` only once the target is ready for new keys
 (emptied, or a new one). Rotating the key secret is such a change, for
 every `hmac` mapping: see [Security](security.md#personal-data) for the
 procedure.
+
+Runs recorded before the natural key entries existed (0.1.0 and the
+releases before this one) have none: the first run after the upgrade adds
+them without asking for `--rekey`, so it cannot tell a natural key changed
+in the same deploy. Change no `PK` source columns in the deploy that
+upgrades; `etl-mappings diff` shows such a change anyway.
 
 ## When rows are rejected
 

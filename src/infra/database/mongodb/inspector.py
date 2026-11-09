@@ -6,17 +6,20 @@ import collections
 from collections.abc import Iterator, Sequence
 import datetime
 import decimal
-from typing import Any
+from typing import cast
 import uuid
 
 from bson import objectid
+from pymongo import collection as mongo_collection
+from pymongo import database as mongo_database
 
 from core import contract
 from infra.database.mongodb import client
+from infra.database.mongodb import documents
 
 _MAX_FIELD_PATH_DEPTH = 3
 
-_COUNT: client.Document = {"$count": "n"}
+_COUNT: documents.Document = {"$count": "n"}
 _MATCH = "$match"
 
 
@@ -75,7 +78,7 @@ class MongoSchemaInspector(client.MongoAdapter, contract.ISchemaInspector):
         sample_rows: int | None = None,
     ) -> dict[str, contract.ColumnProfile]:
         collection = self._collection(table)
-        head: list[client.Document] = (
+        head: list[documents.Document] = (
             [{"$limit": sample_rows}] if sample_rows is not None else []
         )
         profiles = {}
@@ -113,7 +116,7 @@ class MongoSchemaInspector(client.MongoAdapter, contract.ISchemaInspector):
         referenced_column: str,
     ) -> contract.InclusionCheck:
         collection = self._collection(table)
-        values: list[client.Document] = [
+        values: list[documents.Document] = [
             _present(column),
             {"$group": {"_id": f"${column}"}},
         ]
@@ -145,7 +148,10 @@ class MongoSchemaInspector(client.MongoAdapter, contract.ISchemaInspector):
         return contract.InclusionCheck(distinct=distinct, unmatched=unmatched)
 
     def _table(
-        self, database: Any, schema: str, name: str
+        self,
+        database: mongo_database.Database[documents.Document],
+        schema: str,
+        name: str,
     ) -> contract.TableInfo:
         """Returns a collection as a table: sampled columns, unique indexes."""
         collection = database[name]
@@ -179,7 +185,9 @@ class MongoSchemaInspector(client.MongoAdapter, contract.ISchemaInspector):
             estimated_rows=collection.estimated_document_count(),
         )
 
-    def _collection(self, table: str) -> Any:
+    def _collection(
+        self, table: str
+    ) -> mongo_collection.Collection[documents.Document]:
         schema, _, name = table.partition(".")
         database = self.db.client.get_database(
             schema, codec_options=client.CODEC_OPTIONS
@@ -191,14 +199,17 @@ def _bare(table: str) -> str:
     return table.partition(".")[2] or table
 
 
-def _count(collection: Any, pipeline: list[client.Document]) -> int:
+def _count(
+    collection: mongo_collection.Collection[documents.Document],
+    pipeline: list[documents.Document],
+) -> int:
     found = list(collection.aggregate(pipeline, allowDiskUse=True))
-    return int(found[0]["n"]) if found else 0
+    return int(cast(documents.CountedDocument, found[0])["n"]) if found else 0
 
 
 def _paths(
-    document: client.Document, prefix: str = "", depth: int = 1
-) -> Iterator[tuple[str, Any]]:
+    document: documents.Document, prefix: str = "", depth: int = 1
+) -> Iterator[tuple[str, object]]:
     """Yields the field paths of a document, nested documents included."""
     for key, value in document.items():
         path = f"{prefix}{key}"
@@ -223,7 +234,7 @@ _BSON_TYPES: tuple[tuple[type, str], ...] = (
 )
 
 
-def _type(value: Any) -> str:
+def _type(value: object) -> str:
     """Names the BSON type of a value, as MongoDB's `$type` does."""
     if value is None:
         return "null"
@@ -262,6 +273,6 @@ def _family(types: collections.Counter[str]) -> contract.TypeFamily:
     return families.pop() if len(families) == 1 else contract.TypeFamily.OTHER
 
 
-def _present(column: str) -> client.Document:
+def _present(column: str) -> documents.Document:
     """The stage keeping the documents where `column` is set."""
     return {_MATCH: {column: {"$ne": None}}}

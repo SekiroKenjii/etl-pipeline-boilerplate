@@ -11,6 +11,8 @@ from collections.abc import Mapping
 import pathlib
 from typing import Literal, Protocol
 
+__all__ = ["LookupTable", "MappingSettings"]
+
 
 class LookupTable(Protocol):
     """A lookup table of the mappings, read from a database table."""
@@ -128,4 +130,14 @@ class MappingSettings(Protocol):
     @property
     def retry_backoff_seconds(self) -> float:
         """The pause before the second attempt; it doubles at each one."""
+        ...
+
+    @property
+    def spill_rows(self) -> int:
+        """The rows `deletes` holds in memory before it sorts on disk."""
+        ...
+
+    @property
+    def in_chunk(self) -> int:
+        """The values per IN list when the loads are verified."""
         ...

@@ -3,8 +3,8 @@ every database."""
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import concurrent.futures
-import math
 from typing import Any
 import uuid
 
@@ -35,6 +35,10 @@ def test_batches_of_disjoint_keys_written_at_once_never_deadlock(
         sa.Column("name", sa.Unicode(50), nullable=False),
     )
     backend.create()
+    relational.create_etl_tables(backend.db, prefix=backend.prefix)
+    registry = relational.RelationalKeyRegistry(
+        backend.db, prefix=backend.prefix
+    )
     target = contract.TableTarget(table.name, key=("customer_key",))
     writer = relational.RelationalTableWriter(backend.db)
     writers, batches, rows = 4, 12, 1000
@@ -42,12 +46,14 @@ def test_batches_of_disjoint_keys_written_at_once_never_deadlock(
     def write(index: int, name: str) -> tuple[int, int]:
         created = updated = 0
         for batch in range(batches):
+            keys = [_key(index, batch, row) for row in range(rows)]
+            # An autocommit read on the pooled connection first, as a run
+            # does (state, key registry): its reset must not undo the
+            # isolation level of the next merge.
+            registry.known(ENTITY, keys[:1])
             result = writer.write(
                 target,
-                [
-                    {"customer_key": _key(index, batch, row), "name": name}
-                    for row in range(rows)
-                ],
+                [{"customer_key": key, "name": name} for key in keys],
             )
             created += result.created
             updated += result.updated
@@ -87,38 +93,71 @@ def registry(backend: conftest.Backend) -> relational.RelationalKeyRegistry:
     return relational.RelationalKeyRegistry(backend.db, prefix=backend.prefix)
 
 
+# INSERT statements a batch of keys takes, by database: one where the
+# database skips the keys there (MySQL in the driver's executemany, Postgres
+# with the batch as arrays); Oracle fills its staging table in one
+# executemany, then one INSERT ... SELECT. SQLite sends one multi-row
+# INSERT ... RETURNING a page of `_rows_per_insert` rows; so does SQL Server
+# for the first batch of a table, which the online choice of the staging
+# sends as parameters (the second is bulk copied, which no cursor runs),
+# then one INSERT ... SELECT.
+_INSERTS = {"postgresql": 1, "mysql": 1, "oracle": 2}
+
+
+def _expected_inserts(backend: conftest.Backend, rows: int) -> int:
+    if backend.name == "sqlite":
+        return -(-rows // _rows_per_insert(backend))
+    if backend.name == "mssql":
+        return -(-rows // _rows_per_insert(backend)) + 1
+    return _INSERTS[backend.name]
+
+
+def _registry_table(backend: conftest.Backend) -> sa.Table:
+    return bookkeeping.etl_tables(None, backend.prefix).key_registry
+
+
+def _recording(
+    backend: conftest.Backend, action: Callable[[], None]
+) -> list[str]:
+    """The statements `action` runs on the backend."""
+    statements: list[str] = []
+
+    def record(*args: Any) -> None:
+        statement: str = args[2]
+        statements.append(statement.lstrip())
+
+    sa_event.listen(backend.db.engine, "before_cursor_execute", record)
+    try:
+        action()
+    finally:
+        sa_event.remove(backend.db.engine, "before_cursor_execute", record)
+    return statements
+
+
 class TestKeyRegistryInserts:
 
-    def test_more_keys_than_one_insert_holds(
+    def test_a_batch_is_inserted_without_a_read_first(
         self,
         backend: conftest.Backend,
         registry: relational.RelationalKeyRegistry,
     ) -> None:
-        per_insert = _rows_per_insert(backend)
-        entries = _entries(per_insert * 2 + 7)
-        inserts: list[str] = []
+        entries = _entries(_rows_per_insert(backend) * 2 + 7)
+        table = _registry_table(backend).name
 
-        def count(*args: Any) -> None:
-            statement: str = args[2]
-            if statement.lstrip().upper().startswith("INSERT"):
-                inserts.append(statement)
+        statements = _recording(backend, lambda: registry.register(entries))
 
-        sa_event.listen(backend.db.engine, "before_cursor_execute", count)
-        try:
-            registry.register(entries)
-        finally:
-            sa_event.remove(backend.db.engine, "before_cursor_execute", count)
-
-        dialect = backend.db.engine.dialect
-        if dialect.use_insertmanyvalues and (
-            dialect.use_insertmanyvalues_wo_returning
-            or dialect.insert_executemany_returning
-        ):
-            # Multi-row INSERTs, never one statement per row.
-            assert len(inserts) == math.ceil(len(entries) / per_insert)
-        else:
-            # The driver's own (MySQL: multi-row INSERTs; Oracle: arrays).
-            assert len(inserts) == 1
+        inserts = [s for s in statements if s.upper().startswith("INSERT")]
+        # No key is read before writing (SQL Server reads its catalog once,
+        # for the plan of the merge).
+        reads = [
+            s
+            for s in statements
+            if s.upper().startswith("SELECT") and table in s
+        ]
+        assert (len(inserts), reads) == (
+            _expected_inserts(backend, len(entries)),
+            [],
+        )
         keys = [e.surrogate_key for e in entries]
         assert registry.known(ENTITY, keys) == set(keys)
         assert registry.natural_key(ENTITY, keys[-1]) == entries[-1].natural_key
@@ -146,37 +185,93 @@ class TestKeyRegistryInserts:
             "earlier",
         )
 
-    def test_a_concurrent_writer_taking_keys_first(
-        self, backend: conftest.Backend
+    def test_overlapping_batches_keep_the_first_natural_key(
+        self,
+        backend: conftest.Backend,
+        registry: relational.RelationalKeyRegistry,
     ) -> None:
-        relational.create_etl_tables(backend.db, prefix=backend.prefix)
+        first = _entries(700)
+        second = [
+            contract.KeyEntry(ENTITY, e.surrogate_key, ("second",))
+            for e in _entries(700, start=350)
+        ]
+
+        registry.register(first)
+        registry.register(second)
+        registry.register(first)
+
+        keys = [e.surrogate_key for e in _entries(1050)]
+        assert (
+            len(backend.rows(_registry_table(backend), "surrogate_key")) == 1050
+        )
+        assert registry.natural_key(ENTITY, _key(0, 0, 400)) == ("400",)
+        assert registry.natural_key(ENTITY, _key(0, 0, 1000)) == ("second",)
+        assert (
+            {e.surrogate_key for e in registry.entries(ENTITY)}
+            == (registry.known(ENTITY, keys))
+            == set(keys)
+        )
+
+    def test_a_concurrent_writer_taking_keys_first(
+        self,
+        backend: conftest.Backend,
+        registry: relational.RelationalKeyRegistry,
+    ) -> None:
+        """Another writer registers some keys of the batch just before this
+        one writes it: every key once, the first writer's natural key kept."""
         per_insert = _rows_per_insert(backend)
         entries = _entries(per_insert + 50)
-        taken = entries[per_insert : per_insert + 10]
+        taken = [
+            contract.KeyEntry(e.entity, e.surrogate_key, ("taken",))
+            for e in entries[per_insert : per_insert + 10]
+        ]
+        table = _registry_table(backend)
+        raced: list[str] = []
 
-        class Racing(relational.RelationalKeyRegistry):
-            """Another writer registers some keys after the first read."""
+        def race(*args: Any) -> None:
+            statement: str = args[2]
+            if (
+                not raced
+                and statement.lstrip().upper().startswith("INSERT")
+                and table.name in statement
+            ):
+                raced.append(statement)
+                relational.RelationalKeyRegistry(
+                    backend.db, prefix=backend.prefix
+                ).register(taken)
 
-            raced = False
-
-            def _known(
-                self, connection: sa.Connection, entity: str, keys: Any
-            ) -> set[str]:
-                found = super()._known(connection, entity, keys)
-                if not self.raced:
-                    self.raced = True
-                    relational.RelationalKeyRegistry(
-                        backend.db, prefix=backend.prefix
-                    ).register(taken)
-                return found
-
-        racing = Racing(backend.db, prefix=backend.prefix)
-
-        racing.register(entries)
+        sa_event.listen(backend.db.engine, "before_cursor_execute", race)
+        try:
+            registry.register(entries)
+        finally:
+            sa_event.remove(backend.db.engine, "before_cursor_execute", race)
 
         keys = [e.surrogate_key for e in entries]
-        assert racing.raced
-        assert racing.known(ENTITY, keys) == set(keys)
+        assert len(raced) == 1
+        assert registry.known(ENTITY, keys) == set(keys)
+        assert registry.natural_key(ENTITY, taken[0].surrogate_key) == (
+            "taken",
+        )
+        assert len(backend.rows(table, "surrogate_key")) == len(entries)
+
+    def test_the_same_keys_registered_by_four_threads_at_once(
+        self,
+        backend: conftest.Backend,
+        registry: relational.RelationalKeyRegistry,
+    ) -> None:
+        entries = _entries(1000)
+        keys = [e.surrogate_key for e in entries]
+
+        with concurrent.futures.ThreadPoolExecutor(4) as threads:
+            list(threads.map(lambda _: registry.register(entries), range(4)))
+
+        assert (
+            len(backend.rows(_registry_table(backend), "surrogate_key")) == 1000
+        )
+        assert registry.known(ENTITY, keys) == set(keys)
+        assert {
+            e.surrogate_key: e.natural_key for e in registry.entries(ENTITY)
+        } == {e.surrogate_key: e.natural_key for e in entries}
 
 
 def test_inserting_no_rows_does_nothing(

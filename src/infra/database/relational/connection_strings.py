@@ -21,7 +21,6 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 import dataclasses
 import re
-from typing import Any
 
 import sqlalchemy as sa
 
@@ -57,7 +56,7 @@ class ConnectionSpec:
     """
 
     url: sa.URL
-    connect_args: dict[str, Any] = dataclasses.field(default_factory=dict)
+    connect_args: dict[str, object] = dataclasses.field(default_factory=dict)
     source: str = "sqlalchemy"
     guessed: bool = False
     ignored: tuple[str, ...] = ()
@@ -340,7 +339,7 @@ def _build(
 
 def _mssql(
     settings: _Settings, drivername: str
-) -> tuple[sa.URL, dict[str, Any]]:
+) -> tuple[sa.URL, dict[str, object]]:
     """SqlClient, ODBC, OLE DB and JDBC settings, for SQL Server drivers."""
     server = settings.take(*_SERVER) or ""
     server = re.sub(r"^tcp:", "", server.strip(), flags=re.I)
@@ -380,7 +379,7 @@ def _mssql(
         if value is not None:
             query[name] = value
 
-    connect_args: dict[str, Any] = {}
+    connect_args: dict[str, object] = {}
     timeout = settings.take(*_TIMEOUT)
     if timeout is not None:
         connect_args["attrs_before"] = {_SQL_ATTR_LOGIN_TIMEOUT: int(timeout)}
@@ -408,10 +407,10 @@ def _odbc_bool(value: str) -> str:
 
 def _oracle(
     settings: _Settings, drivername: str
-) -> tuple[sa.URL, dict[str, Any]]:
+) -> tuple[sa.URL, dict[str, object]]:
     """ODP.NET, OLE DB and JDBC settings, for python-oracledb."""
     source = (settings.take("datasource", *_SERVER) or "").strip()
-    connect_args: dict[str, Any] = {}
+    connect_args: dict[str, object] = {}
     host: str | None = None
     port: str | None = None
     database: str | None = None
@@ -479,7 +478,7 @@ _NPGSQL_TO_LIBPQ_SSL_MODES = {
 
 def _postgres(
     settings: _Settings, drivername: str
-) -> tuple[sa.URL, dict[str, Any]]:
+) -> tuple[sa.URL, dict[str, object]]:
     """Npgsql, JDBC and libpq settings, for psycopg."""
     hosts = (settings.take(*_SERVER) or "").split(",")
     port = settings.take("port")
@@ -527,7 +526,7 @@ def _postgres(
 
 def _mysql(
     settings: _Settings, drivername: str
-) -> tuple[sa.URL, dict[str, Any]]:
+) -> tuple[sa.URL, dict[str, object]]:
     """Connector/NET, MySqlConnector and JDBC settings, for PyMySQL."""
     host = (settings.take(*_SERVER) or "").split(",")[0].strip()
     query: dict[str, str] = {}
@@ -538,7 +537,7 @@ def _mysql(
     if timeout is not None:
         query["connect_timeout"] = timeout
 
-    connect_args: dict[str, Any] = {}
+    connect_args: dict[str, object] = {}
     mode = (settings.take("sslmode") or "").lower().replace("_", "")
     use_ssl = settings.flag("usessl")
     if mode in ("none", "disabled") or use_ssl is False:
@@ -567,7 +566,7 @@ def _mysql(
 
 
 _BUILDERS: dict[
-    str, Callable[[_Settings, str], tuple[sa.URL, dict[str, Any]]]
+    str, Callable[[_Settings, str], tuple[sa.URL, dict[str, object]]]
 ] = {
     "mssql": _mssql,
     "oracle": _oracle,

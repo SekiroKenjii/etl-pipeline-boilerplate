@@ -12,17 +12,14 @@ settings (which it resolves):
   `VAULT_CACERT` (a PEM file) or `VAULT_CAPATH` (a directory of them) for
   a private CA. `VAULT_SKIP_VERIFY` is not supported: certificates are
   always verified. Redirects (a standby node) are not followed: point
-  `VAULT_ADDR` at the active node or the load balancer. Needs the `http`
-  extra.
+  `VAULT_ADDR` at the active node or the load balancer.
 - `gcp`: Secret Manager, the full version name, or `<secret>` (its latest
   version in `$GOOGLE_CLOUD_PROJECT`); Application Default Credentials.
-  Needs the `gcp-secrets` extra.
 - `azure`: Key Vault, `<vault>/<secret>[/<version>]`;
   `DefaultAzureCredential` (managed identity, environment, CLI). The vault
   is `<vault>.vault.azure.net`; in another cloud, set
   `AZURE_KEYVAULT_DNS_SUFFIX` (`vault.azure.cn`, `vault.usgovcloudapi.net`)
   and `AZURE_AUTHORITY_HOST`, or give the vault's host name as `<vault>`.
-  Needs the `azure-secrets` extra.
 
 A secret is read once per process, whatever the number of placeholders.
 """
@@ -35,12 +32,17 @@ import os
 import pathlib
 import ssl
 import threading
-from typing import Any
 
+from azure import identity as azure_identity
+from azure.core import exceptions as azure_errors
+from azure.keyvault import secrets as azure_secrets
+from google.api_core import exceptions as google_errors
+from google.auth import exceptions as auth_errors
+from google.cloud import secretmanager
+import httpx
+
+from app import clients
 import config
-
-# Imported at a manager's first secret: a deployment needs only its extra.
-# pylint: disable=import-outside-toplevel
 
 _INSTALLED = threading.Event()
 
@@ -60,12 +62,12 @@ def _cached(read: Callable[[str], str]) -> Callable[[str], str]:
     return functools.cache(read)
 
 
-def vault(reference: str, http: Any = None) -> str:
+def vault(reference: str, http: httpx.Client | None = None) -> str:
     """Reads `<mount>/<path>#<field>` from Vault's KV version 2 engine.
 
     Args:
         reference: The secret, e.g. `secret/crm/db#password`.
-        http: An `httpx.Client`-like object (tests); a new one by default.
+        http: The client (tests); a new one by default.
 
     Raises:
         SecretError: If Vault is not configured, or has no such secret.
@@ -83,8 +85,6 @@ def vault(reference: str, http: Any = None) -> str:
     if namespace := os.environ.get("VAULT_NAMESPACE"):
         headers["X-Vault-Namespace"] = namespace
     url = f"{address.rstrip('/')}/v1/{mount}/data/{name}"
-    import httpx
-
     try:
         if http is not None:
             response = http.get(url, headers=headers)
@@ -144,7 +144,9 @@ def _vault_token() -> str:
     )
 
 
-def gcp(reference: str, client: Any = None) -> str:
+def gcp(
+    reference: str, client: clients.SecretManagerClient | None = None
+) -> str:
     """Reads a secret version of Google Cloud Secret Manager.
 
     Args:
@@ -165,14 +167,6 @@ def gcp(reference: str, client: Any = None) -> str:
             )
         name = f"projects/{project}/secrets/{reference}/versions/latest"
     try:
-        from google.api_core import exceptions as google_errors
-        from google.auth import exceptions as auth_errors
-        from google.cloud import secretmanager
-    except ImportError:
-        raise config.SecretError(
-            "gcp: install the `gcp-secrets` extra"
-        ) from None
-    try:
         client = client or secretmanager.SecretManagerServiceClient()
         response = client.access_secret_version(request={"name": name})
     except (google_errors.GoogleAPIError, auth_errors.GoogleAuthError) as exc:
@@ -180,7 +174,7 @@ def gcp(reference: str, client: Any = None) -> str:
     return str(response.payload.data.decode("utf-8"))
 
 
-def azure(reference: str, client: Any = None) -> str:
+def azure(reference: str, client: clients.KeyVaultClient | None = None) -> str:
     """Reads a secret of Azure Key Vault.
 
     Args:
@@ -198,16 +192,9 @@ def azure(reference: str, client: Any = None) -> str:
     vault_name, secret = parts[0], parts[1]
     version = parts[2] if len(parts) == 3 else None
     try:
-        from azure.core import exceptions as azure_errors
-        from azure.identity import DefaultAzureCredential
-        from azure.keyvault.secrets import SecretClient
-    except ImportError:
-        raise config.SecretError(
-            "azure: install the `azure-secrets` extra"
-        ) from None
-    try:
-        client = client or SecretClient(
-            _azure_vault_url(vault_name), DefaultAzureCredential()
+        client = client or azure_secrets.SecretClient(
+            _azure_vault_url(vault_name),
+            azure_identity.DefaultAzureCredential(),
         )
         found = client.get_secret(secret, version)
     except azure_errors.AzureError as exc:

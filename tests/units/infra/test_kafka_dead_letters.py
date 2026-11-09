@@ -113,3 +113,64 @@ def test_a_long_reason_is_cut(producer: list[_Producer]) -> None:
     error = _headers(producer)["etl.error"].decode()
     assert len(error) == 1000
     assert error.endswith("…")
+
+
+def _sent_reason(
+    built: list[_Producer], reason: str, redact: tuple[str, ...] = ()
+) -> str:
+    cluster = (
+        kafka.KafkaCluster({"bootstrap.servers": "k:9092"}, redact=redact)
+        if redact
+        else kafka.KafkaCluster({"bootstrap.servers": "k:9092"})
+    )
+    cluster.dead_letters("dlq").send(_message(), reason)
+    return _headers(built)["etl.error"].decode()
+
+
+def test_the_names_of_the_logs_are_redacted_too(
+    producer: list[_Producer],
+) -> None:
+    error = _sent_reason(
+        producer, "bad value: badge=B-4711; token=t0k", redact=("badge",)
+    )
+
+    assert error == "bad value: badge=***; token=***"
+
+
+@pytest.mark.parametrize(
+    ("secret", "start"),
+    [
+        # The cut at 4,000 characters falls in the password: no `@` left.
+        ("postgresql://etl:S3cr3tS3cr3t@db/crm", 4_000 - 20),
+        # It falls before the closing parenthesis.
+        ("Key (email)=(jane@example.com, " + "x" * 700 + ")", 3_500),
+    ],
+    ids=["url", "key"],
+)
+def test_a_secret_where_a_long_reason_used_to_be_cut_is_redacted(
+    producer: list[_Producer], secret: str, start: int
+) -> None:
+    # The long token before it shrinks to `***`: what follows it is in the
+    # first 1,000 characters sent.
+    token = "token=" + "t" * (start - len("token=") - 1)
+
+    error = _sent_reason(producer, f"{token} {secret} end")
+
+    for leaked in ("S3c", "jane@example.com"):
+        assert leaked not in error
+    assert error.startswith("token=*** ")
+
+
+def test_an_empty_reason_is_sent_empty(producer: list[_Producer]) -> None:
+    assert not _sent_reason(producer, "")
+
+
+def test_a_reason_of_a_megabyte_is_redacted_whole_then_cut(
+    producer: list[_Producer],
+) -> None:
+    reason = ("password=hunter2 " * 60_000) + "Key (id)=(42) exists"
+
+    error = _sent_reason(producer, reason)
+
+    assert len(error) == 1000
+    assert "hunter2" not in error

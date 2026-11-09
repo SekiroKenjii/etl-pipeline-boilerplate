@@ -28,6 +28,8 @@ import pydantic
 import pydantic_settings
 
 from config import secrets
+from config import tuning as config_tuning
+from shared import utils
 
 ENV_VARIABLE = "ETL_ENV"
 DEFAULT_ENV = "dev"
@@ -80,7 +82,7 @@ def _flat(name: str) -> str:
     return re.sub(r"[_\-.\s]", "", name).lower()
 
 
-def _secret_values(value: Any, secret: bool = False) -> Any:
+def _secret_values(value: object, secret: bool = False) -> object:
     """Wraps in `SecretStr` the values of the keys naming a secret, nested."""
     if isinstance(value, Mapping):
         return {
@@ -94,25 +96,28 @@ def _secret_values(value: Any, secret: bool = False) -> Any:
     return value
 
 
-def _revealed(value: Any) -> Any:
+def _revealed(value: object) -> object:
     """The values of `_secret_values`, secrets revealed: for the drivers."""
     if isinstance(value, pydantic.SecretStr):
         return value.get_secret_value()
     if isinstance(value, Mapping):
-        return {key: _revealed(item) for key, item in value.items()}
+        return _revealed_items(value)
     if isinstance(value, list):
         return [_revealed(item) for item in value]
     return value
 
 
-def _hidden(value: Any, names: Collection[str], secret: bool = False) -> Any:
+def _revealed_items(mapping: Mapping[str, object]) -> dict[str, object]:
+    return {key: _revealed(item) for key, item in mapping.items()}
+
+
+def _hidden(
+    value: utils.JsonValue, names: Collection[str], secret: bool = False
+) -> utils.JsonValue:
     """Shown settings data, with the values of secret keys masked and the
     passwords of URLs hidden."""
-    if isinstance(value, Mapping):
-        return {
-            key: _hidden(item, names, secret or is_secret_name(key, names))
-            for key, item in value.items()
-        }
+    if isinstance(value, dict):
+        return _hidden_items(value, names, secret)
     if isinstance(value, list):
         return [_hidden(item, names, secret) for item in value]
     if secret and value is not None:
@@ -122,13 +127,22 @@ def _hidden(value: Any, names: Collection[str], secret: bool = False) -> Any:
     return value
 
 
+def _hidden_items(
+    shown: utils.JsonObject, names: Collection[str], secret: bool = False
+) -> utils.JsonObject:
+    return {
+        key: _hidden(item, names, secret or is_secret_name(key, names))
+        for key, item in shown.items()
+    }
+
+
 def _is_mongodb(url: str) -> bool:
     return url.startswith(("mongodb://", "mongodb+srv://"))
 
 
 # The values of secret keys are hidden.
 type _FreeForm = Annotated[
-    dict[str, Any], pydantic.AfterValidator(_secret_values)
+    dict[str, object], pydantic.AfterValidator(_secret_values)
 ]
 
 
@@ -142,6 +156,10 @@ class ConfigError(ValueError):
     def __init__(self, problems: list[str]) -> None:
         super().__init__("Invalid settings:\n  " + "\n  ".join(problems))
         self.problems = problems
+
+
+# A byte count: an int, or a string with a unit (`"256MiB"`).
+_Bytes = Annotated[int, pydantic.BeforeValidator(utils.parse_byte_size)]
 
 
 class _Model(pydantic.BaseModel):
@@ -186,7 +204,6 @@ class LoggingSettings(_Model):
         otlp: Also export to OpenTelemetry, when set.
         redact: More names whose values are hidden, wherever they appear,
             on top of the built-in ones (`observability.SECRET_NAMES`).
-        queue_size: Records buffered before the slowest sink drops some.
     """
 
     level: str = "INFO"
@@ -203,7 +220,6 @@ class LoggingSettings(_Model):
         "credential",
         "private_key",
     )
-    queue_size: Annotated[int, pydantic.Field(ge=100)] = 10_000
 
 
 class KafkaSettings(_Model):
@@ -228,11 +244,11 @@ class KafkaSettings(_Model):
     credentials: dict[str, pydantic.SecretStr] = {}
     timeout_seconds: float = 30.0
 
-    def librdkafka(self) -> dict[str, Any]:
+    def librdkafka(self) -> dict[str, object]:
         """The librdkafka properties, secrets included."""
         return {
             "bootstrap.servers": self.bootstrap_servers,
-            **_revealed(self.options),
+            **_revealed_items(self.options),
             **{k: v.get_secret_value() for k, v in self.credentials.items()},
         }
 
@@ -275,8 +291,8 @@ class _Options(_Model):
     @pydantic.model_serializer(mode="wrap")
     def _given(
         self, handler: pydantic.SerializerFunctionWrapHandler
-    ) -> dict[str, Any]:
-        shown: dict[str, Any] = handler(self)
+    ) -> dict[str, object]:
+        shown: dict[str, object] = handler(self)
         return {k: v for k, v in shown.items() if v is not None and v != {}}
 
 
@@ -347,11 +363,10 @@ class EngineOptions(_Options):
             )
         return self
 
-    def arguments(self) -> dict[str, Any]:
+    def arguments(self) -> dict[str, object]:
         """The arguments of `create_engine`, secrets revealed."""
         given = self.model_dump(exclude={"dialect_options"})
-        arguments: dict[str, Any] = _revealed({**given, **self.dialect_options})
-        return arguments
+        return _revealed_items({**given, **self.dialect_options})
 
     def capacity(self) -> int | None:
         """The most connections the pool opens; None for no limit."""
@@ -436,11 +451,10 @@ class MongoOptions(_Options):
 
     DEFAULT_POOL_SIZE: ClassVar[int] = 100
 
-    def arguments(self) -> dict[str, Any]:
+    def arguments(self) -> dict[str, object]:
         """The arguments of `MongoClient`, secrets revealed."""
         given = self.model_dump(exclude={"client_options"})
-        arguments: dict[str, Any] = _revealed({**given, **self.client_options})
-        return arguments
+        return _revealed_items({**given, **self.client_options})
 
     def capacity(self) -> int | None:
         """The most connections the pool opens; None for no limit."""
@@ -463,8 +477,9 @@ class DatabaseSettings(_Model):
             MongoDB client (`MongoOptions`): pool size, timeouts...
         page_size: The rows read per query: a page is held in memory, by
             every step reading the database at the same time. Keep it at the
-            `batch_size` of the pipelines reading it (1000 by default): a
-            bigger page holds more rows, a smaller one takes more queries.
+            `batch_size` of the pipelines reading it (1000 by default, at
+            most 100,000): a bigger page holds more rows, a smaller one takes
+            more queries.
         replication_prefix: Postgres: the prefix of the replication slot and
             publication of each table read by logical replication.
         changes: Where its changes are read; its own log by default.
@@ -475,13 +490,15 @@ class DatabaseSettings(_Model):
     options: EngineOptions | MongoOptions = pydantic.Field(
         default_factory=dict, validate_default=True
     )
-    page_size: Annotated[int, pydantic.Field(ge=1)] = 1_000
+    page_size: Annotated[int, pydantic.Field(ge=1, le=100_000)] = 1_000
     replication_prefix: str = "etl_"
     changes: ChangesSettings = ChangesSettings()
 
     @pydantic.field_validator("options", mode="before")
     @classmethod
-    def _options(cls, value: Any, info: pydantic.ValidationInfo) -> Any:
+    def _options(
+        cls, value: object, info: pydantic.ValidationInfo
+    ) -> EngineOptions | MongoOptions:
         """Validates the options as the URL's database takes them."""
         url = info.data.get("url")
         mongodb = isinstance(url, pydantic.SecretStr) and _is_mongodb(
@@ -591,19 +608,15 @@ class LineageSettings(_Model):
 
 
 class RunsSettings(_Model):
-    """How runs hold their lock, and how many steps they run at once.
+    """How runs hold their lock.
 
     Attributes:
         lease_seconds: How long a run's lock outlives its process: renewed
             every third of it while the run goes on; after a crash, the next
             run waits that long at most.
-        max_parallel_steps: The most steps a process runs at the same time,
-            whatever the module asks; the module decides if None. The pools
-            of the databases must hold the connections of that many steps.
     """
 
     lease_seconds: Annotated[float, pydantic.Field(ge=1)] = 300.0
-    max_parallel_steps: Annotated[int, pydantic.Field(ge=1)] | None = None
 
 
 class ModuleSettings(_Model):
@@ -620,7 +633,7 @@ class ModuleSettings(_Model):
 
     module: str | None = None
     enabled: bool = True
-    settings: dict[str, Any] = {}
+    settings: dict[str, object] = {}
 
 
 class AppSettings(pydantic_settings.BaseSettings):
@@ -638,7 +651,8 @@ class AppSettings(pydantic_settings.BaseSettings):
         bookkeeping: Where the ETL keeps its records.
         key_secret: Keys the HMAC surrogate keys of personal data.
         privacy: Whether personal data is anonymized.
-        runs: How runs hold their lock, and run their steps.
+        runs: How runs hold their lock.
+        tuning: The thresholds bound by the resources of the process.
         lineage: Where OpenLineage events go, if anywhere.
         modules: The business modules, by name.
     """
@@ -663,6 +677,9 @@ class AppSettings(pydantic_settings.BaseSettings):
     key_secret: pydantic.SecretStr | None = None
     privacy: PrivacySettings = PrivacySettings()
     runs: RunsSettings = RunsSettings()
+    tuning: config_tuning.TuningSettings = pydantic.Field(
+        default_factory=config_tuning.TuningSettings
+    )
     lineage: LineageSettings | None = None
     modules: dict[str, ModuleSettings] = {}
     _unresolved_placeholders_by_path: dict[tuple[str | int, ...], str] = (
@@ -691,7 +708,9 @@ class AppSettings(pydantic_settings.BaseSettings):
     @pydantic.model_validator(mode="wrap")
     @classmethod
     def _secrets(
-        cls, data: Any, handler: pydantic.ModelWrapValidatorHandler[AppSettings]
+        cls,
+        data: object,
+        handler: pydantic.ModelWrapValidatorHandler[AppSettings],
     ) -> AppSettings:
         """Resolves the secret placeholders of every value, and remembers
         them to show them instead."""
@@ -804,30 +823,29 @@ class AppSettings(pydantic_settings.BaseSettings):
                 f" most, {why} need {count}"
                 f"{' with the ETL records' if name == book else ''}: set"
                 f" databases.{name}.options.{grow} or more, or lower"
-                " runs.max_parallel_steps"
+                " tuning.max_parallel_steps"
             )
         if problems:
             raise ValueError("; ".join(problems))
 
-    def redacted(self) -> dict[str, Any]:
+    def redacted(self) -> utils.JsonObject:
         """Returns the settings as data, secrets hidden: to show them.
 
         Hidden: secret values (`SecretStr`), the values of keys naming a
         secret (`is_secret_name`, with `logging.redact`) and the passwords
         of URLs; values given by placeholders show the placeholders.
         """
-        shown = self.model_dump(mode="json")
+        shown: utils.JsonObject = self.model_dump(mode="json")
         for path, text in self._unresolved_placeholders_by_path.items():
             _replace(shown, path, text)
-        hidden: dict[str, Any] = _hidden(shown, self.logging.redact)
-        return hidden
+        return _hidden_items(shown, self.logging.redact)
 
 
 def load_settings(
     env: str | None = None,
     *,
     directory: pathlib.Path | str = "config",
-    overrides: Mapping[str, Any] | None = None,
+    overrides: Mapping[str, object] | None = None,
 ) -> AppSettings:
     """Loads and validates the settings of an environment.
 
@@ -854,24 +872,35 @@ def load_settings(
     loaded: type[AppSettings] = type(
         "LoadedSettings", (AppSettings,), {"toml_files": files, "__doc__": None}
     )
+    # pydantic types `__init__` field by field; it validates these values.
+    values: dict[str, Any] = {"env": chosen, **(overrides or {})}
     try:
-        return loaded(**{"env": chosen, **dict(overrides or {})})
+        return loaded(**values)
     except pydantic.ValidationError as exc:
         raise ConfigError(_problems(exc)) from None
 
 
-def _replace(data: Any, path: tuple[str | int, ...], text: str) -> None:
+def _replace(
+    data: utils.JsonValue, path: tuple[str | int, ...], text: str
+) -> None:
     """Shows `text` at `path` of shown settings, unless nothing is there or
     a hidden secret is."""
-    parent = data
+    parent: object = data
     for part in path[:-1]:
         parent = _child(parent, part)
-    if path and isinstance(found := _child(parent, path[-1]), str):
-        if found != _MASK:
-            parent[path[-1]] = text
+    if not path:
+        return
+    last = path[-1]
+    shown = _child(parent, last)
+    if not isinstance(shown, str) or shown == _MASK:
+        return
+    if isinstance(parent, dict):
+        parent[str(last)] = text
+    elif isinstance(parent, list) and isinstance(last, int):
+        parent[last] = text
 
 
-def _child(data: Any, part: str | int) -> Any:
+def _child(data: object, part: str | int) -> object:
     """The item `part` of shown settings data; `_MISSING` if none."""
     if isinstance(data, dict):
         return data.get(part, _MISSING)

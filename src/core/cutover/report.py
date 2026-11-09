@@ -6,7 +6,8 @@ The verdict is one of:
 - `PASSED-WITH-REJECTS`: likewise, but rejected rows are left behind, all of
   them accepted (`AcceptedRejections`).
 - `FAILED`: something is missing, extra, different or rejected that nothing
-  explains.
+  explains; or an entity is empty on both sides (`empty`), unless the BAs
+  accept it (`AcceptedRejections.empty`).
 - `COUNTED`: the rows were only counted (`--counts-only`): no verdict.
 """
 
@@ -15,18 +16,17 @@ from __future__ import annotations
 from collections.abc import Collection, Iterable, Mapping, Sequence
 import dataclasses
 import datetime
-from typing import Any, Literal
 
 from core import contract
 from core.cutover import acceptance
 from core.cutover import checksum
 from core.cutover import diff
 
-type Verdict = Literal["PASSED", "PASSED-WITH-REJECTS", "FAILED", "COUNTED"]
-PASSED: Verdict = "PASSED"
-PASSED_WITH_REJECTS: Verdict = "PASSED-WITH-REJECTS"
-FAILED: Verdict = "FAILED"
-COUNTED: Verdict = "COUNTED"
+PASSED: contract.Verdict = "PASSED"
+PASSED_WITH_REJECTS: contract.Verdict = "PASSED-WITH-REJECTS"
+FAILED: contract.Verdict = "FAILED"
+COUNTED: contract.Verdict = "COUNTED"
+_FAILING: frozenset[contract.EntityStatus] = frozenset({"mismatch", "empty"})
 
 
 @dataclasses.dataclass(slots=True)
@@ -51,20 +51,20 @@ class CutoverReport:
     runs: list[contract.RunRecord] = dataclasses.field(
         default_factory=list[contract.RunRecord]
     )
-    provenance: dict[str, Any] = dataclasses.field(
-        default_factory=dict[str, Any]
+    provenance: dict[str, object] = dataclasses.field(
+        default_factory=dict[str, object]
     )
 
     @property
     def passed(self) -> bool:
         """Whether no entity has a difference left unexplained."""
-        return all(entity.status != "mismatch" for entity in self.entities)
+        return all(entity.status not in _FAILING for entity in self.entities)
 
     @property
-    def verdict(self) -> Verdict:
+    def verdict(self) -> contract.Verdict:
         """The verdict: see the module's documentation."""
         statuses = {entity.status for entity in self.entities}
-        if "mismatch" in statuses:
+        if statuses & _FAILING:
             return FAILED
         if "counted" in statuses:
             return COUNTED
@@ -72,7 +72,7 @@ class CutoverReport:
             return PASSED_WITH_REJECTS
         return PASSED
 
-    def as_dict(self) -> dict[str, Any]:
+    def as_dict(self) -> dict[str, object]:
         """The report as JSON-compatible data."""
         return {
             "module": self.module,
@@ -114,7 +114,7 @@ def last_runs(
     return [last[name] for name in sorted(last)]
 
 
-def _entity(entity: diff.EntityReport) -> dict[str, Any]:
+def _entity(entity: diff.EntityReport) -> dict[str, object]:
     """An entity's reconciliation as JSON-compatible data."""
     fields = dataclasses.asdict(entity)
     fields["samples"] = [
@@ -137,7 +137,8 @@ def _entity(entity: diff.EntityReport) -> dict[str, Any]:
     return fields
 
 
-def build(
+# The options of `diff.reconcile`, keyword-only, next to the report's own.
+def build(  # pylint: disable=too-many-arguments
     module: str,
     reconciliations: Sequence[contract.Reconciliation],
     *,
@@ -148,7 +149,8 @@ def build(
     samples: int = 20,
     accepted: acceptance.AcceptedRejections | None = None,
     resolution: int = checksum.MICROSECONDS,
-    provenance: Mapping[str, Any] | None = None,
+    provenance: Mapping[str, object] | None = None,
+    spill_rows: int = diff.SPILL_ROWS,
 ) -> CutoverReport:
     """Reconciles every entity of a module, and reports.
 
@@ -160,9 +162,11 @@ def build(
         counted_only: Whether to count the rows only, in the databases.
         buckets: See `diff.reconcile`.
         samples: See `diff.reconcile`.
-        accepted: The rejected rows the BAs accept to leave behind.
+        accepted: The rejected rows the BAs accept to leave behind, and the
+            entities they accept empty.
         resolution: See `diff.reconcile`.
         provenance: What produces the report (`CutoverReport.provenance`).
+        spill_rows: See `diff.reconcile`.
     """
     entities: list[diff.EntityReport] = []
     for reconciliation in reconciliations:
@@ -170,17 +174,20 @@ def build(
         if counted_only:
             entities.append(diff.count(reconciliation, parked=parked))
             continue
-        entities.append(
-            diff.reconcile(
-                reconciliation,
-                buckets=buckets,
-                samples=samples,
-                parked=parked,
-                parked_keys=keys,
-                accepted=accepted.of(reconciliation.entity) if accepted else {},
-                resolution=resolution,
-            )
+        entity = diff.reconcile(
+            reconciliation,
+            buckets=buckets,
+            samples=samples,
+            parked=parked,
+            parked_keys=keys,
+            accepted=accepted.of(reconciliation.entity) if accepted else {},
+            resolution=resolution,
+            spill_rows=spill_rows,
         )
+        entity.accepted_empty = bool(
+            accepted and accepted.accepts_empty(entity.entity)
+        )
+        entities.append(entity)
     runs = last_runs(ledger.recent(None, 1000), module) if ledger else []
     return CutoverReport(
         module=module,

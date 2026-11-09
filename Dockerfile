@@ -29,7 +29,7 @@ ENV UV_COMPILE_BYTECODE=1 \
     UV_PYTHON_DOWNLOADS=0 \
     UV_PROJECT_ENVIRONMENT=/opt/etl
 WORKDIR /src
-# The extras to install: every connector by default.
+# The extras to install: the SQL Server, Oracle and MySQL drivers by default.
 ARG EXTRAS="--all-extras"
 # Dependencies first: their layer survives changes of the code.
 COPY pyproject.toml uv.lock ./

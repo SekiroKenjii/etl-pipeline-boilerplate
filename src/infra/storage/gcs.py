@@ -1,47 +1,28 @@
 """A Google Cloud Storage bucket seen as an object store.
 
-Needs the `gcs` extra (google-cloud-storage). Credentials come from
-Application Default Credentials: `gcloud auth application-default login`
-locally, the service account on GCP.
+Credentials come from Application Default Credentials: `gcloud auth
+application-default login` locally, the service account on GCP.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 import threading
-from typing import Any, BinaryIO, cast, Protocol
+from typing import BinaryIO
 
 from google.api_core import exceptions as google_exceptions
 from google.cloud import storage
 
 from core import contract
+from infra.storage import clients as storage_clients
 
 
-class GcsClient(Protocol):
-    """The part of `storage.Client` this adapter uses."""
-
-    def list_blobs(
-        self, bucket_or_name: str, *, prefix: str | None = ...
-    ) -> Iterator[Any]:
-        """Yields the blobs of a bucket, by name."""
-        ...
-
-    def bucket(self, bucket_name: str) -> Any:
-        """Returns a handle on a bucket."""
-        ...
-
-    def close(self) -> None:
-        """Releases the connections of the client."""
-        ...
-
-
-type ClientFactory = Callable[[], GcsClient]
-
-
-def default_client_factory(project: str | None = None) -> ClientFactory:
+def default_client_factory(
+    project: str | None = None,
+) -> storage_clients.GcsClientFactory:
     """Returns a factory of `storage.Client`s for `project`."""
 
-    def create() -> GcsClient:
+    def create() -> storage_clients.GcsClient:
         return storage.Client(project=project)
 
     return create
@@ -65,7 +46,7 @@ class GcsObjectStore(contract.IObjectStore):
         bucket: str,
         *,
         project: str | None = None,
-        client_factory: ClientFactory | None = None,
+        client_factory: storage_clients.GcsClientFactory | None = None,
     ) -> None:
         """Initializes the store; clients are created on first use.
 
@@ -78,7 +59,7 @@ class GcsObjectStore(contract.IObjectStore):
         self.bucket = bucket
         self._factory = client_factory or default_client_factory(project)
         self._local = threading.local()
-        self._clients: list[GcsClient] = []
+        self._clients: list[storage_clients.GcsClient] = []
         self._lock = threading.Lock()
 
     @property
@@ -101,6 +82,11 @@ class GcsObjectStore(contract.IObjectStore):
             if blob.name.endswith("/"):
                 # A "folder" placeholder, created by the console.
                 continue
+            if blob.updated is None:
+                raise contract.FatalError(
+                    f"gs://{self.bucket}/{blob.name} is listed without its"
+                    " update time"
+                )
             yield contract.ObjectInfo(
                 key=blob.name,
                 size=int(blob.size or 0),
@@ -127,11 +113,13 @@ class GcsObjectStore(contract.IObjectStore):
                 f"gs://{self.bucket}/{obj.key} generation {obj.version} is"
                 " gone: it changed while the run was reading it"
             ) from exc
-        return cast(BinaryIO, blob.open("rb"))
+        return blob.open("rb")
 
-    def _client(self) -> GcsClient:
+    def _client(self) -> storage_clients.GcsClient:
         """Returns the client of the current thread, creating it if needed."""
-        client: GcsClient | None = getattr(self._local, "client", None)
+        client: storage_clients.GcsClient | None = getattr(
+            self._local, "client", None
+        )
         if client is None:
             client = self._factory()
             self._local.client = client

@@ -146,9 +146,6 @@ def _spawn(job: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
-# Source.
-
-
 def _customer(i: int) -> dict[str, Any]:
     dirty = i % DIRTY_EVERY == 0
     return {
@@ -260,9 +257,6 @@ def _drop_source(url: str) -> None:
         db.close()
 
 
-# Target.
-
-
 def _recreate_target(url: str) -> None:
     """Drops the CRM tables and the ETL's records, then creates the former."""
     db = relational.Database(url)
@@ -291,9 +285,6 @@ def _reset_state(url: str) -> None:
         db.close()
 
 
-# One run, in a child process.
-
-
 class _Span(tracing.Span):
     """A span that reports its duration to `_Clock`."""
 
@@ -301,7 +292,7 @@ class _Span(tracing.Span):
         self,
         clock: _Clock,
         name: str,
-        attributes: Mapping[str, tracing.Attribute],
+        attributes: Mapping[str, contract.Attribute],
         parent: tracing.Span | None,
     ) -> None:
         self.name = name
@@ -320,7 +311,7 @@ class _Span(tracing.Span):
         return ""
 
     def set_attributes(
-        self, attributes: Mapping[str, tracing.Attribute]
+        self, attributes: Mapping[str, contract.Attribute]
     ) -> None:
         del attributes  # Unused.
 
@@ -346,7 +337,7 @@ class _Clock(tracing.ITracer):
     def start_span(
         self,
         name: str,
-        attributes: Mapping[str, tracing.Attribute],
+        attributes: Mapping[str, contract.Attribute],
         parent: tracing.Span | None,
     ) -> tracing.Span:
         return _Span(self, name, attributes, parent)
@@ -506,9 +497,6 @@ def _peak_mb() -> float:
     peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     # Kilobytes on Linux, bytes on macOS.
     return peak / (1024 * 1024) if sys.platform == "darwin" else peak / 1024
-
-
-# Report.
 
 
 def _setup(source: str, target: str) -> dict[str, Any]:

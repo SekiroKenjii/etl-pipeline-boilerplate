@@ -21,7 +21,7 @@ import threading
 # `${provider:reference}`; `$${` writes a literal `${`.
 _PLACEHOLDER = re.compile(r"\$\$\{|\$\{([a-z][a-z0-9_]*):([^}]*)\}")
 
-type SecretProvider = Callable[[str], str]
+type _SecretProvider = Callable[[str], str]
 
 
 class SecretError(ValueError):
@@ -42,7 +42,7 @@ def _from_file(path: str) -> str:
         raise SecretError(f"cannot read secret file {path}: {exc}") from None
 
 
-_PROVIDERS: dict[str, SecretProvider] = {"env": _from_env, "file": _from_file}
+_PROVIDERS: dict[str, _SecretProvider] = {"env": _from_env, "file": _from_file}
 _BUILT_IN = frozenset(_PROVIDERS)
 _LOCK = threading.Lock()
 _KEEP_PLACEHOLDERS = contextvars.ContextVar("unresolved", default=False)
@@ -64,7 +64,7 @@ def unresolved() -> Iterator[None]:
         _KEEP_PLACEHOLDERS.reset(token)
 
 
-def register_provider(name: str, provider: SecretProvider) -> None:
+def register_provider(name: str, provider: _SecretProvider) -> None:
     """Adds a source of secrets, e.g. `vault` for `${vault:crm/db#password}`.
 
     Args:

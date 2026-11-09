@@ -2,8 +2,9 @@
 
 The crosswalk (key registry) serves referential integrity checks and lookups
 between natural and surrogate keys; database-backed registries are database
-adapters (`infra.database`). `discover_relationships` suggests the keys and
-foreign keys of a legacy schema.
+adapters (`infra.database`), behind a `TieredKeyCache`.
+`discover_relationships` suggests the keys and foreign keys of a legacy
+schema.
 """
 
 from core.keys.generation import canonical
@@ -14,7 +15,6 @@ from core.keys.generation import KeyMaker
 from core.keys.generation import MissingKeyComponentError
 from core.keys.generation import named_namespace
 from core.keys.loader import RegisteringLoader
-from core.keys.registry import CachedKeyRegistry
 from core.keys.registry import InMemoryKeyRegistry
 from core.keys.registry import JsonLinesKeyRegistry
 from core.keys.relationships import CandidateKey
@@ -22,9 +22,9 @@ from core.keys.relationships import discover_relationships
 from core.keys.relationships import Evidence
 from core.keys.relationships import Relationship
 from core.keys.relationships import RelationshipReport
+from core.keys.tiered import TieredKeyCache
 
 __all__ = [
-    "CachedKeyRegistry",
     "CandidateKey",
     "Evidence",
     "InMemoryKeyRegistry",
@@ -34,6 +34,7 @@ __all__ = [
     "RegisteringLoader",
     "Relationship",
     "RelationshipReport",
+    "TieredKeyCache",
     "canonical",
     "canonical_component",
     "canonical_text",

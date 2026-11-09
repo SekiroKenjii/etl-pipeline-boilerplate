@@ -29,7 +29,7 @@ def test_a_saved_report_is_recorded_with_the_operator(
     cli_cutover._record(ledger, sealed, tmp_path / "report.json")
     status, detail = cli_cutover._check(ledger, sealed)
 
-    record = ledger.get(sealed["digest"])
+    record = ledger.get(str(sealed["digest"]))
     assert record is not None
     assert record.meta["user"] == "CHG-1042 jane.doe"
     assert status == "OK"

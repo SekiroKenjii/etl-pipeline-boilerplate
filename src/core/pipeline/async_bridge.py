@@ -8,7 +8,7 @@ import contextvars
 import dataclasses
 import queue
 import threading
-from typing import Any
+from typing import Never
 
 from core import contract
 from core.pipeline import extractor as pipeline_extractor
@@ -170,7 +170,7 @@ class _Bridge[T]:
                 return None
             return item
 
-    def run(self, coroutine: Coroutine[Any, Any, None]) -> None:
+    def run(self, coroutine: Coroutine[object, Never, None]) -> None:
         """Runs `coroutine` on the extractor's loop and waits for it.
 
         Raises:

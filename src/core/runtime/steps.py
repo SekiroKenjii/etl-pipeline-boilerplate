@@ -6,12 +6,13 @@ over the steps that one finished (`done_steps`).
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 import dataclasses
 import logging
 
 from core import contract
 from core import pipeline
+from core.observability import redaction
 
 _LOG = logging.getLogger("etl.kernel")
 
@@ -78,6 +79,7 @@ class LedgerSteps(pipeline.StepCoordinator):
         host: str,
         *,
         carried: Mapping[str, DoneStep] | None = None,
+        redact: Collection[str] = (),
     ) -> None:
         """Initializes the coordinator.
 
@@ -86,11 +88,14 @@ class LedgerSteps(pipeline.StepCoordinator):
             run_id: The run.
             host: Where the run runs.
             carried: The steps an earlier run finished, not run again.
+            redact: More secret names hidden in the messages recorded, on
+                top of `redaction.SECRET_NAMES`: the logs' `redact`.
         """
         self.run_id = run_id
         self._ledger = ledger
         self._host = host
         self._carried = dict(carried or {})
+        self._redact = tuple(redact)
 
     def settled(
         self, ctx: contract.ETLContext
@@ -105,11 +110,26 @@ class LedgerSteps(pipeline.StepCoordinator):
         self, step: str, result: contract.ETLResult, ctx: contract.ETLContext
     ) -> None:
         del ctx  # Unused.
+        hide_secrets(result, self._redact)
         try:
             self._ledger.record_step(self.run_id, step, result, self._host)
         # The run goes on: resuming it runs this step again.
         except Exception:  # pylint: disable=broad-exception-caught
             _LOG.exception("could not record the step %s", step)
+
+
+def hide_secrets(
+    result: contract.ETLResult | contract.PipelineResult,
+    names: Collection[str] = (),
+) -> None:
+    """Redacts, in place, the message of a result and of its steps: the
+    ledger keeps it, `etl run` and `etl runs` show it, and it may quote an
+    exception (`redaction.redact_text`)."""
+    if result.message:
+        result.message = redaction.redact_text(result.message, names)
+    if isinstance(result, contract.PipelineResult):
+        for step in result.step_results.values():
+            hide_secrets(step, names)
 
 
 def _result(

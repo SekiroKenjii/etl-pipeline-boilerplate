@@ -24,20 +24,16 @@ from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
 import contextlib
 import dataclasses
 import decimal
-import heapq
 import itertools
-import json
 import math
 import operator
-import pathlib
-import shutil
-import tempfile
 import time
-from typing import Any, Literal
+from typing import Literal
 
 from core import contract
 from core.cutover import acceptance
 from core.cutover import checksum
+from shared import utils
 
 # Digests are summed per partition: unlike XOR, two equal rows do not cancel.
 _MASK = (1 << 64) - 1
@@ -45,11 +41,8 @@ ROWS_PER_PARTITION = 100
 # Memory: 32 bytes a partition, and a key a range.
 MAX_PARTITIONS = 500_000
 SPILL_ROWS = 50_000
-_FAN_IN = 64
 
-type Kind = Literal["missing", "extra", "different", "duplicate"]
-type Status = Literal["match", "match-with-rejects", "mismatch", "counted"]
-type Partitioning = Literal["", "range", "hash"]
+type _Partitioning = Literal["", "range", "hash"]
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -64,7 +57,7 @@ class Difference:
             expected and actual canonical values.
     """
 
-    kind: Kind
+    kind: contract.DifferenceKind
     key: tuple[checksum.Canonical, ...]
     columns: dict[str, tuple[checksum.Canonical, checksum.Canonical]] = (
         dataclasses.field(
@@ -103,6 +96,8 @@ class EntityReport:
             known reason, their parent.
         samples: Some of the differences, to look into.
         counted_only: Whether only the rows were counted, not compared.
+        accepted_empty: Whether the BAs accept it empty: nothing expected,
+            nothing in the target.
         partitioning: How the diff split the keys: `range` or `hash`.
         seconds: How long the reconciliation took.
     """
@@ -127,7 +122,8 @@ class EntityReport:
         default_factory=list[Difference]
     )
     counted_only: bool = False
-    partitioning: Partitioning = ""
+    accepted_empty: bool = False
+    partitioning: _Partitioning = ""
     seconds: float = 0.0
 
     @property
@@ -141,10 +137,17 @@ class EntityReport:
         return self.rejected - self.accepted
 
     @property
-    def status(self) -> Status:
+    def is_empty(self) -> bool:
+        """Whether nothing was compared: no row expected, none rejected,
+        none in the target. As a wrong source table or filter would make."""
+        return not (self.expected_rows or self.rejected or self.target_rows)
+
+    @property
+    def status(self) -> contract.EntityStatus:
         """`match` when nothing unexplained differs, `match-with-rejects`
         when only accepted rejected rows are missing, `counted` if not
-        compared, `mismatch` otherwise."""
+        compared, `empty` when nothing was and the BAs did not accept it,
+        `mismatch` otherwise."""
         if self.counted_only:
             return "counted"
         unexplained = (
@@ -156,6 +159,8 @@ class EntityReport:
         )
         if unexplained:
             return "mismatch"
+        if self.is_empty and not self.accepted_empty:
+            return "empty"
         return "match-with-rejects" if self.accepted else "match"
 
 
@@ -218,7 +223,7 @@ class _Ranges:
     whose canonical order is `orders[i - 1]`.
     """
 
-    lows: list[Any] = dataclasses.field(default_factory=list[Any])
+    lows: list[object] = dataclasses.field(default_factory=list[object])
     orders: list[_Order] = dataclasses.field(default_factory=list[_Order])
 
     def of(self, key: tuple[checksum.Canonical, ...]) -> int:
@@ -380,16 +385,33 @@ class _Diff:
         tally = _Tally()
         wanted = set(differing)
         with contextlib.ExitStack() as stack:
-            sorter = _Sorter(self.spill_rows, stack)
-            expected = sorter.sort(self._placed(self._expected(), wanted))
+            expected = self._sorted(stack, self._expected(), wanted)
             actual = (
                 self._target_ranges(differing)
                 if by_range
-                else sorter.sort(self._placed(self._target(), wanted))
+                else self._sorted(stack, self._target(), wanted)
             )
             for mine, theirs in _merge(expected, actual):
                 self._compare_key(tally, mine, theirs)
         return tally
+
+    def _sorted(
+        self,
+        stack: contextlib.ExitStack,
+        rows: Iterable[_Row],
+        wanted: Collection[int],
+    ) -> Iterator[_Placed]:
+        """The rows of the `wanted` partitions sorted by partition and key,
+        on disk past `spill_rows`; the stack removes the files."""
+        sorter = stack.enter_context(
+            utils.ExternalSorter[_Placed](
+                _partition_and_key,
+                spill_rows=self.spill_rows,
+                prefix="etl-cutover-",
+            )
+        )
+        sorter.extend(self._placed(rows, wanted))
+        return iter(sorter)
 
     def _compare_key(
         self, tally: _Tally, mine: list[_Placed], theirs: list[_Placed]
@@ -501,7 +523,7 @@ class _Diff:
     def _sample(
         self,
         tally: _Tally,
-        kind: Kind,
+        kind: contract.DifferenceKind,
         key: tuple[checksum.Canonical, ...],
         columns: (
             dict[str, tuple[checksum.Canonical, checksum.Canonical]] | None
@@ -602,80 +624,6 @@ def _merge(
         elif mine is not None and theirs is not None:
             yield mine[1], theirs[1]
             mine, theirs = next(lefts, None), next(rights, None)
-
-
-class _Sorter:
-    """Sorts rows by partition and key: in memory up to `limit` rows, then
-    in files merged back; the stack removes them."""
-
-    def __init__(self, limit: int, stack: contextlib.ExitStack) -> None:
-        self.limit = limit
-        self.stack = stack
-        self.directory: pathlib.Path | None = None
-        self.files = 0
-
-    def sort(self, rows: Iterable[_Placed]) -> Iterator[_Placed]:
-        """Yields the rows sorted, once it has read them all."""
-        buffer: list[_Placed] = []
-        runs: list[pathlib.Path] = []
-        for row in rows:
-            buffer.append(row)
-            if len(buffer) >= self.limit:
-                buffer.sort(key=_partition_and_key)
-                runs.append(self._write(buffer))
-                buffer = []
-                if len(runs) >= _FAN_IN:
-                    runs = [self._write(self._merged(runs))]
-        buffer.sort(key=_partition_and_key)
-        if not runs:
-            yield from buffer
-            return
-        if buffer:
-            runs.append(self._write(buffer))
-            buffer = []
-        yield from self._merged(runs)
-
-    def _merged(self, runs: list[pathlib.Path]) -> Iterator[_Placed]:
-        """The rows of sorted files, sorted."""
-        yield from heapq.merge(
-            *(self._read(path) for path in runs), key=_partition_and_key
-        )
-
-    def _write(self, rows: Iterable[_Placed]) -> pathlib.Path:
-        """Writes sorted rows to a new file; returns its path.
-
-        The rows hold the data compared, personal data included: the
-        directory is the owner's only (`mkdtemp`), and goes with the diff.
-        """
-        if self.directory is None:
-            self.directory = pathlib.Path(
-                tempfile.mkdtemp(prefix="etl-cutover-")
-            )
-            self.stack.callback(shutil.rmtree, self.directory, True)
-        self.files += 1
-        path = self.directory / f"{self.files}.jsonl"
-        # Text is as a driver gave it: a lone surrogate too.
-        with path.open("w", encoding="utf-8", errors="surrogatepass") as file:
-            for row in rows:
-                file.write(
-                    json.dumps(row, ensure_ascii=False, separators=(",", ":"))
-                )
-                file.write("\n")
-        return path
-
-    def _read(self, path: pathlib.Path) -> Iterator[_Placed]:
-        """Yields the rows of a file, then removes it."""
-        with path.open(encoding="utf-8", errors="surrogatepass") as file:
-            for line in file:
-                index, text, key, digest, values = json.loads(line)
-                yield (
-                    index,
-                    text,
-                    checksum.restored(key),
-                    digest,
-                    checksum.restored(values),
-                )
-        path.unlink()
 
 
 def reconcile(

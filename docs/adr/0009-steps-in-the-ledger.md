@@ -37,7 +37,7 @@ upgrade` ({doc}`0011-alembic-revisions-of-the-etl-tables`).
 
 - **What it buys.**
   - A failed run is resumed where it stopped, after `kill -9` too
-    (`tests/e2e/test_resumed_and_shared_runs.py`).
+    (`tests/e2e/test_runs_resumed_locked_or_unbuilt.py`).
   - Any number of pods, an Indexed Job of Kubernetes for instance, share a
     run: `deploy/k8s/overlays/workers`.
   - A worker that dies loses its claims when their lease expires; another

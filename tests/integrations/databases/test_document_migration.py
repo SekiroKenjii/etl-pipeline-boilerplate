@@ -143,8 +143,11 @@ class Migration(pipeline.BaseOrchestrator):
         self.reader = mongodb.MongoTableReader(source, page_size=2)
         self.state = mongodb.MongoStateStore(source)
         self.writer = relational.RelationalTableWriter(target)
-        self.registry = core_keys.CachedKeyRegistry(
-            relational.RelationalKeyRegistry(target)
+        # Memory for a dozen keys: the rest of them go through the disk tier.
+        self.registry = core_keys.TieredKeyCache(
+            relational.RelationalKeyRegistry(target),
+            memory_budget=4096,
+            disk_budget=10**7,
         )
         self.quarantine = relational.RelationalQuarantine(target)
 

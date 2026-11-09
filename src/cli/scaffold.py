@@ -12,6 +12,8 @@ import keyword
 import pathlib
 import re
 
+from cli import mappings as mappings_cli
+
 MAX_NAME_LENGTH = 20
 
 _MODULE = '''"""The {name} module: <what it migrates, from where to where>.
@@ -107,8 +109,7 @@ def scaffold(
 
     Raises:
         ValueError: If the name is not a module name, the module or its
-            workbook exists already, or the `mappings` extra (openpyxl) is
-            missing.
+            workbook exists already.
     """
     if (
         not re.fullmatch(r"[a-z][a-z0-9_]*", name)
@@ -124,15 +125,6 @@ def scaffold(
     for path in (directory, workbook):
         if path.exists():
             raise ValueError(f"{path} exists already")
-    try:
-        # Needs openpyxl (`mappings` extra), as every workbook does.
-        # pylint: disable-next=import-outside-toplevel
-        from cli import mappings as mappings_cli
-    except ImportError as exc:
-        raise ValueError(
-            f"the workbook needs the `mappings` extra (openpyxl): {exc}"
-        ) from None
-
     out = io.StringIO()
     if mappings_cli.main(["template", str(workbook), "--module", name], out):
         raise ValueError(out.getvalue().strip())

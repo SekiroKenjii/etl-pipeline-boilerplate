@@ -45,13 +45,11 @@ patches:
             volumeMounts:
               - name: var
                 mountPath: /app/var
-  - target:
+  # Each run's SQLite lives in its pod's emptyDir and goes with it: no
+  # quarantine outlives a run for housekeeping to purge.
+  - patch: |-
+      $patch: delete
+      apiVersion: batch/v1
       kind: CronJob
-      name: etl-housekeeping
-    patch: |-
-      - op: replace
-        path: /spec/jobTemplate/spec/template/spec/containers/0/env/0/value
-        value: dev
-      - op: replace
-        path: /spec/jobTemplate/spec/template/spec/containers/0/imagePullPolicy
-        value: Never
+      metadata:
+        name: etl-housekeeping

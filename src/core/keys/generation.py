@@ -58,21 +58,22 @@ def canonical_component(
     """
     if value is None:
         raise MissingKeyComponentError("empty")
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, int):
-        return str(value)
-    if isinstance(value, float):
-        if not value.is_integer():
-            return repr(value)
-        return str(int(value))
-    if isinstance(value, decimal.Decimal):
-        normalized = value.normalize()
-        if normalized == normalized.to_integral():
-            return str(int(normalized))
-        return format(normalized, "f")
-    if isinstance(value, (datetime.datetime, datetime.date)):
-        return value.isoformat()
+    if not isinstance(value, str):
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, int):
+            return str(value)
+        if isinstance(value, float):
+            if not value.is_integer():
+                return repr(value)
+            return str(int(value))
+        if isinstance(value, decimal.Decimal):
+            normalized = value.normalize()
+            if normalized == normalized.to_integral():
+                return str(int(normalized))
+            return format(normalized, "f")
+        if isinstance(value, (datetime.datetime, datetime.date)):
+            return value.isoformat()
 
     text = unicodedata.normalize("NFC", str(value)).strip()
     if not text:
@@ -179,9 +180,7 @@ class KeyMaker:
         Returns:
             A UUIDv5, or a UUIDv8 when a secret is set, as text.
         """
-        encoded = json.dumps(
-            list(natural_key), ensure_ascii=False, separators=(",", ":")
-        )
+        encoded = encoded_natural_key(natural_key)
         if self.secret is None:
             return str(uuid.uuid5(self.namespace, encoded))
 
@@ -189,3 +188,21 @@ class KeyMaker:
             self.secret, self.namespace.bytes + encoded.encode(), hashlib.sha256
         )
         return str(uuid.UUID(bytes=digest.digest()[:16], version=8))
+
+
+def encoded_natural_key(natural_key: Sequence[str]) -> str:
+    """Returns the text a key is derived from: the canonical natural key as
+    compact JSON, `["C001","2"]`, since the first release.
+
+    Built without the JSON encoder when no component needs escaping: a
+    component with a quote, a backslash or a character JSON would escape
+    goes through `json.dumps`, which gives the same text.
+    """
+    if not natural_key:
+        return "[]"
+    for component in natural_key:
+        if '"' in component or "\\" in component or not component.isprintable():
+            return json.dumps(
+                list(natural_key), ensure_ascii=False, separators=(",", ":")
+            )
+    return '["' + '","'.join(natural_key) + '"]'

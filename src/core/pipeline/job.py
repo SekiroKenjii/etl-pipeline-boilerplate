@@ -23,14 +23,23 @@ class ETLJob[TRaw, TOut]:
         BEFORE_EXTRACT -> extract -> AFTER_EXTRACT -> transform
                        -> AFTER_TRANSFORM -> load -> AFTER_LOAD
 
-    A failed checkpoint ends the step FAILED, keeping the reports. A dry run
-    loads nothing and counts the records as skipped.
+    A failed checkpoint ends the step FAILED, keeping its reports, and the
+    gate stores what it set aside before (its rejects, its issues); the batch
+    is not acknowledged. A dry run loads nothing and counts the records as
+    skipped, but the gate still stores what it set aside: a dry run shows
+    the rejects.
 
     Once a batch is loaded or rejected, the gate stores what it set aside
     (`gate.flush`), then `extractor.acknowledge(batch)` is called, in that
-    order. A failed batch and a dry run are never acknowledged, so the source
-    delivers them again (at-least-once); what the gate set aside for a failed
-    batch is dropped. Wrap an asyncio extractor in `AsyncExtractorAdapter`.
+    order: a crash between them reads the batch again, and stores its rejects
+    and issues again (at-least-once; the quarantine keeps one entry, an
+    issue sink may keep both). A batch whose acknowledgement failed is not
+    stored again when a retry of the step, in the same process, reads it
+    again unchanged, whatever it reads before it (a source reading from the
+    start again); read changed, it is stored again. A failed batch and a
+    dry run are never acknowledged, so the source delivers them again; what
+    the gate set aside for a failed batch is dropped. A cancelled run reads
+    no further batch. Wrap an asyncio extractor in `AsyncExtractorAdapter`.
 
         PipelineStep("users", ETLJob(extractor, transformer, loader))
 
@@ -58,6 +67,7 @@ class ETLJob[TRaw, TOut]:
         self.loader = loader
         self.gate = gate
         self.batch_size = batch_size
+        self._stored_unacknowledged: list[list[TRaw]] = []
 
     def __call__(
         self,
@@ -89,6 +99,7 @@ class ETLJob[TRaw, TOut]:
                 self._run(ctx, result)
             except contract.QualityGateError as exc:
                 self._flush(ctx)
+                self._stored_unacknowledged.clear()
                 result.add_error(
                     contract.ETLError.from_exception(exc, phase=exc.phase)
                 )
@@ -99,6 +110,7 @@ class ETLJob[TRaw, TOut]:
                     self.gate.discard()
                 raise
 
+        self._stored_unacknowledged.clear()
         result.complete(
             contract.ETLStatus.CANCELLED if ctx.is_cancelled else None
         )
@@ -108,25 +120,45 @@ class ETLJob[TRaw, TOut]:
         self, ctx: contract.ETLContext, result: contract.ETLResult
     ) -> None:
         """Streams the source batch by batch, acknowledging each handled one."""
+        if ctx.is_cancelled:
+            return
         self._inspect(contract.Checkpoint.BEFORE_EXTRACT, [], ctx, result)
 
-        for raw_batch in itertools.batched(
+        batches = itertools.batched(
             self.extractor.extract(ctx), self.batch_size
-        ):
-            if ctx.is_cancelled:
-                break
-
+        )
+        while not ctx.is_cancelled and (raw_batch := next(batches, None)):
             records = list(raw_batch)
             with tracing.span("etl.batch", {"etl.rows": len(records)}):
                 self._process(records, ctx, result)
-
             # Only reached once the batch is loaded or rejected.
-            self._flush(ctx)
-            if not ctx.run.dry_run:
-                self.extractor.acknowledge(records, ctx)
+            self._settle(records, ctx)
 
         # What BEFORE_EXTRACT found, when no batch was handled.
         self._flush(ctx)
+
+    def _settle(self, records: list[TRaw], ctx: contract.ETLContext) -> None:
+        """Stores what the gate set aside for a handled batch, unless a try
+        before stored it and failed to acknowledge it; then acknowledges it.
+
+        The batches stored and not acknowledged are kept until acknowledged,
+        or the step ends.
+        """
+        stored = records in self._stored_unacknowledged
+        if not stored:
+            self._flush(ctx)
+        elif self.gate is not None:
+            self.gate.discard()
+        if ctx.run.dry_run:
+            return
+        try:
+            self.extractor.acknowledge(records, ctx)
+        except BaseException:
+            if not stored:
+                self._stored_unacknowledged.append(records)
+            raise
+        if stored:
+            self._stored_unacknowledged.remove(records)
 
     def _flush(self, ctx: contract.ETLContext) -> None:
         """Has the gate store what it set aside for the handled batch."""

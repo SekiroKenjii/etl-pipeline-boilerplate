@@ -24,7 +24,6 @@ import io
 import pathlib
 import threading
 import time
-from typing import Any
 
 from alembic import command
 from alembic import config as alembic_config
@@ -37,6 +36,7 @@ import sqlalchemy as sa
 from core import contract
 from infra.database.relational import bookkeeping
 from infra.database.relational import database
+from infra.database.relational import types as relational_types
 from shared import utils
 
 REVISIONS = ("0001", "0002", "0003", "0004")
@@ -186,10 +186,18 @@ def check(
 
     Raises:
         PipelineConfigError: If they are not, with what to run.
-        RetryableError: If the server cannot be reached.
+        RetryableError: If the server cannot be reached, after a few
+            attempts.
         FatalError: If the tables cannot be read.
     """
-    found = status(db, schema, prefix)
+    # Reading the catalog deadlocks with another process's DDL on SQL
+    # Server (processes starting together, one upgrading): look again.
+    found = utils.retry(
+        lambda: status(db, schema, prefix),
+        when=lambda exc: isinstance(exc, contract.RetryableError),
+        attempts=_RACING_UPGRADE_ATTEMPTS,
+        delay=0.2,
+    )
     if not found.up_to_date:
         raise contract.PipelineConfigError(found.message())
 
@@ -316,7 +324,7 @@ def run_environment() -> None:
     config = context.config
     schema = config.attributes["schema"]
     prefix = config.attributes["prefix"]
-    options: dict[str, Any] = {
+    options: relational_types.MigrationOptions = {
         "version_table": prefix + _VERSION_TABLE,
         "version_table_schema": schema,
         # Where DDL is transactional, a failed revision leaves the one before.
@@ -474,7 +482,7 @@ def _create_sql(dialect: str, schema: str | None, prefix: str) -> str:
     """The CREATE statements of the latest tables."""
     statements: list[str] = []
 
-    def collect(statement: sa.schema.ExecutableDDLElement, *_: Any) -> None:
+    def collect(statement: sa.schema.ExecutableDDLElement, *_: object) -> None:
         compiled = str(statement.compile(dialect=engine.dialect)).strip()
         statements.append(compiled.replace("\t", "    ") + ";")
 

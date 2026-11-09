@@ -18,12 +18,13 @@ without a run id resumes the last run of that label only).
 
 from __future__ import annotations
 
-from collections.abc import Generator, Mapping, Sequence
+from collections.abc import Collection, Generator, Mapping, Sequence
 import contextlib
 import dataclasses
 import datetime
 import enum
 import fnmatch
+import functools
 import getpass
 import logging
 import os
@@ -37,16 +38,15 @@ from core import contract
 from core import pipeline
 from core.observability import context as observability_context
 from core.observability import metrics
+from core.observability import redaction
+from core.runtime import locks
 from core.runtime import module as runtime_module
 from core.runtime import names
 from core.runtime import resources as runtime_resources
 from core.runtime import steps as runtime_steps
+from core.runtime import types as runtime_types
 
 _LOG = logging.getLogger("etl.kernel")
-
-_RUNS_SEARCHED_FOR_RESUME = 200
-# `label:<label>` owns the run's locks: it must fit their owner column.
-_MAX_LABEL_LENGTH = 190
 
 
 class ExitCode(enum.IntEnum):
@@ -59,6 +59,11 @@ class ExitCode(enum.IntEnum):
     LOCKED = 4
     CANCELLED = 130
 
+
+_REFUSED = {
+    locks.Refusal.LOCKED: ExitCode.LOCKED,
+    locks.Refusal.CANCELLED: ExitCode.CANCELLED,
+}
 
 _EXIT_CODES = {
     contract.ETLStatus.SUCCESS: ExitCode.SUCCESS,
@@ -95,6 +100,8 @@ class Kernel:
             it.
         max_parallel_steps: The most steps a run runs at the same time here,
             whatever its module asks; None lets the module decide.
+        redact: More secret names hidden in what the ledger keeps, the
+            outcome tells and `check` reports of an error.
     """
 
     def __init__(
@@ -107,6 +114,8 @@ class Kernel:
         max_parallel_steps: int | None = None,
         host: str | None = None,
         meta: Mapping[str, str] | None = None,
+        redact: Collection[str] = (),
+        lock_wait: locks.LockWait | None = None,
     ) -> None:
         """Initializes the kernel.
 
@@ -123,6 +132,11 @@ class Kernel:
             meta: What runs, for the ledger: the version, the build, the
                 hash of the settings. The user and the fingerprint of the
                 module are added at each run.
+            redact: More secret names hidden in what the ledger keeps and
+                the outcome tells of an error, on top of
+                `redaction.SECRET_NAMES`: the logs' `redact`.
+            lock_wait: How a run of a label waits for the locks of its
+                label; `LockWait()` by default.
 
         Raises:
             PipelineConfigError: If two modules have the same name.
@@ -141,6 +155,8 @@ class Kernel:
         self._listeners = tuple(listeners)
         self._host = host or socket.gethostname()
         self._meta = dict(meta or {})
+        self.redact = tuple(redact)
+        self._lock_wait = lock_wait or locks.LockWait()
 
     def pipelines(self) -> list[str]:
         """Returns every pipeline, `module.pipeline`, sorted."""
@@ -150,7 +166,7 @@ class Kernel:
             for name in module.pipelines()
         )
 
-    def factory(self, name: str) -> runtime_module.PipelineFactory:
+    def factory(self, name: str) -> runtime_types.PipelineFactory:
         """Returns how to build pipeline `module.pipeline`.
 
         Raises:
@@ -201,15 +217,17 @@ class Kernel:
             steps: The steps to run, as names or patterns (`customer*`);
                 every step when empty. Their dependencies are taken as done.
             resume: Resumes a run, by id, or True for the last run of the
-                pipeline (of the same `label`, if any) unless it succeeded:
-                the steps it finished are not run again.
+                `label`, whatever its outcome, or without a label the last
+                run of the pipeline unless it succeeded: the steps it
+                finished are not run again.
             label: The scheduler's name of the job, recorded with the run:
-                a retry of the job resumes its run (`resume=True`), and
-                takes over the locks that run left when it died. Runs of the
-                same label must never run at the same time.
-            rekey: Runs even if the module's keys changed since its last
-                successful run (`Module.fingerprint`): every surrogate key
-                changes.
+                a retry of the job resumes its run (`resume=True`). A run
+                of a label never runs while another holds the label's locks:
+                it waits for them up to the lease (a try that died frees
+                them when its lease expires), then gives up (`LOCKED`).
+            rekey: Runs even if the module's keys changed since its last run
+                that loaded, of any of its pipelines (`Module.fingerprint`):
+                every surrogate key changes.
 
         Returns:
             How it went; never raises for the pipeline's own failures.
@@ -221,21 +239,16 @@ class Kernel:
                 the ledger needed is missing. Nothing is recorded then.
         """
         factory = self.factory(name)
-        if label is not None and not 0 < len(label) <= _MAX_LABEL_LENGTH:
-            raise contract.PipelineConfigError(
-                f"A label has 1 to {_MAX_LABEL_LENGTH} characters"
-            )
-        lock = self._optional(names.LOCK, contract.IRunLock)
+        locks.check_label(label)
         ledger = self._optional(names.LEDGER, contract.IRunLedger)
-        resumed = None
-        if resume:
-            if ledger is None:
-                raise contract.PipelineConfigError(
-                    f"Resuming a run needs a run ledger ({names.LEDGER})"
-                )
-            resumed = self._to_resume(name, resume, label, ledger)
+        resumed = self._to_resume(name, resume, label, ledger)
         fingerprint = self._fingerprint(name)
-        rekeyed = _check_keys(name, fingerprint, ledger, rekey=rekey)
+        meta = functools.partial(
+            _run_meta,
+            {**self._meta, **fingerprint},
+            label=label,
+            rekeyed=_check_keys(name, fingerprint, ledger, rekey=rekey),
+        )
 
         with self.resources.run_scope() as scope:
             try:
@@ -246,16 +259,7 @@ class Kernel:
             except Exception as exc:  # pylint: disable=broad-exception-caught
                 unbuilt = contract.ETLRunInfo(name, dry_run=dry_run)
                 return self._unbuilt(
-                    unbuilt,
-                    exc,
-                    ledger,
-                    _run_meta(
-                        {**self._meta, **fingerprint},
-                        unbuilt,
-                        resumed=resumed,
-                        label=label,
-                        rekeyed=rekeyed,
-                    ),
+                    unbuilt, exc, ledger, meta(unbuilt, resumed=resumed)
                 )
             ctx = contract.ETLContext(
                 contract.ETLRunInfo(
@@ -267,73 +271,103 @@ class Kernel:
                     steps=_select(name, plan, steps) if steps else frozenset(),
                 )
             )
-            carried = (
-                runtime_steps.done_steps(ledger, resumed)
-                if ledger is not None and resumed
-                else {}
-            )
-            leases = _Leases(
-                lock,
-                name,
-                tuple(
-                    f"{name}/{step.name}"
-                    for step in plan
-                    if (not ctx.run.steps or step.name in ctx.run.steps)
-                    and step.name not in carried
-                ),
-                # A labelled run's retry takes over the locks it left.
-                f"label:{label}"
-                if label is not None
-                else f"{self._host}:{ctx.run.run_id}",
-            )
-            with observability_context.log_context(
-                **observability_context.run_fields(ctx)
-            ):
-                if not leases.acquire(self.lease_seconds):
-                    _LOG.warning("%s is already running: skipped", name)
-                    return RunOutcome(
-                        ExitCode.LOCKED, message="already running"
-                    )
-                if resumed:
-                    _LOG.info("%s resumes the run %s", name, resumed)
-                try:
-                    with (
-                        self._heartbeat(leases, ctx),
-                        _cancel_on_signals(ctx),
-                    ):
-                        if ledger is not None:
-                            ledger.start(
-                                ctx.run,
-                                self._host,
-                                _run_meta(
-                                    {**self._meta, **fingerprint},
-                                    ctx.run,
-                                    resumed=resumed,
-                                    label=label,
-                                    rekeyed=rekeyed,
-                                ),
-                            )
-                        result = self._execute(
-                            orchestrator,
-                            ctx,
-                            None
-                            if ledger is None
-                            else runtime_steps.LedgerSteps(
-                                ledger,
-                                ctx.run.run_id,
-                                f"{self._host}:{os.getpid()}",
-                                carried=carried,
-                            ),
-                        )
-                        if ledger is not None:
-                            ledger.finish(result)
-                finally:
-                    leases.release()
-        return RunOutcome(
-            _EXIT_CODES.get(result.status, ExitCode.FAILED),
-            result,
-            resumed_from=resumed,
+            with _running(ctx):
+                taken = self._lock_steps(
+                    plan,
+                    ctx,
+                    label=label,
+                    ledger=ledger,
+                    resume=resume,
+                    resumed=resumed,
+                )
+                if isinstance(taken, locks.Refusal):
+                    return RunOutcome(_REFUSED[taken], message=taken.value)
+                leases, resumed, carried = taken
+                result = self._run_locked(
+                    orchestrator,
+                    ctx,
+                    leases,
+                    ledger=ledger,
+                    carried=carried,
+                    meta=meta(ctx.run, resumed=resumed),
+                )
+        return RunOutcome(_exit_code(result), result, resumed_from=resumed)
+
+    def _lock_steps(
+        self,
+        plan: Sequence[contract.PipelineStep],
+        ctx: contract.ETLContext,
+        *,
+        label: str | None,
+        ledger: contract.IRunLedger | None,
+        resume: bool | str,
+        resumed: str | None,
+    ) -> (
+        locks.Refusal
+        | tuple[locks.Leases, str | None, dict[str, runtime_steps.DoneStep]]
+    ):
+        """Takes the locks of the steps a run runs, but those it carries
+        over from the run it resumes (`locks.Locking.lock_steps`)."""
+        locking = locks.Locking(
+            self._optional(names.LOCK, contract.IRunLock),
+            self.lease_seconds,
+            self._lock_wait,
         )
+        return locking.lock_steps(
+            plan,
+            ctx,
+            locks.owner_of(self._host, label, ctx.run.run_id),
+            label=label,
+            ledger=ledger,
+            resumed=resumed,
+            resume_again=(
+                functools.partial(
+                    self._to_resume,
+                    ctx.run.pipeline_name,
+                    resume,
+                    label,
+                    ledger,
+                )
+                if resume
+                else None
+            ),
+        )
+
+    def _run_locked(
+        self,
+        orchestrator: pipeline.BaseOrchestrator,
+        ctx: contract.ETLContext,
+        leases: locks.Leases,
+        *,
+        ledger: contract.IRunLedger | None,
+        carried: Mapping[str, runtime_steps.DoneStep],
+        meta: Mapping[str, str],
+    ) -> contract.PipelineResult:
+        """Runs the pipeline built, its locks taken, recording it in the
+        ledger; frees the locks."""
+        try:
+            with self._heartbeat(leases, ctx):
+                if ledger is not None:
+                    ledger.start(ctx.run, self._host, meta)
+                result = self._execute(
+                    orchestrator,
+                    ctx,
+                    None
+                    if ledger is None
+                    else runtime_steps.LedgerSteps(
+                        ledger,
+                        ctx.run.run_id,
+                        f"{self._host}:{os.getpid()}",
+                        carried=carried,
+                        redact=self.redact,
+                    ),
+                )
+                runtime_steps.hide_secrets(result, self.redact)
+                if ledger is not None:
+                    ledger.finish(result)
+        finally:
+            leases.release()
+        return result
 
     def _unbuilt(
         self,
@@ -354,6 +388,7 @@ class Kernel:
                 pipeline_name=ctx.run.pipeline_name, run_id=ctx.run.run_id
             )
             result.complete(contract.ETLStatus.FAILED, str(error))
+            runtime_steps.hide_secrets(result, self.redact)
             if ledger is not None:
                 ledger.start(ctx.run, self._host, meta)
                 ledger.finish(result)
@@ -364,16 +399,23 @@ class Kernel:
         name: str,
         resume: bool | str,
         label: str | None,
-        ledger: contract.IRunLedger,
+        ledger: contract.IRunLedger | None,
     ) -> str | None:
-        """The run to resume: the one given, or the last one of the
-        pipeline (of that label, if any) unless it succeeded; None if there
-        is none.
+        """The run to resume: the one given; or the last one of the label,
+        if any, whatever its outcome (a retry after a success runs nothing);
+        or the last one of the pipeline unless it succeeded. None if there is
+        none, or `resume` is False.
 
         Raises:
-            PipelineConfigError: If the run given does not exist, is of
-                another pipeline, or was a dry run.
+            PipelineConfigError: If there is no ledger; or the run given
+                does not exist, is of another pipeline, or was a dry run.
         """
+        if not resume:
+            return None
+        if ledger is None:
+            raise contract.PipelineConfigError(
+                f"Resuming a run needs a run ledger ({names.LEDGER})"
+            )
         if isinstance(resume, str):
             record = ledger.get(resume)
             if record is None or record.pipeline != name:
@@ -385,23 +427,27 @@ class Kernel:
                     f"The run {resume!r} was a dry run: it loaded nothing"
                 )
             return record.run_id
-        last = next(
-            (
-                record
-                for record in ledger.recent(name, _RUNS_SEARCHED_FOR_RESUME)
-                if not record.dry_run
-                and (label is None or record.meta.get("label") == label)
-            ),
-            None,
-        )
-        if last is None or last.status is contract.ETLStatus.SUCCESS:
+        last = ledger.last_run(name, label)
+        if last is None or (
+            label is None and last.status is contract.ETLStatus.SUCCESS
+        ):
             _LOG.info("%s: no run to resume, every step runs", name)
             return None
         return last.run_id
 
-    def check(self) -> dict[str, str]:
-        """Checks the resources that can be: `ok`, or what is wrong."""
-        return self.resources.health()
+    def check(self) -> dict[str, runtime_resources.Health]:
+        """Checks the resources that can be: `ok` and its warnings, or what
+        is wrong, redacted."""
+        return {
+            name: runtime_resources.Health(
+                redaction.redact_text(health.status, self.redact),
+                tuple(
+                    redaction.redact_text(warning, self.redact)
+                    for warning in health.warnings
+                ),
+            )
+            for name, health in self.resources.health().items()
+        }
 
     def _execute(
         self,
@@ -437,7 +483,11 @@ class Kernel:
             return dict(module.fingerprint())
         # The ledger records the run whatever the fingerprint does.
         except Exception as exc:  # pylint: disable=broad-exception-caught
-            return {"fingerprint_error": str(exc)}
+            return {
+                "fingerprint_error": redaction.redact_text(
+                    str(exc), self.redact
+                )
+            }
 
     def _optional[T](self, name: str, kind: type[T]) -> T | None:
         if name not in self.resources.names:
@@ -446,7 +496,7 @@ class Kernel:
 
     @contextlib.contextmanager
     def _heartbeat(
-        self, leases: _Leases, ctx: contract.ETLContext
+        self, leases: locks.Leases, ctx: contract.ETLContext
     ) -> Generator[None]:
         """Renews the leases of the run while it goes on; cancels the run
         if one is lost, or cannot be renewed before it expires.
@@ -505,80 +555,9 @@ class Kernel:
             thread.join()
 
 
-@dataclasses.dataclass(frozen=True, slots=True)
-class _Leases:
-    """The leases of a run on the locks of its steps.
-
-    Attributes:
-        lock: The run lock, if any.
-        pipeline: The pipeline.
-        names: The locks, `<pipeline>/<step>`.
-        owner: Who holds them.
-    """
-
-    lock: contract.IRunLock | None
-    pipeline: str
-    names: tuple[str, ...]
-    owner: str
-
-    def acquire(self, lease_seconds: float) -> bool:
-        """Takes every lock, or none: never waits, so never deadlocks."""
-        if self.lock is None:
-            return True
-        taken: list[str] = []
-        try:
-            for name in sorted(self.names):
-                if not self.lock.acquire(name, self.owner, lease_seconds):
-                    _LOG.warning("%s is held by another run", name)
-                    self._release(taken)
-                    return False
-                taken.append(name)
-        except BaseException:
-            self._release(taken)
-            raise
-        return True
-
-    def renew(self, lease_seconds: float) -> bool:
-        """Extends every lease; False if one was lost.
-
-        Raises:
-            Exception: What the lock raised, if no lease was found lost.
-        """
-        if self.lock is None:
-            return True
-        lost: list[str] = []
-        error: Exception | None = None
-        # Every lease is renewed, even after one is found lost.
-        for name in self.names:
-            try:
-                if not self.lock.renew(name, self.owner, lease_seconds):
-                    lost.append(name)
-            except Exception as exc:  # pylint: disable=broad-exception-caught
-                error = error or exc
-        if lost:
-            _LOG.error("locks lost: %s", ", ".join(lost))
-            return False
-        if error is not None:
-            raise error
-        return True
-
-    def release(self) -> None:
-        """Frees every lock; one that cannot be freed expires."""
-        self._release(self.names)
-
-    def _release(self, held: Sequence[str]) -> None:
-        if self.lock is None:
-            return
-        for name in held:
-            try:
-                self.lock.release(name, self.owner)
-            except Exception as exc:  # pylint: disable=broad-exception-caught
-                _LOG.warning("could not release %s, it expires: %s", name, exc)
-
-
 def _build(
     name: str,
-    factory: runtime_module.PipelineFactory,
+    factory: runtime_types.PipelineFactory,
     resources: runtime_resources.Resources,
 ) -> tuple[pipeline.BaseOrchestrator, list[contract.PipelineStep]]:
     """Builds a pipeline, and orders its steps.
@@ -630,8 +609,9 @@ def _check_keys(
     *,
     rekey: bool,
 ) -> str | None:
-    """Checks that the module makes its keys as in the last successful run
-    of the pipeline (the `runtime.KEYS` entry of its fingerprint).
+    """Checks that the module makes its keys as in its last run that loaded
+    (the `runtime.KEYS` entry of its fingerprint), of any of its pipelines:
+    they load the same tables.
 
     Returns:
         The keys of that run when they changed and `rekey` lets it run.
@@ -642,16 +622,8 @@ def _check_keys(
     keys = fingerprint.get(runtime_module.KEYS)
     if keys is None or ledger is None:
         return None
-    last = next(
-        (
-            record
-            for record in ledger.recent(name, _RUNS_SEARCHED_FOR_RESUME)
-            if not record.dry_run
-            and record.status in runtime_steps.DONE
-            and runtime_module.KEYS in record.meta
-        ),
-        None,
-    )
+    module = name.partition(".")[0]
+    last = ledger.latest(f"{module}.", runtime_steps.DONE, runtime_module.KEYS)
     if last is None or last.meta[runtime_module.KEYS] == keys:
         return None
     before = last.meta[runtime_module.KEYS]
@@ -671,7 +643,8 @@ def _check_keys(
     )
     if not rekey:
         raise contract.PipelineConfigError(
-            f"The keys of {name} changed since its run {last.run_id} ({shown}):"
+            f"The keys of {name} changed since the run {last.run_id} of"
+            f" {last.pipeline} ({shown}):"
             " every surrogate key of these would change, and the rows loaded"
             " before would be loaded again under new keys. Undo the change,"
             " or run again with --rekey once the target is ready for new keys"
@@ -717,6 +690,22 @@ def _run_meta(
     return found
 
 
+def _exit_code(result: contract.PipelineResult) -> ExitCode:
+    """The exit code of a run that ran.
+
+    A step that refused for its configuration or its parameters (a
+    `PipelineConfigError`: deletes to confirm) fails the run INVALID: a
+    retry would refuse again, an operator must act.
+    """
+    if result.status is contract.ETLStatus.FAILED and any(
+        isinstance(error.exception, contract.PipelineConfigError)
+        for step in result.step_results.values()
+        for error in step.errors
+    ):
+        return ExitCode.INVALID
+    return _EXIT_CODES.get(result.status, ExitCode.FAILED)
+
+
 def _lost(pipeline_name: str) -> None:
     """Reports a run cancelled because it lost its lock."""
     _LOG.error("%s lost its run lock: cancelled", pipeline_name)
@@ -734,6 +723,19 @@ def _user() -> str:
         return getpass.getuser()
     except (KeyError, OSError):
         return str(os.getuid()) if hasattr(os, "getuid") else "unknown"
+
+
+@contextlib.contextmanager
+def _running(ctx: contract.ETLContext) -> Generator[None]:
+    """Binds the log context of a run, and cancels it on SIGTERM or
+    SIGINT."""
+    with (
+        observability_context.log_context(
+            **observability_context.run_fields(ctx)
+        ),
+        _cancel_on_signals(ctx),
+    ):
+        yield
 
 
 @contextlib.contextmanager

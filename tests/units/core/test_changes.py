@@ -443,6 +443,7 @@ def test_missing_source_rows_are_found_from_the_crosswalk() -> None:
         registry=registry,
         entity="crm.customer",
         case=contract.KeyCase.UPPER,
+        max_share=None,
     )
 
     events = list(extractor.extract(fakes.make_context()))
@@ -511,7 +512,7 @@ class TestMissingSourceRowsSafety:
 
         with pytest.raises(
             contract.FatalError,
-            match=r"3 of the 4 .*: 75\.0% of them, above 50\.0%.*"
+            match=r"3 of the 4 .*: 75\.0% of them, above 10\.0%.*"
             r"--param confirm_deletes=crm.customer:3",
         ):
             list(unconfirmed.extract(context))
@@ -522,6 +523,21 @@ class TestMissingSourceRowsSafety:
         )
 
         assert [e.row["cust_no"] for e in confirmed] == ["C1", "C2", "C3"]
+
+    def test_a_fifth_of_the_rows_is_refused_by_default(self) -> None:
+        source = [{"cust_no": f"C{i}"} for i in range(8)]
+        extractor = self._extractor(source, self._registry(10))
+        context = self._context()
+
+        with pytest.raises(contract.FatalError, match=r"above 10\.0%"):
+            list(extractor.extract(context))
+
+    def test_a_refusal_is_for_the_operator_not_a_retry(self) -> None:
+        extractor = self._extractor([], self._registry(2))
+        context = self._context()
+
+        with pytest.raises(contract.PipelineConfigError, match="refusing"):
+            list(extractor.extract(context))
 
     def test_deletes_within_the_share_need_no_confirmation(self) -> None:
         source = [{"cust_no": f"C{i}"} for i in range(9)]

@@ -4,6 +4,10 @@ Specs are format-neutral (`core.contract`); readers of authored files, like
 xlsx, live in `infra.mapping`; the compiled JSON form is in `catalog`.
 """
 
+from core.mapping.casts import CastError
+from core.mapping.casts import parse_type
+from core.mapping.casts import SUPPORTED_TYPE_NAMES
+from core.mapping.casts import TargetType
 from core.mapping.catalog import load_catalog
 from core.mapping.catalog import save_catalog
 from core.mapping.compiled import CompiledMapping
@@ -39,10 +43,6 @@ from core.mapping.transformer import MappingTransformer
 from core.mapping.transforms import Transform
 from core.mapping.transforms import TransformRegistry
 from core.mapping.transforms import UnmappedValueError
-from core.mapping.types import CastError
-from core.mapping.types import parse_type
-from core.mapping.types import SUPPORTED_TYPE_NAMES
-from core.mapping.types import TargetType
 
 __all__ = [
     "CatalogChanges",

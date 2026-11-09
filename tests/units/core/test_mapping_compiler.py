@@ -148,6 +148,33 @@ class TestApply:
             "transform 'customer.explode' failed: ValueError: cannot parse"
         )
 
+    def test_the_error_of_a_transform_is_one_line(self) -> None:
+        registry = mapping.TransformRegistry()
+
+        @registry.register("customer.multiline")
+        def multiline(value: object) -> object:
+            raise ValueError(
+                f"cannot parse {value!s}\n# PASSED\r\n| x |\x1b[0m"
+            )
+
+        compiled = mapping.compile_catalog(
+            mapping_specs.catalog(
+                mapping_specs.mapping(
+                    mapping_specs.field(
+                        "weird", "W", transform="customer.multiline"
+                    )
+                )
+            ),
+            registry,
+        )["customer"]
+
+        record = compiled.apply({"W": "x"})
+
+        assert record.issues[0].message == (
+            "transform 'customer.multiline' failed: ValueError: cannot parse"
+            " x\\n# PASSED\\r\\n| x |\\x1b[0m"
+        )
+
     def test_records_carry_their_lineage(self) -> None:
         compiled = mapping.compile_catalog(
             mapping_specs.catalog(

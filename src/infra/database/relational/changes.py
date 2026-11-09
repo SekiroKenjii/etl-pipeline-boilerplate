@@ -12,12 +12,15 @@ Debezium or GoldenGate changes through a queue.
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 import dataclasses
 import datetime
 import struct
-from typing import Any, cast
+from typing import cast
 
+from psycopg import abc as pg_abc
+from psycopg import adapt
+from psycopg import pq
 import sqlalchemy as sa
 
 from core import contract
@@ -159,15 +162,15 @@ class SqlServerChangeTracking(
         base: int,
         limit: int | None,
         version: int,
-        last: tuple[Any, ...] | None,
-    ) -> list[dict[str, Any]]:
+        last: tuple[object, ...] | None,
+    ) -> list[sa.RowMapping]:
         """Reads one page of changes, in (version, key) order."""
         quote = self.db.engine.dialect.identifier_preparer.quote
         table = self.db.engine.dialect.identifier_preparer.format_table(
             self.db.table(self._table)
         )
         key = self.key
-        params: dict[str, Any] = {"base": base, "n": self.page_size}
+        params: dict[str, object] = {"base": base, "n": self.page_size}
         conditions = []
         if limit is not None:
             conditions.append("ct.SYS_CHANGE_VERSION <= :limit")
@@ -198,13 +201,10 @@ class SqlServerChangeTracking(
             + ", ".join(f"ct.{quote(c)}" for c in key)
         )
         with self.db.connect(f"reading the changes of {self._table}") as conn:
-            return [
-                dict(row)
-                for row in conn.execute(sa.text(statement), params).mappings()
-            ]
+            return list(conn.execute(sa.text(statement), params).mappings())
 
     def _event(
-        self, row: dict[str, Any], key: tuple[str, ...]
+        self, row: sa.RowMapping, key: tuple[str, ...]
     ) -> contract.ChangeEvent | None:
         """Turns a row of CHANGETABLE into a change; None to skip it."""
         values = tuple(row[f"etl_ct_{c}"] for c in key)
@@ -245,7 +245,7 @@ class SqlServerChangeTracking(
 
 def _version(
     position: contract.StateValue,
-) -> tuple[int, tuple[Any, ...] | None]:
+) -> tuple[int, tuple[object, ...] | None]:
     """Splits a Change Tracking position into its version and key.
 
     Raises:
@@ -259,8 +259,12 @@ def _version(
         )
     key = position.get("key")
     decoded = utils.from_tagged(key) if key is not None else None
+    if decoded is not None and not isinstance(decoded, list):
+        raise contract.FatalError(
+            f"Not a Change Tracking position: {position!r}"
+        )
     return cast(int, position["version"]), (
-        tuple(cast(list[Any], decoded)) if decoded is not None else None
+        tuple(decoded) if decoded is not None else None
     )
 
 
@@ -321,7 +325,7 @@ class PostgresLogicalReplication(
     transaction are. `safe` is the commit of the transaction before, all
     loaded: the slot is advanced to it.
 
-    Needs psycopg (the `postgres` extra) and `wal_level = logical`. Deletes
+    Needs psycopg as the driver and `wal_level = logical`. Deletes
     come with the replica identity (the primary key by default).
     """
 
@@ -490,8 +494,8 @@ class PostgresLogicalReplication(
             )
 
     def _current(
-        self, conn: sa.Connection, key: dict[str, Any]
-    ) -> dict[str, Any] | None:
+        self, conn: sa.Connection, key: Mapping[str, object]
+    ) -> dict[str, object] | None:
         """Reads a row as it is now: large values left unchanged by an update
         are not in the log."""
         table = self.db.table(self._table)
@@ -558,8 +562,8 @@ class _Message:
     kind: str
     commit: str = ""
     operation: contract.ChangeOperation = contract.ChangeOperation.INSERT
-    row: dict[str, Any] = dataclasses.field(default_factory=dict)
-    key_values: dict[str, Any] = dataclasses.field(default_factory=dict)
+    row: dict[str, object] = dataclasses.field(default_factory=dict)
+    key_values: dict[str, object] = dataclasses.field(default_factory=dict)
     unchanged: bool = False
     committed_at: datetime.datetime | None = None
 
@@ -607,8 +611,8 @@ class _PgOutput:
         if relation is None or (relation.schema, relation.name) != self._table:
             return _Message("other")
         offset = 4
-        old: list[Any] | None = None
-        new: list[Any] | None = None
+        old: list[object] | None = None
+        new: list[object] | None = None
         while offset < len(body):
             marker = chr(body[offset])
             values, offset = self._tuple(body, offset + 1, relation)
@@ -673,12 +677,12 @@ class _PgOutput:
 
     def _tuple(
         self, body: memoryview, offset: int, relation: _Relation
-    ) -> tuple[list[Any], int]:
+    ) -> tuple[list[object], int]:
         """Reads the values of a row: NULL, unchanged, or text; returns them
         and where the row ends."""
         (count,) = struct.unpack_from(">H", body, offset)
         offset += 2
-        values: list[Any] = []
+        values: list[object] = []
         for i in range(count):
             kind = chr(body[offset])
             offset += 1
@@ -707,18 +711,11 @@ def _string(body: memoryview, offset: int) -> tuple[str, int]:
 class _Loaders:
     """Turns the text of a value into its Python value, by its type."""
 
-    def __init__(self, driver: Any) -> None:
-        # Imported here: only Postgres through psycopg needs them.
-        # pylint: disable=import-outside-toplevel
-        from psycopg import adapt
-        from psycopg import pq
-
-        # pylint: enable=import-outside-toplevel
-
+    def __init__(self, driver: pg_abc.AdaptContext) -> None:
         self._transformer = adapt.Transformer(driver)
         self._format = pq.Format.TEXT
 
-    def load(self, value: Any) -> Any:
+    def load(self, value: object) -> object:
         if not isinstance(value, _Text):
             return value
         loader = self._transformer.get_loader(value.oid, self._format)

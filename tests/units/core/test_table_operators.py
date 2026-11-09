@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 import datetime
 from typing import Any
 
@@ -132,6 +133,15 @@ class TestTableExtractor:
 
         assert _run(rerun) == [2, 3]
 
+    def test_a_lookback_must_fit_the_watermark(self) -> None:
+        reader = fake_ports.InMemoryTableReader({"crm.customer": _rows((1, 1))})
+        state = core_state.InMemoryStateStore()
+        _run(_extractor(reader, state))
+        misfit = _extractor(reader, state, lookback=5)
+
+        with pytest.raises(contract.FatalError, match="does not apply"):
+            _run(misfit)
+
     def test_without_watermark_rows_come_by_key(self) -> None:
         table: list[dict[str, Any]] = [{"id": 2}, {"id": 1}]
         reader = fake_ports.InMemoryTableReader({"crm.customer": table})
@@ -231,6 +241,148 @@ class TestTableExtractor:
 
         with pytest.raises(ValueError, match=message):
             operators.TableExtractor(reader, "crm.customer", **options)
+
+
+class _CancellingLoader(fakes.CollectingLoader[contract.Row]):
+    """Cancels the run once it loaded `after` batches: SIGTERM, a lost lease."""
+
+    def __init__(self, after: int) -> None:
+        super().__init__()
+        self._after = after
+
+    def load(
+        self, records: Sequence[contract.Row], ctx: contract.ETLContext
+    ) -> contract.ETLStats:
+        stats = super().load(records, ctx)
+        if self.batches == self._after:
+            ctx.cancel()
+        return stats
+
+
+class TestReadingAgain:
+    """The rows at the saved watermark are read again until a run has read
+    them all, whatever dies or stops half-way."""
+
+    def _late_commits(self) -> tuple[list[dict[str, Any]], Any]:
+        """Row 9 read at minute 1, then 1 to 4 committed late at minute 1."""
+        table = _rows((9, 1))
+        reader = fake_ports.InMemoryTableReader({"crm.customer": table})
+        state = core_state.InMemoryStateStore()
+        assert _run(_extractor(reader, state)) == [9]
+        table.extend(_rows((1, 1), (2, 1), (3, 1), (4, 1)))
+        return table, (reader, state)
+
+    def test_a_run_dying_half_way_loses_no_late_row(self) -> None:
+        _, (reader, state) = self._late_commits()
+        failing = fakes.CollectingLoader[contract.Row](fail_on_batch=2)
+        extractor = _extractor(reader, state)
+
+        with pytest.raises(contract.RetryableError):
+            _run(extractor, batch_size=1, loader=failing)
+
+        assert failing.rows == [{"id": 1, "updated_at": _at(1), "name": "n1"}]
+        assert _run(_extractor(reader, state)) == [2, 3, 4, 9]
+        assert _run(_extractor(reader, state)) == []
+
+    def test_a_run_cancelled_half_way_loses_no_late_row(self) -> None:
+        _, (reader, state) = self._late_commits()
+
+        assert _run(
+            _extractor(reader, state),
+            batch_size=1,
+            loader=_CancellingLoader(after=2),
+        ) == [1, 2]
+        assert _run(_extractor(reader, state)) == [3, 4, 9]
+        assert _run(_extractor(reader, state)) == []
+
+    def test_a_run_dying_twice_half_way_loses_no_late_row(self) -> None:
+        _, (reader, state) = self._late_commits()
+
+        for _ in range(2):
+            failing = fakes.CollectingLoader[contract.Row](fail_on_batch=2)
+            extractor = _extractor(reader, state)
+            with pytest.raises(contract.RetryableError):
+                _run(extractor, batch_size=1, loader=failing)
+
+        assert _run(_extractor(reader, state)) == [3, 4, 9]
+
+    def test_a_dry_run_half_way_leaves_the_read_again_to_come(self) -> None:
+        _, (reader, state) = self._late_commits()
+
+        _run(_extractor(reader, state), ctx=fakes.make_context(dry_run=True))
+        _run(_extractor(reader, state), ctx=fakes.make_context(dry_run=True))
+
+        assert _run(_extractor(reader, state)) == [1, 2, 3, 4, 9]
+
+    def test_a_static_table_is_read_again_once_on_full_batches(self) -> None:
+        reader = fake_ports.InMemoryTableReader(
+            {"crm.customer": _rows((1, 1), (2, 1), (3, 1), (4, 1))}
+        )
+        state = core_state.InMemoryStateStore()
+
+        assert _run(_extractor(reader, state)) == [1, 2, 3, 4]
+        # Two full batches: the read ends after the last one is loaded.
+        assert _run(_extractor(reader, state)) == [1, 2, 3, 4]
+        assert _run(_extractor(reader, state)) == []
+        assert _run(_extractor(reader, state)) == []
+
+    def test_a_death_after_the_read_again_does_not_repeat_it(self) -> None:
+        table, (reader, state) = self._late_commits()
+        table.extend(_rows((20, 2), (21, 2)))
+        failing = fakes.CollectingLoader[contract.Row](fail_on_batch=6)
+        extractor = _extractor(reader, state)
+
+        with pytest.raises(contract.RetryableError):
+            _run(extractor, batch_size=1, loader=failing)
+
+        # Minute 1 was read again whole; minute 2, the largest, is next.
+        assert [row["id"] for row in failing.rows] == [1, 2, 3, 4, 9]
+        assert _run(_extractor(reader, state)) == [20, 21]
+        assert _run(_extractor(reader, state)) == [20, 21]
+        assert _run(_extractor(reader, state)) == []
+
+    def test_a_backfill_below_the_watermark_keeps_the_read_again(
+        self,
+    ) -> None:
+        table, (reader, state) = self._late_commits()
+        # Row 5 came late with an old watermark: what backfills are for.
+        table.extend(_rows((5, -7), (20, 20)))
+        backfill = contract.ETLContext(
+            contract.ETLRunInfo("crm", since=_at(-10), until=_at(-5))
+        )
+
+        assert _run(_extractor(reader, state), ctx=backfill) == [5]
+        assert _run(_extractor(reader, state)) == [1, 2, 3, 4, 9, 20]
+
+    def test_a_backfill_above_the_watermark_does_not_skip_rows(self) -> None:
+        table, (reader, state) = self._late_commits()
+        table.extend(_rows((20, 20), (30, 30)))
+        backfill = contract.ETLContext(
+            contract.ETLRunInfo("crm", since=_at(25), until=_at(40))
+        )
+
+        assert _run(_extractor(reader, state), ctx=backfill) == [30]
+        assert _run(_extractor(reader, state)) == [1, 2, 3, 4, 9, 20, 30]
+
+    def test_a_backfill_before_any_run_is_not_taken_as_one(self) -> None:
+        reader = fake_ports.InMemoryTableReader(
+            {"crm.customer": _rows((1, 1), (2, 5))}
+        )
+        state = core_state.InMemoryStateStore()
+        backfill = contract.ETLContext(contract.ETLRunInfo("crm", since=_at(5)))
+
+        assert _run(_extractor(reader, state), ctx=backfill) == [2]
+        assert _run(_extractor(reader, state)) == [1, 2]
+
+    def test_a_backfill_over_the_watermark_reads_it_again(self) -> None:
+        table, (reader, state) = self._late_commits()
+        table.extend(_rows((20, 20)))
+        backfill = contract.ETLContext(
+            contract.ETLRunInfo("crm", since=_at(0), until=_at(10))
+        )
+
+        assert _run(_extractor(reader, state), ctx=backfill) == [1, 2, 3, 4, 9]
+        assert _run(_extractor(reader, state)) == [20]
 
 
 class TestTableQuery:

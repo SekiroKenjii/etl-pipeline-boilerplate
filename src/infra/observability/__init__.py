@@ -1,7 +1,6 @@
 """Shipping logs: JSON on stdout for log agents, OpenTelemetry for the rest.
 
-`configure_logging` once at start-up; `stop()` the result at exit. The OTLP
-sink needs the `otel` extra, imported only when configured.
+`configure_logging` once at start-up; `stop()` the result at exit.
 """
 
 from infra.observability.formatter import ConsoleFormatter

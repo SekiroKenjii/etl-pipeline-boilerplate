@@ -1,9 +1,8 @@
-"""HTTP and REST adapters. Needs the `http` extra (httpx).
+"""HTTP and REST adapters, through httpx.
 
 `api.RestEndpoint` implements `contract.IAsyncRecordSource`.
 """
 
-from infra.http.api import ApiRecord
 from infra.http.api import RestApi
 from infra.http.api import RestEndpoint
 from infra.http.client import HttpRequester
@@ -13,7 +12,8 @@ from infra.http.pagination import LinkHeaderPaginator
 from infra.http.pagination import NoPagination
 from infra.http.pagination import Page
 from infra.http.pagination import PageNumberPaginator
-from infra.http.pagination import Paginator
+from infra.http.types import ApiRecord
+from infra.http.types import Paginator
 
 __all__ = [
     "ApiRecord",

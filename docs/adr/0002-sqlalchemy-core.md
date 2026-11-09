@@ -13,9 +13,11 @@ staging).
 
 - **Relational databases.** They go through SQLAlchemy Core: reflected
   tables, keyset reads, and staging tables merged with set-based SQL.
-- **Dialects.** Where databases differ, a `Dialect` object of
-  `infra.database.relational.dialects` covers it: bulk copy, `MERGE`,
-  `COPY`, temporary tables.
+- **Dialects.** Where databases differ, a `Dialect` object covers it (the
+  base class in `infra.database.relational.base_dialect`, one subclass per
+  database in `dialects`): bulk copy, `MERGE`, `COPY`, temporary tables,
+  inserting the rows a table lacks (`insert_missing`), the error codes that
+  are transient, the isolation level, the hints a merge takes.
 - **MongoDB.** It has adapters of its own, behind the same ports.
 
 ## Consequences

@@ -15,8 +15,10 @@ every project.
   jobs, quality, keys, mappings, change data capture, cutover. It imports
   the standard library only. `core.contract` imports no other part of the
   core, so an adapter implements a port without knowing the engine.
-- **Adapters.** They live in `infra`, one extra per family, and implement
-  the ports.
+- **Adapters.** They live in `infra` and implement the ports. Their
+  libraries are dependencies of the package, imported at the top of the
+  modules that use them; only the SQL drivers that SQLAlchemy loads by URL
+  (`mssql`, `oracle`, `mysql`) are extras.
 - **The composition root.** `app` picks the adapters from the settings.
 - **Modules.** They ask for ports by name, and never import `infra`.
 - **Entry points.** `cli` goes through `app` for anything built from the

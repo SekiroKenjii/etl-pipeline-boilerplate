@@ -7,7 +7,9 @@ loaded. Rejected rows fail the report unless accepted
 (`AcceptedRejections`).
 """
 
+from core.contract.cutover import Verdict
 from core.cutover.acceptance import AcceptedRejections
+from core.cutover.acceptance import ANY
 from core.cutover.checksum import canonical_value
 from core.cutover.diff import count
 from core.cutover.diff import Difference
@@ -24,10 +26,10 @@ from core.cutover.markdown import to_markdown
 from core.cutover.report import build
 from core.cutover.report import CutoverReport
 from core.cutover.report import last_runs
-from core.cutover.report import Verdict
 from core.cutover.rules import LoadedRowsCheck
 
 __all__ = [
+    "ANY",
     "ROWS_PER_PARTITION",
     "AcceptedRejections",
     "Comparison",

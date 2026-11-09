@@ -11,17 +11,22 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 import json
 import pathlib
-from typing import Any
 
 import openpyxl
 from openpyxl import styles
+from openpyxl.cell import cell as openpyxl_cell
 from openpyxl.worksheet import worksheet as openpyxl_worksheet
+
+from shared import utils
+
+type _Value = str | float | None
 
 _HEADER_FONT = styles.Font(bold=True, color="FFFFFF")
 _HEADER_FILL = styles.PatternFill("solid", fgColor="305496")
 _STATUS_FILLS = {
     "match": styles.PatternFill("solid", fgColor="C6EFCE"),
     "mismatch": styles.PatternFill("solid", fgColor="FFC7CE"),
+    "empty": styles.PatternFill("solid", fgColor="FFC7CE"),
     "counted": styles.PatternFill("solid", fgColor="FFEB9C"),
     "match-with-rejects": styles.PatternFill("solid", fgColor="FFEB9C"),
 }
@@ -46,9 +51,10 @@ _SUMMARY = (
 
 
 def write_cutover_report(
-    report: Mapping[str, Any], path: pathlib.Path | str
+    report: Mapping[str, object], path: pathlib.Path | str
 ) -> pathlib.Path:
     """Writes the report to an xlsx workbook; returns its path."""
+    entities = _records(report["entities"])
     workbook = openpyxl.Workbook()
     summary = workbook.active
     if summary is None:  # A new workbook has one sheet.
@@ -65,13 +71,13 @@ def write_cutover_report(
         summary,
         [label for label, _ in _SUMMARY],
         [
-            [entity.get(field) for _, field in _SUMMARY]
-            for entity in report["entities"]
+            [_cell(entity.get(field)) for _, field in _SUMMARY]
+            for entity in entities
         ],
         first_row=4,
     )
-    for row, entity in enumerate(report["entities"], start=5):
-        fill = _STATUS_FILLS.get(entity["status"])
+    for row, entity in enumerate(entities, start=5):
+        fill = _STATUS_FILLS.get(str(entity["status"]))
         if fill is not None:
             summary.cell(row=row, column=2).fill = fill
 
@@ -80,25 +86,25 @@ def write_cutover_report(
         ["Entity", "Kind", "Key", "Column", "Expected", "Found"],
         [
             [
-                entity["entity"],
-                sample["kind"],
+                _cell(entity["entity"]),
+                _cell(sample["kind"]),
                 json.dumps(sample["key"], ensure_ascii=False),
                 column,
                 _cell(values.get("expected")),
                 _cell(values.get("actual")),
             ]
-            for entity in report["entities"]
-            for sample in entity["samples"]
-            for column, values in (sample["columns"] or {"": {}}).items()
+            for entity in entities
+            for sample in _records(entity["samples"])
+            for column, values in _columns(sample["columns"]).items()
         ],
     )
     _table(
         workbook.create_sheet("Rejected"),
         ["Entity", "Reason", "Rows"],
         [
-            [entity["entity"], reason, count]
-            for entity in report["entities"]
-            for reason, count in entity["rejections"].items()
+            [_cell(entity["entity"]), reason, _cell(count)]
+            for entity in entities
+            for reason, count in _mapping(entity["rejections"]).items()
         ],
     )
     _table(
@@ -106,7 +112,9 @@ def write_cutover_report(
         ["Entry", "Value"],
         [
             [entry, _text(value)]
-            for entry, value in _flat(report.get("provenance") or {}).items()
+            for entry, value in _flat(
+                _mapping(report.get("provenance") or {})
+            ).items()
         ],
     )
     _table(
@@ -114,14 +122,14 @@ def write_cutover_report(
         ["Pipeline", "Status", "Started", "Completed", "Stats", "Message"],
         [
             [
-                run["pipeline"],
-                run["status"],
-                run["started_at"],
-                run["completed_at"],
+                _cell(run["pipeline"]),
+                _cell(run["status"]),
+                _cell(run["started_at"]),
+                _cell(run["completed_at"]),
                 json.dumps(run["stats"]),
-                run["message"],
+                _cell(run["message"]),
             ]
-            for run in report["runs"]
+            for run in _records(report["runs"])
         ],
     )
     target = pathlib.Path(path)
@@ -133,7 +141,7 @@ def write_cutover_report(
 def _table(
     sheet: openpyxl_worksheet.Worksheet,
     headers: Sequence[str],
-    rows: Sequence[Sequence[Any]],
+    rows: Sequence[Sequence[_Value]],
     first_row: int = 1,
 ) -> None:
     """Writes a header row and rows, the header styled and frozen."""
@@ -150,16 +158,28 @@ def _table(
 
 
 def _put(
-    sheet: openpyxl_worksheet.Worksheet, row: int, column: int, value: Any
+    sheet: openpyxl_worksheet.Worksheet,
+    row: int,
+    column: int,
+    value: _Value,
 ) -> None:
-    """Writes a value into a cell; text always as text, never a formula."""
+    """Writes a value into a cell; text always as text, never a formula.
+
+    The control characters a workbook cannot hold are escaped (`\\x1b`);
+    line breaks and tabs are kept: the Rejected sheet's reasons must stay
+    those an acceptance CSV names.
+    """
+    if isinstance(value, str):
+        value = openpyxl_cell.ILLEGAL_CHARACTERS_RE.sub(
+            lambda found: utils.one_line(found.group()), value
+        )
     cell = sheet.cell(row=row, column=column, value=value)
     if isinstance(value, str):
         # Never a formula (`=...`) or an error (`#N/A`), whatever the text.
         cell.data_type = "s"
 
 
-def _cell(value: Any) -> Any:
+def _cell(value: object) -> _Value:
     """A canonical value, as a cell shows it: text keeps its quotes off."""
     return (
         value
@@ -168,19 +188,38 @@ def _cell(value: Any) -> Any:
     )
 
 
-def _text(value: Any) -> Any:
+def _text(value: object) -> _Value:
     """A provenance value, as a cell shows it."""
     if value is None or isinstance(value, (int, str)):
         return value
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
-def _flat(data: Mapping[str, Any], prefix: str = "") -> dict[str, Any]:
+def _flat(data: Mapping[str, object], prefix: str = "") -> dict[str, object]:
     """Nested mappings as one, by dotted entry."""
-    found: dict[str, Any] = {}
+    found: dict[str, object] = {}
     for name, value in data.items():
         if isinstance(value, Mapping) and value:
             found |= _flat(value, f"{prefix}{name}.")
         else:
             found[f"{prefix}{name}"] = value
     return found
+
+
+def _mapping(value: object) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise TypeError(f"not a mapping: {type(value).__name__}")
+    return value
+
+
+def _records(value: object) -> list[Mapping[str, object]]:
+    if not isinstance(value, list):
+        raise TypeError(f"not a list: {type(value).__name__}")
+    return [_mapping(item) for item in value]
+
+
+def _columns(value: object) -> dict[str, Mapping[str, object]]:
+    """The expected and actual values of a sample, by column; one blank
+    column for a sample without columns."""
+    columns = _mapping(value or {"": {}})
+    return {name: _mapping(values) for name, values in columns.items()}

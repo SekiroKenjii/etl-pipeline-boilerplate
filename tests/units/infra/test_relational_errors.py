@@ -11,6 +11,7 @@ import contextlib
 import pathlib
 import sqlite3
 import traceback
+import typing
 from typing import Any
 
 from mssql_python import exceptions as mssql_errors
@@ -73,7 +74,22 @@ INTERFACE = sa_exc.InterfaceError
         (POSTGRES, OPERATIONAL, pg_errors.CannotConnectNow(), True),
         (POSTGRES, OPERATIONAL, pg_errors.TooManyConnections(), True),
         (POSTGRES, OPERATIONAL, pg_errors.LockNotAvailable(), True),
-        (POSTGRES, OPERATIONAL, pg_errors.QueryCanceled(), True),
+        # Cancelled by another session (an operator, a failover): retried;
+        # by its statement_timeout: it would time out again.
+        (
+            POSTGRES,
+            OPERATIONAL,
+            pg_errors.QueryCanceled("canceling statement due to user request"),
+            True,
+        ),
+        (
+            POSTGRES,
+            OPERATIONAL,
+            pg_errors.QueryCanceled(
+                "canceling statement due to statement timeout"
+            ),
+            False,
+        ),
         (POSTGRES, OPERATIONAL, pg_errors.ConnectionFailure(), True),
         (POSTGRES, PROGRAMMING, pg_errors.UndefinedTable(), False),
         (POSTGRES, PROGRAMMING, pg_errors.UndefinedColumn(), False),
@@ -180,8 +196,31 @@ INTERFACE = sa_exc.InterfaceError
             ),
             False,
         ),
+        # SQL Server: waiting for memory to run a query (8645), whatever
+        # the class of the error.
+        (
+            MSSQL,
+            DATABASE,
+            _mssql(
+                "General error",
+                "A timeout occurred while waiting for memory resources to"
+                " execute the query in resource pool 'default' (2).",
+            ),
+            True,
+        ),
+        (
+            MSSQL,
+            DATABASE,
+            Exception(
+                "HY000",
+                "[HY000] [SQL Server]A timeout occurred while waiting for"
+                " memory resources (8645) (SQLExecDirectW)",
+            ),
+            True,
+        ),
         # SQL Server, pymssql: the error number first.
         (MSSQL, OPERATIONAL, Exception(1205, b"deadlocked"), True),
+        (MSSQL, DATABASE, Exception(8645, b"memory resources"), True),
         (MSSQL, OPERATIONAL, Exception(18456, b"Login failed"), False),
         (MSSQL, OPERATIONAL, Exception(4060, b"Cannot open database"), False),
         # SQL Server, bulk copy (mssql-python's own connection).
@@ -225,6 +264,11 @@ INTERFACE = sa_exc.InterfaceError
                 "ORA-01033",
                 "DPY-4011",
                 "DPY-6005",
+                # Snapshot too old: undo overwritten; a new query gets a
+                # new snapshot.
+                "ORA-01555",
+                # Shared pool memory short for a moment.
+                "ORA-04031",
             )
         ),
         (ORACLE, DATABASE, _oracle("ORA-03135", isrecoverable=True), True),
@@ -550,3 +594,137 @@ def test_errors_translate_without_a_dialect() -> None:
     with pytest.raises(contract.FatalError, match="no such table"):
         with database.errors("reading"):
             raise error
+
+
+class TestParametersTheDriverCannotBind:
+    """A value the driver refuses to bind (SQLite's `OverflowError`,
+    mssql-python's `ValueError` past BIGINT) fails the statement like any
+    other bad data: fatal, without the value."""
+
+    _HUGE = 2**70
+
+    def test_executing_is_fatal(self) -> None:
+        db = relational.Database("sqlite://")
+        connect = db.connect("reading")
+        statement = sa.text("SELECT :v").bindparams(v=self._HUGE)
+
+        try:
+            with pytest.raises(contract.FatalError) as caught:
+                _execute(connect, statement)
+        finally:
+            db.engine.dispose()
+
+        assert str(caught.value).startswith("reading: ")
+        assert str(self._HUGE) not in str(caught.value)
+        cause = caught.value.__cause__
+        assert cause is not None
+        assert isinstance(cause.__cause__, OverflowError)
+
+    def test_in_a_transaction_too_rolled_back(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        db = relational.Database(f"sqlite:///{tmp_path / 'etl.db'}")
+        table = sa.Table("t", sa.MetaData(), sa.Column("n", sa.BigInteger))
+        table.metadata.create_all(db.engine)
+
+        def insert_one_then_one_too_big() -> None:
+            with db.begin("inserting") as connection:
+                connection.execute(table.insert(), [{"n": 1}])
+                connection.execute(table.insert(), [{"n": self._HUGE}])
+
+        try:
+            with pytest.raises(contract.FatalError):
+                insert_one_then_one_too_big()
+            with db.connect("counting") as connection:
+                count = connection.execute(
+                    sa.select(sa.func.count()).select_from(table)
+                ).scalar_one()
+        finally:
+            db.engine.dispose()
+
+        assert count == 0
+
+    def test_once_for_an_engine_shared_by_databases(self) -> None:
+        engine = sa.create_engine("sqlite://")
+        first = relational.Database(engine)
+        second = relational.Database(engine)
+        statement = sa.text("SELECT :v").bindparams(v=self._HUGE)
+
+        try:
+            connect = second.connect("reading")
+            with pytest.raises(contract.FatalError) as caught:
+                _execute(connect, statement)
+        finally:
+            engine.dispose()
+
+        assert first.engine is second.engine
+        cause = caught.value.__cause__
+        assert cause is not None
+        assert isinstance(cause.__cause__, OverflowError)
+
+    def test_an_error_of_the_caller_s_code_is_not_the_database_s(
+        self,
+    ) -> None:
+        db = relational.Database("sqlite://")
+
+        def fail_while_connected() -> None:
+            with db.connect("reading") as connection:
+                connection.execute(sa.text("SELECT 1"))
+                raise ValueError("not the database's")
+
+        try:
+            with pytest.raises(ValueError, match="not the database's"):
+                fail_while_connected()
+        finally:
+            db.engine.dispose()
+
+
+class _Settings:
+    """A connection answering `SHOW <setting>` with a value."""
+
+    def __init__(self, value: str) -> None:
+        self.value = value
+        self.statements: list[str] = []
+
+    def execute(self, statement: sa.TextClause) -> _Settings:
+        self.statements.append(str(statement))
+        return self
+
+    def scalar_one(self) -> str:
+        return self.value
+
+
+def _session_warnings(dialect: dialects.Dialect, value: str) -> list[str]:
+    connection = _Settings(value)
+    found = dialect.session_warnings(typing.cast(sa.Connection, connection))
+    assert connection.statements in ([], ["SHOW lc_messages"])
+    return found
+
+
+class TestPostgresMessagesInEnglish:
+    """A statement past `statement_timeout` is told by its English message:
+    `etl check` warns of sessions whose messages are in another language."""
+
+    @pytest.mark.parametrize(
+        "locale", ["C", "POSIX", "C.UTF-8", "C.utf8", "en_US.utf8", "en_GB"]
+    )
+    def test_english_messages_are_fine(self, locale: str) -> None:
+        assert not _session_warnings(POSTGRES, locale)
+
+    @pytest.mark.parametrize("locale", ["de_DE.utf8", "fr_FR", "ja_JP.UTF-8"])
+    def test_another_language_is_warned_of(self, locale: str) -> None:
+        (warning,) = _session_warnings(POSTGRES, locale)
+
+        assert repr(locale) in warning
+        assert "lc_messages = 'C'" in warning
+
+    def test_a_language_left_to_the_server_s_environment_is_warned_of(
+        self,
+    ) -> None:
+        (warning,) = _session_warnings(POSTGRES, "")
+
+        assert "lc_messages = 'C'" in warning
+
+    def test_other_databases_are_not_asked(self) -> None:
+        for dialect in (GENERIC, MSSQL, MYSQL, ORACLE):
+            assert not _session_warnings(dialect, "de_DE.utf8")

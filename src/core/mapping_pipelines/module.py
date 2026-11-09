@@ -12,7 +12,7 @@ from core import runtime
 from core.mapping_pipelines import kinds
 from core.mapping_pipelines import mappings as pipelines_mappings
 from core.mapping_pipelines import reconciliation
-from core.mapping_pipelines import settings as pipelines_settings
+from core.mapping_pipelines import types as pipelines_types
 from core.runtime import names
 
 
@@ -49,7 +49,7 @@ class MappingModule(runtime.Module):
     def __init__(
         self,
         name: str,
-        settings: pipelines_settings.MappingSettings,
+        settings: pipelines_types.MappingSettings,
         transforms: mapping.TransformRegistry,
         *,
         key_secret: bytes | None = None,

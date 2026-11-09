@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+from typing import Any, cast
 
 from core import contract
 from tests.factories import fakes
@@ -10,6 +11,12 @@ from tests.factories import fakes
 OPEN = contract.QuarantineStatus.OPEN
 REPLAYED = contract.QuarantineStatus.REPLAYED
 CLOSED = contract.QuarantineStatus.CLOSED
+
+
+def fields(entry: contract.QuarantineEntry) -> dict[str, Any]:
+    """The record of an entry: a dict, as rows and mapped records are kept."""
+    assert isinstance(entry.record, dict), entry.record
+    return cast(dict[str, Any], entry.record)
 
 
 def _rejected(
@@ -50,7 +57,7 @@ def check_quarantine(quarantine: contract.IQuarantine) -> None:
     quarantine.put([_rejected("1005")], second)
 
     entries = list(quarantine.entries())
-    assert [e.record["source_key"] for e in entries] == [
+    assert [fields(e)["source_key"] for e in entries] == [
         "1003",
         "1004",
         "1005",
@@ -62,12 +69,12 @@ def check_quarantine(quarantine: contract.IQuarantine) -> None:
         OPEN,
     )
     assert one.checkpoint == "after_transform"
-    assert one.record["data"] == {"name": "Chi"}
+    assert fields(one)["data"] == {"name": "Chi"}
     assert one.issues[0]["message"] == "not a date"
     assert one.rejected_at.tzinfo is not None
-    assert [e.record["source_key"] for e in quarantine.entries("crm.sync")] == [
-        "1005"
-    ]
+    assert [
+        fields(e)["source_key"] for e in quarantine.entries("crm.sync")
+    ] == ["1005"]
 
     assert quarantine.resolve([one.id], REPLAYED) == 1
     assert quarantine.resolve([one.id], REPLAYED) == 0  # Already.
@@ -123,9 +130,9 @@ def check_rejected_again(quarantine: contract.IQuarantine) -> None:
         (
             e.pipeline,
             e.checkpoint,
-            e.record["source_key"],
-            e.record["part"],
-            e.record["data"]["name"],
+            fields(e)["source_key"],
+            fields(e)["part"],
+            fields(e)["data"]["name"],
         ): e
         for e in entries
     }
@@ -145,7 +152,7 @@ def check_rejected_again(quarantine: contract.IQuarantine) -> None:
     again = found["crm.full_load", "after_transform", "1003", 0, "Chi C"]
     assert again.run_id == second.run.run_id
     assert [i["message"] for i in again.issues] == ["twice in a batch"]
-    same = [e for e in entries if e.record["source_key"] == "1003"]
+    same = [e for e in entries if fields(e)["source_key"] == "1003"]
     assert len({e.key for e in same}) == len(same)
 
     # Once replayed, a record rejected again is a new open entry.
@@ -154,7 +161,7 @@ def check_rejected_again(quarantine: contract.IQuarantine) -> None:
     mine = [
         e
         for e in quarantine.entries("crm.full_load", status=None)
-        if (e.checkpoint, e.record["source_key"], e.record["part"])
+        if (e.checkpoint, fields(e)["source_key"], fields(e)["part"])
         == ("after_transform", "1003", 0)
     ]
     assert sorted(e.status for e in mine) == [OPEN, REPLAYED]

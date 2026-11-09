@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import abc
 from collections.abc import AsyncIterator, Mapping
-from typing import Any
 
 from core.contract import lifecycle
 
@@ -17,5 +16,5 @@ class IAsyncRecordSource[T](lifecycle.AsyncLifecycle, abc.ABC):
     """
 
     @abc.abstractmethod
-    def records(self, params: Mapping[str, Any]) -> AsyncIterator[T]:
+    def records(self, params: Mapping[str, object]) -> AsyncIterator[T]:
         """Yields the records for `params`; implement as an async generator."""

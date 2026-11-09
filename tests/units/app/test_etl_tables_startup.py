@@ -13,8 +13,10 @@ import sqlalchemy as sa
 
 from cli import database as database_cli
 from cli import run
+from core import contract
 from infra.database import relational
 from infra.database.relational import migrations
+from shared.utils import retrying
 from tests.integrations.databases import legacy_etl_tables
 
 
@@ -141,3 +143,48 @@ def test_create_upgrades_the_tables(tmp_path: pathlib.Path, old: bool) -> None:
         )
     finally:
         db.engine.dispose()
+
+
+class TestCheckingWhileAnotherProcessUpgrades:
+    """Reading the catalog deadlocks with another process's DDL on SQL
+    Server: `check` looks again a few times before giving up."""
+
+    @pytest.fixture(autouse=True)
+    def _no_delay(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(retrying.time, "sleep", lambda _: None)
+
+    def test_a_transient_catalog_error_is_tried_again(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[int] = []
+
+        def status(*args: object, **kwargs: object) -> migrations.Status:
+            del args, kwargs
+            calls.append(1)
+            if len(calls) == 1:
+                raise contract.RetryableError("deadlocked on lock resources")
+            return migrations.Status(dialect="sqlite", revision=migrations.HEAD)
+
+        monkeypatch.setattr(migrations, "status", status)
+
+        migrations.check(relational.Database("sqlite://"))
+
+        assert len(calls) == 2
+
+    def test_a_catalog_that_never_answers_fails_after_a_few_attempts(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[int] = []
+
+        def status(*args: object, **kwargs: object) -> migrations.Status:
+            del args, kwargs
+            calls.append(1)
+            raise contract.RetryableError("deadlocked on lock resources")
+
+        monkeypatch.setattr(migrations, "status", status)
+
+        db = relational.Database("sqlite://")
+        with pytest.raises(contract.RetryableError):
+            migrations.check(db)
+
+        assert len(calls) == migrations._RACING_UPGRADE_ATTEMPTS  # pylint: disable=protected-access

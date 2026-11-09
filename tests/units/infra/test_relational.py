@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import datetime
+import decimal
 import gc
 import pathlib
 from typing import Any
@@ -17,6 +19,7 @@ from sqlalchemy.dialects import postgresql as sa_postgresql
 
 from core import contract
 from infra.database import relational
+from infra.database.relational import bulk_loading
 from infra.database.relational import dialects
 
 # SQLAlchemy's dialect modules are not typed.
@@ -127,6 +130,106 @@ class TestKeyset:
         assert _sql(condition, postgresql.dialect()) == "(t.a, t.b) > (1, 'x')"
 
 
+STAMPS = sa.Table(
+    "s",
+    sa.MetaData(),
+    sa.Column("id", sa.Integer),
+    sa.Column("dt", sa.DATETIME),
+    sa.Column("small", sa_mssql.SMALLDATETIME),
+    sa.Column("dt2", mssql.DATETIME2(3)),
+    sa.Column("offset", sa_mssql.DATETIMEOFFSET),
+)
+STAMP = "2026-10-01 10:00:00.003000"
+AT_STAMP = datetime.datetime(2026, 10, 1, 10, 0, 0, 3000)
+
+
+class TestSqlServerDatetimeParameters:
+    """`datetime` and `smalldatetime` columns compare with a parameter cast
+    to their type; the types a `datetime2(7)` parameter matches exactly, and
+    every other dialect, bind the value as it is."""
+
+    @pytest.mark.parametrize(
+        "column, expected",
+        [
+            ("dt", f"s.dt > CAST('{STAMP}' AS DATETIME)"),
+            ("small", f"s.small > CAST('{STAMP}' AS SMALLDATETIME)"),
+            ("dt2", f"s.dt2 > '{STAMP}'"),
+            ("offset", f"s.offset > '{STAMP}'"),
+            ("id", "s.id > 7"),
+        ],
+    )
+    def test_the_parameter_is_cast_for_the_rounded_types_only(
+        self, column: str, expected: str
+    ) -> None:
+        value = 7 if column == "id" else AT_STAMP
+        condition = dialects.MssqlDialect().after([STAMPS.c[column]], [value])
+
+        assert _sql(condition, mssql.dialect()) == expected
+
+    def test_a_null_is_bound_as_it_is(self) -> None:
+        assert dialects.MssqlDialect().bind(STAMPS.c.dt, None) is None
+
+    def test_other_dialects_bind_the_value_as_it_is(self) -> None:
+        for dialect in (
+            dialects.Dialect(),
+            dialects.MysqlDialect(),
+            dialects.OracleDialect(),
+            dialects.PostgresDialect(),
+        ):
+            assert dialect.bind(STAMPS.c.dt, AT_STAMP) is AT_STAMP
+
+
+NUMBERS = sa.Table(
+    "n",
+    sa.MetaData(),
+    sa.Column("exact", sa.Numeric(20, 0)),
+    sa.Column("cents", sa.Numeric(10, 2)),
+    sa.Column("real", sa.Float()),
+    sa.Column("whole", sa.BigInteger()),
+)
+
+
+class TestIntegersComparedWithExactNumbers:
+    """An integer compared with a `DECIMAL` column is bound as a `Decimal`:
+    as an integer, the drivers bind a BIGINT, refused past its range."""
+
+    _ALL = (
+        dialects.Dialect(),
+        dialects.MssqlDialect(),
+        dialects.MysqlDialect(),
+        dialects.OracleDialect(),
+        dialects.PostgresDialect(),
+    )
+
+    @pytest.mark.parametrize("column", ["exact", "cents"])
+    def test_bound_as_a_decimal(self, column: str) -> None:
+        for dialect in self._ALL:
+            bound = dialect.bind(NUMBERS.c[column], 2**64 - 1)
+
+            assert bound == decimal.Decimal(2**64 - 1)
+            assert isinstance(bound, decimal.Decimal)
+
+    @pytest.mark.parametrize(
+        "column, value",
+        [("real", 3), ("whole", 2**64), ("exact", True), ("exact", None)],
+    )
+    def test_any_other_value_as_it_is(self, column: str, value: object) -> None:
+        for dialect in self._ALL:
+            assert dialect.bind(NUMBERS.c[column], value) is value
+
+    def test_sqlite_binds_the_integer_whose_digits_a_float_would_lose(
+        self,
+    ) -> None:
+        value = 2**53 + 1
+
+        assert dialects.SqliteDialect().bind(NUMBERS.c.exact, value) is value
+
+    def test_sql_server_keyset_on_a_decimal_key(self) -> None:
+        condition = dialects.MssqlDialect().after([NUMBERS.c.exact], [7])
+
+        assert _sql(condition, mssql.dialect()) == "n.exact > 7"
+
+
 class TestChanged:
 
     def test_sql_server_compares_text_case_sensitively(self) -> None:
@@ -152,7 +255,8 @@ def test_each_database_gets_its_dialect() -> None:
     def name(url: str) -> str:
         return dialects.for_engine(sa.create_engine(url)).name
 
-    assert name("sqlite://") == "generic"
+    assert name("sqlite://") == "sqlite"
+    assert dialects.for_name("duckdb").name == "generic"
     assert name("postgresql+psycopg://x@h/d") == "postgresql"
     assert name("oracle+oracledb://x@h/d") == "oracle"
     assert name("mssql+mssqlpython://x@h/d") == "mssql"
@@ -167,7 +271,7 @@ def test_uuids_given_as_text_are_coerced_for_uuid_columns() -> None:
     )
     text = str(uuid.UUID(int=1))
 
-    (row,) = dialects.coerce(table, [{"id": text, "label": text}])
+    (row,) = bulk_loading.coerce(table, [{"id": text, "label": text}])
 
     assert row == {"id": uuid.UUID(int=1), "label": text}
 
@@ -264,3 +368,60 @@ def test_a_connection_out_when_the_database_is_closed_is_closed(
     memory = relational.Database("sqlite://")
     assert not isinstance(memory.engine.pool, sa.pool.NullPool)
     memory.engine.dispose()
+
+
+class TestInChunk:
+    """The values per IN list: from each database's parameter limit, at
+    most 1,000 (500 on SQL Server); or as set."""
+
+    @pytest.mark.parametrize(
+        ("dialect", "expected"),
+        [
+            (dialects.Dialect(), 1000),
+            (dialects.MssqlDialect(), 500),
+            (dialects.for_name("mssql"), 500),
+            (dialects.PostgresDialect(), 1000),
+            (dialects.MysqlDialect(), 1000),
+            (dialects.OracleDialect(), 1000),
+            (dialects.SqliteDialect(), 1000),
+        ],
+    )
+    def test_derived_from_the_limits(
+        self, dialect: dialects.Dialect, expected: int
+    ) -> None:
+        assert dialect.in_chunk() == expected
+
+    def test_a_small_parameter_limit_leaves_room_for_the_rest(self) -> None:
+        dialect = dialects.SqliteDialect()
+        dialect.parameter_limit = 999
+
+        assert dialect.in_chunk() == 999 - 32
+
+    def test_sql_server_s_cap_yields_to_a_smaller_parameter_limit(
+        self,
+    ) -> None:
+        dialect = dialects.MssqlDialect()
+        dialect.parameter_limit = 300
+
+        assert dialect.in_chunk() == 300 - 32
+
+    def test_set_values_win(self) -> None:
+        assert dialects.MssqlDialect(in_chunk=500).in_chunk() == 500
+        assert dialects.MssqlDialect(in_chunk=1000).in_chunk() == 1000
+        assert dialects.for_name("mssql", in_chunk=2000).in_chunk() == 2000
+        assert dialects.for_name("oracle", in_chunk=2000).in_chunk() == 2000
+        with pytest.raises(ValueError, match="in_chunk"):
+            dialects.Dialect(in_chunk=0)
+        with pytest.raises(ValueError, match="bulk_copy_rows"):
+            dialects.Dialect(bulk_copy_rows=0)
+
+    def test_the_database_hands_them_to_its_dialect(self) -> None:
+        db = relational.Database("sqlite://", bulk_copy_rows=2000, in_chunk=300)
+        try:
+            registry = relational.RelationalKeyRegistry(db)
+
+            assert db.dialect.bulk_copy_rows == 2000
+            assert db.dialect.chooser is None
+            assert registry.in_chunk == 300
+        finally:
+            db.close()

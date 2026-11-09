@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import json
 import pathlib
-from typing import Any
 
 from core import contract
+from core.mapping import documents
 from shared import utils
 
 FORMAT_VERSION = 1
@@ -18,7 +18,7 @@ FORMAT_VERSION = 1
 
 def dumps(catalog: contract.MappingCatalog) -> str:
     """Returns the canonical JSON text of a catalog."""
-    data = {
+    data: documents.CatalogJson = {
         "format_version": FORMAT_VERSION,
         "name": catalog.name,
         "source_file": catalog.source_file,
@@ -35,7 +35,7 @@ def loads(text: str) -> contract.MappingCatalog:
     Raises:
         ValueError: If the text is not in the supported format version.
     """
-    data = json.loads(text)
+    data: documents.CatalogJson = json.loads(text)
     version = data.get("format_version")
     if version != FORMAT_VERSION:
         raise ValueError(
@@ -63,17 +63,22 @@ def save_catalog(
     utils.atomic_write_text(pathlib.Path(path), dumps(catalog))
 
 
-def _location_from_json(data: str | dict[str, Any] | None) -> str | None:
+def _location_from_json(
+    data: str | documents.LocationJson | None,
+) -> str | None:
     """A location; files compiled before it was text hold its parts."""
     if not isinstance(data, dict):
         return data
-    parts = [data["file"], data.get("sheet"), data.get("row")]
-    if parts[2] is not None:
-        parts[2] = f"row {parts[2]}"
-    return " › ".join(str(part) for part in parts if part is not None)
+    row = data.get("row")
+    parts = [
+        data["file"],
+        data.get("sheet"),
+        None if row is None else f"row {row}",
+    ]
+    return " › ".join(part for part in parts if part is not None)
 
 
-def _mapping_to_dict(mapping: contract.MappingSpec) -> dict[str, Any]:
+def _mapping_to_dict(mapping: contract.MappingSpec) -> documents.MappingJson:
     return {
         "name": mapping.name,
         "source": mapping.source,
@@ -96,7 +101,7 @@ def _mapping_to_dict(mapping: contract.MappingSpec) -> dict[str, Any]:
     }
 
 
-def _mapping_from_dict(data: dict[str, Any]) -> contract.MappingSpec:
+def _mapping_from_dict(data: documents.MappingJson) -> contract.MappingSpec:
     return contract.MappingSpec(
         name=data["name"],
         source=data["source"],
@@ -121,14 +126,14 @@ def _mapping_from_dict(data: dict[str, Any]) -> contract.MappingSpec:
     )
 
 
-def _key_hashing(data: dict[str, Any]) -> contract.KeyHashing | None:
+def _key_hashing(data: documents.MappingJson) -> contract.KeyHashing | None:
     """The key hashing of a mapping: null for the default; files written
     before it had a default always name it, uuid5 when they do not."""
     value = data.get("key_hashing", contract.KeyHashing.UUID5.value)
     return None if value is None else contract.KeyHashing(value)
 
 
-def _field_to_dict(field: contract.FieldSpec) -> dict[str, Any]:
+def _field_to_dict(field: contract.FieldSpec) -> documents.FieldJson:
     return {
         "target": field.target,
         "sources": list(field.sources),
@@ -146,7 +151,7 @@ def _field_to_dict(field: contract.FieldSpec) -> dict[str, Any]:
     }
 
 
-def _field_from_dict(data: dict[str, Any]) -> contract.FieldSpec:
+def _field_from_dict(data: documents.FieldJson) -> contract.FieldSpec:
     return contract.FieldSpec(
         target=data["target"],
         sources=tuple(data["sources"]),

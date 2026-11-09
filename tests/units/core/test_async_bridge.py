@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 import threading
 import time
 
@@ -80,6 +80,21 @@ def test_source_errors_reach_the_job_thread() -> None:
     assert source.events[-2:] == ["ateardown", "teardown"]
 
 
+def _settled(value: Callable[[], int], timeout: float = 10.0) -> int:
+    """The value once it stopped changing for a while, however slow the
+    machine: the producer ran ahead as far as it can."""
+    deadline = time.monotonic() + timeout
+    last, since = value(), time.monotonic()
+    while time.monotonic() < deadline:
+        time.sleep(0.01)
+        now = value()
+        if now != last:
+            last, since = now, time.monotonic()
+        elif last and time.monotonic() - since > 0.3:
+            break
+    return last
+
+
 def test_a_slow_consumer_holds_the_source_back() -> None:
     source = Numbers(None)  # endless
     adapter = pipeline.AsyncExtractorAdapter(
@@ -90,10 +105,11 @@ def test_a_slow_consumer_holds_the_source_back() -> None:
     with adapter.lifecycle(ctx):
         records = adapter.extract(ctx)
         assert next(records) == 0
-        time.sleep(0.1)  # let the producer run ahead as far as it can
+        held_back = _settled(lambda: source.produced)
 
-        # at most: the chunk being read + a full buffer + the chunk being built
-        assert source.produced <= 10 * (1 + 2 + 1)
+        # The chunk being read and a full buffer at least; at most, the
+        # chunk being built too.
+        assert 10 * (1 + 2) <= held_back <= 10 * (1 + 2 + 1)
 
     # teardown cancelled the endless source and still ran its async teardown
     assert source.events[-2:] == ["ateardown", "teardown"]

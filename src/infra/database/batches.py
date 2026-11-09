@@ -63,6 +63,9 @@ def match_columns(table: str, rows: Sequence[contract.Row]) -> list[str]:
 
     Raises:
         ValueError: If rows differ in columns, or have none.
+        FatalError: If a row has NULL in a column: in SQL it would match no
+            row, and the delete be lost; in MongoDB it would match every
+            document without the field.
     """
     names = list(rows[0])
     if not names:
@@ -72,5 +75,12 @@ def match_columns(table: str, rows: Sequence[contract.Row]) -> list[str]:
             raise ValueError(
                 f"Row {index} of {table} to delete has columns"
                 f" {sorted(row)}, row 0 {sorted(names)}"
+            )
+        nulls = [name for name in names if row[name] is None]
+        if nulls:
+            raise contract.FatalError(
+                f"Row {index} of {table} to delete has NULL in {nulls}: it"
+                " would match no row, or in MongoDB every document without"
+                " the field. Delete by columns that are never NULL."
             )
     return names

@@ -75,15 +75,15 @@ class TestQuarantineReplay:
             entries: Any, ctx: contract.ETLContext
         ) -> list[dict[str, Any]]:
             return [
-                source[e.record["key"]]
+                source[quarantines.fields(e)["key"]]
                 for e in entries
-                if e.record["key"] in source
+                if quarantines.fields(e)["key"] in source
             ]
 
         extractor = operators.QuarantineReplay[dict[str, Any]](
             store,
             fetch=fetch,
-            entry_identity=lambda e: e.record["key"],
+            entry_identity=lambda e: quarantines.fields(e)["key"],
             identity=lambda row: row["key"],
             chunk_size=1,
         )
@@ -100,7 +100,7 @@ class TestQuarantineReplay:
 
         assert rows == [{"key": "a", "v": 1}]  # Once.
         assert (extractor.replayed, extractor.unmatched) == (2, 1)
-        assert [e.record["key"] for e in store.entries()] == ["b"]
+        assert [quarantines.fields(e)["key"] for e in store.entries()] == ["b"]
 
     def test_a_dry_run_resolves_nothing(self) -> None:
         store = _quarantine("a")
@@ -156,6 +156,7 @@ class TestCorrections:
 
         assert out[0] == {"id": 1, "name": "Fixed"}
         assert out[1] == {"id": 2, "name": "y"}
+        assert isinstance(out[2], contract.ChangeEvent)
         assert out[2].row == {"id": 1, "name": "Fixed"}
         assert out[2].operation is contract.ChangeOperation.UPDATE
         assert transformer.collect_stats().corrected == 2

@@ -35,7 +35,7 @@ class Number(NamedTuple):
     """A number that is not an integer, by its shortest decimal text.
 
     It differs from that text: JSON writes it as a one-item list
-    (`["1.5"]`), and `restored` reads it back.
+    (`["1.5"]`).
     """
 
     value: str
@@ -117,16 +117,6 @@ def canonical_row(
 def text(values: Sequence[Canonical]) -> str:
     """A stable text of canonical values: the identity of a key."""
     return json.dumps(values, ensure_ascii=False, separators=(",", ":"))
-
-
-def restored(values: Sequence[object]) -> tuple[Canonical, ...]:
-    """The canonical values of their JSON (`text`), read back."""
-    return tuple(
-        Number(*typing.cast(list[str], value))
-        if isinstance(value, list)
-        else typing.cast(Canonical, value)
-        for value in values
-    )
 
 
 def shown(value: Canonical) -> None | int | float | str:

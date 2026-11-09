@@ -13,6 +13,7 @@ from typing import TextIO
 from core import observability
 from infra.observability import formatter
 from infra.observability import handlers as bounded
+from infra.observability import otlp as otlp_sink
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -85,10 +86,6 @@ def _sinks(
     console.setFormatter(line)
     sinks: list[logging.Handler] = [console]
     if otlp is not None:
-        # Imported here: only OTLP needs the `otel` extra.
-        # pylint: disable-next=import-outside-toplevel
-        from infra.observability import otlp as otlp_sink
-
         sinks.append(
             otlp_sink.otlp_handler(
                 otlp.endpoint,

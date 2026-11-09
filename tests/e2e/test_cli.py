@@ -93,3 +93,21 @@ def test_logs_are_json_lines_for_shippers(project: harness.Project) -> None:
     assert ends[0]["etl.status"] == "partial_success"
     assert ends[0]["etl.run_id"]
     assert all(e["service.name"] == "etl" for e in events)
+
+
+def test_calibrate_prints_a_tuning_snippet(project: harness.Project) -> None:
+    snippet = project.etl("calibrate", "crm")
+    as_json = project.etl("calibrate", "crm", "--format", "json")
+    unknown = project.etl("calibrate", "nope")
+
+    assert snippet.returncode == 0, snippet.stdout + snippet.stderr
+    lines = snippet.stdout.splitlines()
+    assert lines[0].startswith("# etl calibrate crm: sqlite ")
+    assert "[tuning]" in lines
+    assert any(line.startswith("in_chunk = ") for line in lines)
+    assert "# staging 1000 rows: parameters" in snippet.stdout
+    measured = json.loads(as_json.stdout)
+    assert measured["recommended"]["in_chunk"] in (250, 500, 1000)
+    assert set(measured["key_registry"]) == {"new", "known"}
+    assert unknown.returncode == 2
+    assert "FAILED no database 'nope'" in unknown.stdout

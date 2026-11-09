@@ -3,7 +3,7 @@ ports of traces and metrics.
 
 `core.observability.tracing` and `core.observability.metrics` record nothing
 until the composition root installs OpenTelemetry. The listeners of pipeline
-runs depend on the engine: import them as `core.observability.listener`.
+runs (`contract.PipelineListener`) are in `core.observability.listener`.
 """
 
 from core.observability.context import ContextFilter
@@ -11,6 +11,7 @@ from core.observability.context import current
 from core.observability.context import FIELDS_ATTRIBUTE
 from core.observability.context import log_context
 from core.observability.context import run_fields
+from core.observability.redaction import describe_error
 from core.observability.redaction import ERROR_ATTRIBUTE
 from core.observability.redaction import is_secret_name
 from core.observability.redaction import logged_error
@@ -30,6 +31,7 @@ __all__ = [
     "LoggedError",
     "RedactingFilter",
     "current",
+    "describe_error",
     "is_secret_name",
     "log_context",
     "logged_error",

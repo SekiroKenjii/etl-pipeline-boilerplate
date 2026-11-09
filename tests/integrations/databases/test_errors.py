@@ -187,6 +187,77 @@ def test_a_connection_killed_in_a_query_is_retryable(
         assert connection.execute(probe).scalar() == 1
 
 
+class TestPostgresCancels:
+    """A statement cancelled by another session is retried; one past its
+    `statement_timeout` is not, it would time out again."""
+
+    @pytest.fixture
+    def postgres(self, backend: conftest.Backend) -> conftest.Backend:
+        if backend.name != "postgresql":
+            pytest.skip("Postgres's statement_timeout and pg_cancel_backend")
+        return backend
+
+    def test_a_statement_timeout_is_fatal(
+        self, postgres: conftest.Backend
+    ) -> None:
+        def sleep_past_the_timeout() -> None:
+            with postgres.db.connect("reading") as connection:
+                connection.exec_driver_sql("SET statement_timeout = '50ms'")
+                connection.exec_driver_sql("SELECT pg_sleep(5)")
+
+        with pytest.raises(contract.FatalError, match="statement timeout"):
+            sleep_past_the_timeout()
+
+    def test_a_statement_cancelled_by_another_session_is_retryable(
+        self, postgres: conftest.Backend
+    ) -> None:
+        pids: list[int] = []
+
+        def cancel() -> None:
+            while not pids:
+                time.sleep(0.01)
+            time.sleep(0.2)
+            with postgres.db.engine.connect() as other:
+                other.execute(
+                    sa.text("SELECT pg_cancel_backend(:pid)"), {"pid": pids[0]}
+                )
+
+        def sleep_until_cancelled() -> None:
+            with postgres.db.connect("reading") as connection:
+                pids.append(
+                    connection.exec_driver_sql(
+                        "SELECT pg_backend_pid()"
+                    ).scalar_one()
+                )
+                connection.exec_driver_sql("SELECT pg_sleep(5)")
+
+        canceller = threading.Thread(target=cancel)
+        canceller.start()
+        try:
+            with pytest.raises(contract.RetryableError, match="user request"):
+                sleep_until_cancelled()
+        finally:
+            canceller.join()
+
+    def test_a_lock_timeout_is_retryable_under_a_statement_timeout(
+        self, postgres: conftest.Backend
+    ) -> None:
+        table = postgres.table("locked", sa.Column("id", sa.Integer))
+        postgres.create()
+
+        def wait_for_the_lock() -> None:
+            with postgres.db.connect("reading") as connection:
+                connection.exec_driver_sql("SET statement_timeout = '5s'")
+                connection.exec_driver_sql("SET lock_timeout = '50ms'")
+                connection.execute(sa.select(table))
+
+        with postgres.db.engine.connect() as holder:
+            holder.execute(sa.text(f"LOCK TABLE {table.name}"))
+            with pytest.raises(contract.RetryableError):
+                wait_for_the_lock()
+            holder.rollback()
+
+
 def test_errors_never_show_the_rows_of_a_batch(
     backend: conftest.Backend,
 ) -> None:
@@ -205,6 +276,32 @@ def test_errors_never_show_the_rows_of_a_batch(
 
     text = _text(caught.value)
     assert all(value not in text for value in PII), text
+
+
+def test_a_duplicate_key_message_keeps_the_value_out(
+    backend: conftest.Backend,
+) -> None:
+    """MySQL (1062) and SQL Server (2627) quote the duplicate value."""
+    table = backend.table(
+        "person",
+        sa.Column("id", sa.Integer, primary_key=True, autoincrement=False),
+        sa.Column("email", sa.Unicode(50), unique=True),
+        sa.Column("ssn", sa.Unicode(20)),
+    )
+    backend.create()
+    writer = relational.RelationalTableWriter(backend.db)
+    target = contract.TableTarget(
+        table.name, key=(), mode=contract.WriteMode.INSERT
+    )
+    writer.write(target, [{"id": 1, "email": PII[0], "ssn": PII[1]}])
+
+    with pytest.raises(contract.FatalError) as caught:
+        writer.write(target, [{"id": 2, "email": PII[0], "ssn": PII[1]}])
+
+    message = str(caught.value)
+    assert message.startswith(f"writing 1 row(s) to {table.name}: ")
+    assert all(value not in message for value in PII), message
+    assert "uplicate" in message or "unique" in message.lower(), message
 
 
 def test_bulk_loads_fail_like_any_statement(backend: conftest.Backend) -> None:

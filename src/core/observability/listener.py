@@ -6,7 +6,6 @@ from __future__ import annotations
 import logging
 
 from core import contract
-from core import pipeline
 from core.observability import context as fields
 from core.observability import metrics
 
@@ -24,7 +23,7 @@ def _stats(stats: contract.ETLStats) -> dict[str, object]:
     }
 
 
-class LoggingListener(pipeline.PipelineListener):
+class LoggingListener(contract.PipelineListener):
     """Logs every pipeline and step event, with structured fields.
 
     Fields are flat and dotted (`etl.step`, `etl.stats.created`), as
@@ -67,14 +66,17 @@ class LoggingListener(pipeline.PipelineListener):
         attempt: int,
     ) -> None:
         # A retried attempt is one line: only the last one logs the traceback.
+        # A refusal (a configuration error) is deliberate: its message says
+        # what to do, a traceback would not.
         retried = step.retry.should_retry(error, attempt)
+        refused = isinstance(error, contract.PipelineConfigError)
         self._log.warning(
             "step %s failed (attempt %d%s): %s",
             step.name,
             attempt,
             ", will retry" if retried else "",
             error,
-            exc_info=None if retried else error,
+            exc_info=None if retried or refused else error,
             extra={
                 fields.EVENT: "step.error",
                 fields.STEP: step.name,
@@ -149,7 +151,7 @@ _ROWS = {
 }
 
 
-class MetricsListener(pipeline.PipelineListener):
+class MetricsListener(contract.PipelineListener):
     """Measures every run: rows by outcome, durations, runs by status.
 
     Measurements go to the process's meter (`metrics.meter()`), with the

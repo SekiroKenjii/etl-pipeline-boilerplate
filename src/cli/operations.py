@@ -25,7 +25,7 @@ import datetime
 import json
 import pathlib
 import sys
-from typing import Any, TextIO
+from typing import TextIO
 
 from app import bootstrap
 from cli import audit
@@ -40,7 +40,9 @@ _STATUSES = [status.value for status in contract.QuarantineStatus] + ["all"]
 _FIELDS_EXPORTED_AS_COLUMNS = ("mapping", "source_key", "entity", "key")
 
 
-def add_parsers(commands: Any) -> None:
+def add_parsers(
+    commands: argparse._SubParsersAction[argparse.ArgumentParser],
+) -> None:
     """Adds the operations commands to the subcommands of `etl`."""
     quarantine = commands.add_parser(
         "quarantine", help="the records rejected by quality rules"
@@ -216,7 +218,9 @@ def _quarantine(
     return exit_codes.ExitCode.SUCCESS
 
 
-def _export(entries: Any, output: pathlib.Path) -> int:
+def _export(
+    entries: Iterable[contract.QuarantineEntry], output: pathlib.Path
+) -> int:
     """Writes the entries to a CSV file Excel opens; returns their count."""
     output.parent.mkdir(parents=True, exist_ok=True)
     count = 0
@@ -257,7 +261,7 @@ def _export(entries: Any, output: pathlib.Path) -> int:
     return count
 
 
-def _record_fields(record: object) -> dict[str, Any]:
+def _record_fields(record: object) -> dict[str, object]:
     if not isinstance(record, dict):
         return {}
     return {name: record.get(name) for name in _FIELDS_EXPORTED_AS_COLUMNS}

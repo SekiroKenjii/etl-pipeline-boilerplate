@@ -6,28 +6,28 @@ import decimal
 import pytest
 
 from core import mapping
-from core.mapping import types
+from core.mapping import casts
 
 
 @pytest.mark.parametrize(
     ("raw", "kind", "length", "precision", "scale"),
     [
-        ("VARCHAR(200)", types.TypeKind.STRING, 200, None, None),
-        ("nvarchar2 ( 50 )", types.TypeKind.STRING, 50, None, None),
-        ("TEXT", types.TypeKind.STRING, None, None, None),
-        ("NUMBER(10)", types.TypeKind.INTEGER, None, 10, None),
-        ("NUMBER(10,0)", types.TypeKind.INTEGER, None, 10, None),
-        ("NUMBER(10,2)", types.TypeKind.DECIMAL, None, 10, 2),
-        ("NUMBER", types.TypeKind.DECIMAL, None, None, None),
-        ("BIGINT", types.TypeKind.INTEGER, None, None, None),
-        ("DATE", types.TypeKind.DATE, None, None, None),
-        ("timestamp", types.TypeKind.DATETIME, None, None, None),
-        ("BIT", types.TypeKind.BOOLEAN, None, None, None),
+        ("VARCHAR(200)", casts.TypeKind.STRING, 200, None, None),
+        ("nvarchar2 ( 50 )", casts.TypeKind.STRING, 50, None, None),
+        ("TEXT", casts.TypeKind.STRING, None, None, None),
+        ("NUMBER(10)", casts.TypeKind.INTEGER, None, 10, None),
+        ("NUMBER(10,0)", casts.TypeKind.INTEGER, None, 10, None),
+        ("NUMBER(10,2)", casts.TypeKind.DECIMAL, None, 10, 2),
+        ("NUMBER", casts.TypeKind.DECIMAL, None, None, None),
+        ("BIGINT", casts.TypeKind.INTEGER, None, None, None),
+        ("DATE", casts.TypeKind.DATE, None, None, None),
+        ("timestamp", casts.TypeKind.DATETIME, None, None, None),
+        ("BIT", casts.TypeKind.BOOLEAN, None, None, None),
     ],
 )
 def test_parse_db_types(
     raw: str,
-    kind: types.TypeKind,
+    kind: casts.TypeKind,
     length: int | None,
     precision: int | None,
     scale: int | None,
@@ -127,9 +127,9 @@ class TestCast:
 
 
 def test_excel_style_formats_become_strftime() -> None:
-    assert types.to_strftime("dd/MM/yyyy HH:mm:ss") == "%d/%m/%Y %H:%M:%S"
-    assert types.to_strftime("yy-MM-dd") == "%y-%m-%d"
-    assert types.to_strftime("%d.%m.%Y") == "%d.%m.%Y"
+    assert casts.to_strftime("dd/MM/yyyy HH:mm:ss") == "%d/%m/%Y %H:%M:%S"
+    assert casts.to_strftime("yy-MM-dd") == "%y-%m-%d"
+    assert casts.to_strftime("%d.%m.%Y") == "%d.%m.%Y"
 
 
 @pytest.mark.parametrize(
@@ -146,4 +146,4 @@ def test_excel_style_formats_become_strftime() -> None:
 def test_letters_are_tokens_only_where_a_token_starts(
     source_format: str, expected: str
 ) -> None:
-    assert types.to_strftime(source_format) == expected
+    assert casts.to_strftime(source_format) == expected

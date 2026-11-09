@@ -1,6 +1,6 @@
 """Logs exported by OpenTelemetry (OTLP): to a collector, or a backend.
 
-Needs the `otel` extra. One protocol reaches them all: an OpenTelemetry
+One protocol reaches them all: an OpenTelemetry
 Collector routes logs to Elasticsearch, Grafana Loki, Seq, Datadog...
 (`deploy/otel-collector/`), and Seq, Elastic and Grafana Cloud take OTLP
 directly too.
@@ -10,14 +10,15 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 import logging
-from typing import Any
 
 from opentelemetry import _logs as otel_api_logs
+from opentelemetry import context as otel_context
 from opentelemetry import trace as otel_trace
 from opentelemetry.exporter.otlp.proto.http import _log_exporter
 from opentelemetry.sdk import _logs as otel_logs
 from opentelemetry.sdk import resources
 from opentelemetry.sdk._logs import export as otel_export
+from opentelemetry.util import types as otel_types
 
 from core import observability
 from infra.observability import formatter
@@ -45,7 +46,7 @@ class OtlpHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
-            attributes: dict[str, Any] = {
+            attributes: dict[str, otel_types.AnyValue] = {
                 key: _attribute(value)
                 for key, value in formatter.fields(record)
             }
@@ -133,7 +134,7 @@ def otlp_handler(
     return OtlpHandler(provider)
 
 
-def _attribute(value: object) -> object:
+def _attribute(value: object) -> otel_types.AnyValue:
     if value is None or isinstance(value, (str, bool, int, float)):
         return value if value is not None else ""
     if isinstance(value, (list, tuple)) and all(
@@ -143,7 +144,9 @@ def _attribute(value: object) -> object:
     return str(value)
 
 
-def _span_context(trace_id: object, span_id: object) -> Any:
+def _span_context(
+    trace_id: object, span_id: object
+) -> otel_context.Context | None:
     """A context holding the span of these ids; None without ids."""
     if not isinstance(trace_id, str) or not isinstance(span_id, str):
         return None

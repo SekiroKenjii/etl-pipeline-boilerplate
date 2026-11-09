@@ -4,16 +4,16 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from typing import Any
 
 import httpx
 
 from core import contract
 from infra.http import client as http_client
 from infra.http import pagination
+from infra.http import types as http_types
 from shared import utils
 
-type ApiRecord = dict[str, Any]
+type _Primitive = str | int | float | bool | None
 
 
 class RestApi:
@@ -62,7 +62,7 @@ class RestApi:
         self,
         path: str,
         *,
-        paginator: pagination.Paginator | None = None,
+        paginator: http_types.Paginator | None = None,
         records_path: str | None = None,
         max_pages: int | None = None,
     ) -> RestEndpoint:
@@ -91,7 +91,7 @@ class RestApi:
         )
 
 
-class RestEndpoint(contract.IAsyncRecordSource[ApiRecord]):
+class RestEndpoint(contract.IAsyncRecordSource[http_types.ApiRecord]):
     """The JSON records of one paginated GET endpoint.
 
     Its HTTP client is created in `asetup` and closed in `ateardown`, on the
@@ -112,7 +112,7 @@ class RestEndpoint(contract.IAsyncRecordSource[ApiRecord]):
         api: RestApi,
         path: str,
         *,
-        paginator: pagination.Paginator | None = None,
+        paginator: http_types.Paginator | None = None,
         records_path: str | None = None,
         max_pages: int | None = None,
     ) -> None:
@@ -126,7 +126,7 @@ class RestEndpoint(contract.IAsyncRecordSource[ApiRecord]):
 
         self.api = api
         self.path = path
-        self.paginator: pagination.Paginator = (
+        self.paginator: http_types.Paginator = (
             paginator or pagination.NoPagination()
         )
         self.records_path = records_path
@@ -147,8 +147,8 @@ class RestEndpoint(contract.IAsyncRecordSource[ApiRecord]):
 
     # pylint takes this async generator for a coroutine.
     async def records(  # pylint: disable=invalid-overridden-method
-        self, params: Mapping[str, Any]
-    ) -> AsyncIterator[ApiRecord]:
+        self, params: Mapping[str, object]
+    ) -> AsyncIterator[http_types.ApiRecord]:
         """Yields the records of every page.
 
         Raises:
@@ -168,7 +168,7 @@ class RestEndpoint(contract.IAsyncRecordSource[ApiRecord]):
         while page is not None:
             # httpx replaces the URL's query even with empty `params`.
             request = requester.client.build_request(
-                "GET", page.url, params=dict(page.params) or None
+                "GET", page.url, params=_query(page.params) or None
             )
             response = await requester.send(request)
             records = self._records(response)
@@ -181,7 +181,7 @@ class RestEndpoint(contract.IAsyncRecordSource[ApiRecord]):
                 return
             page = self.paginator.next_page(page, response, records)
 
-    def _records(self, response: httpx.Response) -> list[ApiRecord]:
+    def _records(self, response: httpx.Response) -> list[http_types.ApiRecord]:
         """Returns the records of a page.
 
         Raises:
@@ -189,7 +189,7 @@ class RestEndpoint(contract.IAsyncRecordSource[ApiRecord]):
                 at `records_path`.
         """
         try:
-            body = response.json()
+            body: utils.JsonValue = response.json()
         except ValueError as exc:
             raise contract.FatalError(
                 f"{response.request.url}: response is not JSON"
@@ -205,9 +205,31 @@ class RestEndpoint(contract.IAsyncRecordSource[ApiRecord]):
                 f"{response.request.url}: expected a list of records at"
                 f" {self.records_path or 'the body root'!r}"
             )
-        if not all(isinstance(record, dict) for record in records):
+        objects: list[http_types.ApiRecord] = [
+            record for record in records if isinstance(record, dict)
+        ]
+        if len(objects) != len(records):
             raise contract.FatalError(
                 f"{response.request.url}: every record must be an object"
             )
+        return objects
 
-        return records
+
+def _query(
+    params: Mapping[str, object],
+) -> dict[str, _Primitive | list[_Primitive]]:
+    """The query parameters, as httpx takes them: primitives, or lists."""
+    return {
+        name: (
+            [_primitive(item) for item in value]
+            if isinstance(value, (list, tuple))
+            else _primitive(value)
+        )
+        for name, value in params.items()
+    }
+
+
+def _primitive(value: object) -> _Primitive:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)  # As httpx sends any other value.

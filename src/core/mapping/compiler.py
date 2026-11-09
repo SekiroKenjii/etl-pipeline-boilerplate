@@ -6,6 +6,7 @@ any row is mapped.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 import datetime
 import difflib
 import hashlib
@@ -16,6 +17,7 @@ import uuid
 
 from core import contract
 from core import keys as core_keys
+from core.mapping import casts
 from core.mapping import compiled
 from core.mapping import privacy
 from core.mapping import results
@@ -164,7 +166,7 @@ def catalog_warnings(
         )
     for spec in catalog.mappings:
         for f in spec.fields:
-            if f.format is not None and types.two_digit_year(f.format):
+            if f.format is not None and casts.two_digit_year(f.format):
                 location = _at(f.location, labels["format"])
                 warnings.append(
                     contract.MappingProblem(
@@ -226,13 +228,15 @@ def key_fingerprint(
     catalog: contract.MappingCatalog, key_secret: bytes | None
 ) -> str:
     """Returns what the surrogate keys of a catalog are derived from, hashed:
-    `customer:1a2b3c4d5e6f,order:...`, one entry per mapping.
+    `customer:1a2b3c4d5e6f,customer:natural_key:...,order:...`.
 
-    An entry changes when the keys of its mapping change: its namespace
-    (name and key version), hashing, case, or, for HMAC keys, the key
-    secret. The secret is only in it through an HMAC of a constant: the
-    fingerprint tells nothing of it. Compare the entries of the mappings in
-    both fingerprints: a new mapping changes no existing key.
+    Two entries per mapping. `<mapping>` changes when its namespace (name
+    and key version), hashing, case, or, for HMAC keys, the key secret
+    change. `<mapping>:natural_key` changes when the source columns of its
+    primary key do, or their order. The secret is only in it through an
+    HMAC of a constant: the fingerprint tells nothing of it. Compare the
+    entries of the mappings in both fingerprints: a new mapping, or a new
+    entry, changes no existing key.
     """
     secret = (
         hmac.new(
@@ -244,15 +248,34 @@ def key_fingerprint(
     entries: list[str] = []
     for spec in sorted(catalog.mappings, key=lambda m: m.name):
         hashing = key_hashing(spec, key_secret)
-        facts = [
-            str(key_namespace(spec)),
-            hashing.value,
-            spec.key_case.value,
-            secret if hashing is contract.KeyHashing.HMAC else None,
-        ]
-        digest = hashlib.sha256(json.dumps(facts).encode()).hexdigest()[:12]
-        entries.append(f"{spec.name}:{digest}")
+        # Its own entry: adding the natural key to the facts would change
+        # the entry every run recorded before it, and refuse their next run.
+        entries.append(
+            _entry(
+                spec.name,
+                [
+                    str(key_namespace(spec)),
+                    hashing.value,
+                    spec.key_case.value,
+                    secret if hashing is contract.KeyHashing.HMAC else None,
+                ],
+            )
+        )
+        sources = _key_sources(spec)
+        if sources:
+            entries.append(_entry(f"{spec.name}:natural_key", sources))
     return ",".join(entries)
+
+
+def _key_sources(spec: contract.MappingSpec) -> list[str]:
+    """The source columns of the primary key of a mapping, in order."""
+    key = next((f for f in spec.fields if f.primary_key), None)
+    return list(key.sources) if key is not None else []
+
+
+def _entry(name: str, facts: Sequence[str | None]) -> str:
+    digest = hashlib.sha256(json.dumps(facts).encode()).hexdigest()[:12]
+    return f"{name}:{digest}"
 
 
 def mapping_dependencies(
@@ -387,7 +410,7 @@ class _Compiler:
         for f in self.spec.fields:
             transform = self._transform(f)
             target_type = (
-                types.parse_type(f.target_type) if f.target_type else None
+                casts.parse_type(f.target_type) if f.target_type else None
             )
             fields.append(
                 compiled.CompiledField(
@@ -554,10 +577,10 @@ class _Compiler:
         """Returns every problem of one field."""
         found: list[tuple[str, str]] = []  # (message, label key)
 
-        target_type: types.TargetType | None = None
+        target_type: casts.TargetType | None = None
         if f.target_type:
             try:
-                target_type = types.parse_type(f.target_type)
+                target_type = casts.parse_type(f.target_type)
             except ValueError as exc:
                 found.append((str(exc), "target_type"))
 
@@ -628,7 +651,7 @@ class _Compiler:
         return found
 
     def _key_field_problems(
-        self, f: contract.FieldSpec, target_type: types.TargetType | None
+        self, f: contract.FieldSpec, target_type: casts.TargetType | None
     ) -> list[tuple[str, str]]:
         """Checks a primary key or foreign key field."""
         found: list[tuple[str, str]] = []
@@ -722,7 +745,7 @@ class _Compiler:
 
     def _bind(
         self, f: contract.FieldSpec, transform: transforms.Transform
-    ) -> transforms.TransformFn:
+    ) -> types.TransformFn:
         """Returns the function computing the value of `f`."""
         if f.references is not None:
             parent = self._parent(f.references)
@@ -748,7 +771,7 @@ def _at(location: str | None, column: str) -> str | None:
 
 
 def _format_problems(
-    f: contract.FieldSpec, target_type: types.TargetType | None
+    f: contract.FieldSpec, target_type: casts.TargetType | None
 ) -> list[tuple[str, str]]:
     """Checks the source date format of a field."""
     if f.format is None:
@@ -758,7 +781,7 @@ def _format_problems(
             "a format only applies to DATE / TIMESTAMP target types",
             "format",
         )]
-    problems = types.format_problems(f.format)
+    problems = casts.format_problems(f.format)
     if problems:
         return [(problem, "format") for problem in problems]
     if not _format_round_trips(f.format):
@@ -770,19 +793,19 @@ def _format_problems(
 
 
 def _default_problems(
-    f: contract.FieldSpec, target_type: types.TargetType | None
+    f: contract.FieldSpec, target_type: casts.TargetType | None
 ) -> list[tuple[str, str]]:
     if f.default is None or target_type is None:
         return []
     try:
         _cast_default(target_type, f.default, f.format)
-    except types.CastError as exc:
+    except casts.CastError as exc:
         return [(f"the default {f.default!r} is not valid: {exc}", "default")]
     return []
 
 
-def _holds_uuid(target_type: types.TargetType) -> bool:
-    return target_type.kind is types.TypeKind.STRING and (
+def _holds_uuid(target_type: casts.TargetType) -> bool:
+    return target_type.kind is casts.TypeKind.STRING and (
         target_type.max_length is None or target_type.max_length >= 36
     )
 
@@ -793,7 +816,7 @@ def _suggest(name: str, candidates: list[str]) -> str:
 
 
 def _format_round_trips(source_format: str) -> bool:
-    pattern = types.to_strftime(source_format)
+    pattern = casts.to_strftime(source_format)
     sample = datetime.datetime(2001, 2, 3, 4, 5, 6)
     try:
         datetime.datetime.strptime(sample.strftime(pattern), pattern)
@@ -803,19 +826,19 @@ def _format_round_trips(source_format: str) -> bool:
 
 
 def _cast_default(
-    target_type: types.TargetType, default: str, source_format: str | None
+    target_type: casts.TargetType, default: str, source_format: str | None
 ) -> object:
     """Casts a default, written in the source format or in ISO 8601."""
     try:
         return target_type.cast(default, source_format)
-    except types.CastError:
+    except casts.CastError:
         if source_format is None:
             raise
         return target_type.cast(default)
 
 
 def _personal_problems(
-    f: contract.FieldSpec, target_type: types.TargetType | None
+    f: contract.FieldSpec, target_type: casts.TargetType | None
 ) -> list[tuple[str, str]]:
     """Checks the kind of personal data of a field, and that its fake values
     fit the target type."""
@@ -840,7 +863,7 @@ def _personal_problems(
     if target_type is None:
         return []
     kind = f.personal
-    is_text = target_type.kind is types.TypeKind.STRING
+    is_text = target_type.kind is casts.TypeKind.STRING
     if kind in privacy.TEXT_LENGTHS:
         length = privacy.TEXT_LENGTHS[kind]
         too_short = (

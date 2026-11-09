@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from collections.abc import Generator
 import os
+import typing
 import uuid
 
 import pytest
@@ -77,7 +78,7 @@ def test_a_mongodb_issue_sink_erases_and_purges(
     issue_sinks.check_issue_sink(
         mongodb.MongoIssueSink(mongo),
         lambda: [
-            found.get("record_id")
+            typing.cast(str | None, found.get("record_id"))
             for found in mongo.collection("etl_quality_issues").find()
         ],
     )

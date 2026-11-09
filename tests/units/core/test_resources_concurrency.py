@@ -17,7 +17,7 @@ def test_a_slow_resource_does_not_delay_the_others() -> None:
 
     def slow(_: runtime.Resources) -> str:
         started.set()
-        release.wait(5)
+        release.wait(30)
         return "slow"
 
     resources = runtime.Resources([
@@ -30,15 +30,19 @@ def test_a_slow_resource_does_not_delay_the_others() -> None:
     creating.start()
     started.wait(5)
 
-    began = time.perf_counter()
-    fast = resources.get("fast", str)
-    took = time.perf_counter() - began
+    found: list[str] = []
+    getting = threading.Thread(
+        daemon=True, target=lambda: found.append(resources.get("fast", str))
+    )
+    getting.start()
+    # Under the one lock of the container, it would wait for `slow`, which
+    # waits for the release: given only once `fast` came.
+    getting.join(10)
+    fast_came_first = found == ["fast"]
     release.set()
-    creating.join(5)
+    creating.join(10)
 
-    assert fast == "fast"
-    # Under the one lock of the container, it waited for `slow`.
-    assert took < 0.5
+    assert fast_came_first
     assert resources.get("slow", str) == "slow"
 
 
@@ -197,7 +201,7 @@ def test_a_resource_created_after_closing_is_closed() -> None:
         return "late"
 
     resources = runtime.Resources(
-        [runtime.ResourceSpec("late", slow, close=log.append)]
+        [runtime.ResourceSpec[str]("late", slow, close=log.append)]
     )
     errors: list[BaseException] = []
 

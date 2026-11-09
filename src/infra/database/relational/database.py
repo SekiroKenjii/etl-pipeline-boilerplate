@@ -2,18 +2,19 @@
 
 from __future__ import annotations
 
-from collections.abc import Generator, Sequence
+from collections.abc import Generator, Mapping, Sequence
 import contextlib
 import threading
-from typing import Any
 
 from sqlalchemy import event as sa_event
 from sqlalchemy import exc as sa_exc
 import sqlalchemy as sa
+from sqlalchemy.engine import interfaces as sa_interfaces
 
 from core import contract
 from infra.database.relational import connection_strings
 from infra.database.relational import dialects
+from infra.database.relational import driver_errors
 from shared import utils
 
 
@@ -25,8 +26,10 @@ class Database:
     passed in belongs to the caller.
 
     An engine created here keeps statement parameters (the rows of a batch) out
-    of its errors and runs its sessions in UTC (a naive datetime is UTC). Give
-    an engine passed in `hide_parameters=True` and UTC sessions yourself.
+    of its errors, runs its sessions in UTC (a naive datetime is UTC) and its
+    transactions in the dialect's isolation level (READ COMMITTED on MySQL),
+    unless `isolation_level` is given. Give an engine passed in
+    `hide_parameters=True`, UTC sessions and that isolation level yourself.
 
         Database("mssql+mssqlpython://etl@db/crm?Encrypt=yes")
         Database("postgresql+psycopg://etl@db/crm")
@@ -45,7 +48,9 @@ class Database:
         engine: sa.Engine | str,
         *,
         dialect: str | None = None,
-        **options: Any,
+        bulk_copy_rows: int | None = None,
+        in_chunk: int | None = None,
+        **options: object,
     ) -> None:
         """Initializes the database; nothing connects before the first use.
 
@@ -56,33 +61,42 @@ class Database:
                 read it from the environment or a secret store.
             dialect: The database of a connection string that does not tell
                 it: `mssql`, `oracle`, `postgresql`, `mysql`.
+            bulk_copy_rows: The rows from which a batch is bulk copied
+                (SQL Server); None chooses online per table
+                (`tuning.bulk_copy_rows`).
+            in_chunk: The values per IN list; None derives it from the
+                database's parameter limit (`tuning.in_chunk`).
             **options: Options of `sqlalchemy.create_engine`, with a
                 connection string.
 
         Raises:
             ConnectionStringError: If the connection string cannot be
                 translated.
+            TypeError: If `connect_args` is not a mapping.
         """
         self._owned = isinstance(engine, str)
         self.connection: connection_strings.ConnectionSpec | None = None
         if isinstance(engine, str):
             spec = connection_strings.parse(engine, dialect=dialect)
             self.connection = spec
-            options["connect_args"] = {
-                **spec.connect_args,
-                **options.get("connect_args", {}),
-            }
-            if _sqlite_file(spec.url):
-                # Pooled, a connection out at `dispose()` would never close.
-                options.setdefault("poolclass", sa.pool.NullPool)
-            # Batches, their personal data included, stay out of errors.
-            options["hide_parameters"] = True
-            self.engine = sa.create_engine(spec.url, **options)
+            self.dialect = dialects.for_name(
+                sa.make_url(spec.url).get_backend_name(),
+                bulk_copy_rows=bulk_copy_rows,
+                in_chunk=in_chunk,
+            )
+            self.engine = sa.create_engine(
+                spec.url, **_engine_options(spec, self.dialect, options)
+            )
         else:
             self.engine = engine
-        self.dialect = dialects.for_engine(self.engine)
+            self.dialect = dialects.for_engine(
+                self.engine, bulk_copy_rows=bulk_copy_rows, in_chunk=in_chunk
+            )
         if self._owned and self.dialect.session_setup:
             sa_event.listen(self.engine, "connect", self._set_up_session)
+        # On an engine passed in too, once whatever the databases sharing it.
+        if not sa_event.contains(self.engine, "handle_error", _refused_value):
+            sa_event.listen(self.engine, "handle_error", _refused_value)
         self._tables: dict[str, sa.Table] = {}
         self._lock = threading.Lock()
 
@@ -90,7 +104,11 @@ class Database:
     def name(self) -> str:
         return self.engine.dialect.name
 
-    def _set_up_session(self, connection: Any, record: Any) -> None:
+    def _set_up_session(
+        self,
+        connection: sa_interfaces.DBAPIConnection,
+        record: sa.pool.ConnectionPoolEntry,
+    ) -> None:
         """Runs the dialect's `session_setup` on a new DBAPI connection."""
         del record  # Unused.
         cursor = connection.cursor()
@@ -169,6 +187,36 @@ class Database:
         return table
 
 
+def _engine_options(
+    spec: connection_strings.ConnectionSpec,
+    dialect: dialects.Dialect,
+    options: Mapping[str, object],
+) -> dict[str, object]:
+    """Returns the options of `create_engine` for a connection string.
+
+    Raises:
+        TypeError: If `connect_args` is not a mapping.
+    """
+    given = options.get("connect_args", {})
+    if not isinstance(given, Mapping):
+        # Its type only: the arguments may hold a password.
+        raise TypeError(
+            f"connect_args must be a mapping, not {type(given).__name__}"
+        )
+    merged: dict[str, object] = {
+        **options,
+        "connect_args": {**spec.connect_args, **given},
+        # Batches, their personal data included, stay out of errors.
+        "hide_parameters": True,
+    }
+    if _sqlite_file(spec.url):
+        # Pooled, a connection out at `dispose()` would never close.
+        merged.setdefault("poolclass", sa.pool.NullPool)
+    if dialect.isolation_level is not None:
+        merged.setdefault("isolation_level", dialect.isolation_level)
+    return merged
+
+
 def split_name(name: str) -> tuple[str | None, str]:
     """Splits `schema.table` into its schema (None if absent) and table.
 
@@ -181,7 +229,7 @@ def split_name(name: str) -> tuple[str | None, str]:
     return (None, parts[0]) if len(parts) == 1 else (parts[0], parts[1])
 
 
-def column(table: sa.Table, name: str) -> sa.Column[Any]:
+def column(table: sa.Table, name: str) -> sa.Column[object]:
     """Returns the column `name` of `table`.
 
     Raises:
@@ -271,9 +319,37 @@ def errors(
         raise error(f"{action}: {_first_line(exc)}") from exc
 
 
+class _RefusedValueError(sa_exc.SQLAlchemyError):
+    """A value the driver would not bind or read, raised by it as a
+    `ValueError`, `TypeError` or `OverflowError` rather than as an error of
+    the DBAPI: e.g. mssql-python for an integer past BIGINT's range."""
+
+
+def _refused_value(
+    context: sa.engine.ExceptionContext,
+) -> _RefusedValueError | None:
+    """The error of the driver executing a statement, when SQLAlchemy leaves
+    it as the driver raised it: without the value, which its message tells
+    (`hide_parameters`)."""
+    error = context.original_exception
+    if (
+        context.statement is None
+        or context.sqlalchemy_exception is not None
+        or not isinstance(error, (ValueError, TypeError, OverflowError))
+    ):
+        return None
+    return _RefusedValueError(
+        f"the driver refused a value of the statement ({type(error).__name__})"
+    )
+
+
 def _first_line(exc: BaseException) -> str:
+    """The first line of the error, without a value of the batch: the
+    parameters are hidden (`hide_parameters`), the duplicate key value cut."""
     text = str(exc).strip()
-    return text.splitlines()[0] if text else type(exc).__name__
+    if not text:
+        return type(exc).__name__
+    return driver_errors.without_duplicate_values(text.splitlines()[0])
 
 
 class RelationalAdapter:

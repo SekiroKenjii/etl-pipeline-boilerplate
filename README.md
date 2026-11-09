@@ -141,8 +141,8 @@ saved with the state at the first run and kept, so that no row moves from
 one range to another and slips past a watermark. The CRM module reads one
 range by default (`partitions = 1`): more help a reload more than a load
 (docs/performance.md). Writes are already bulk: `COPY` on Postgres,
-bulk copy on SQL Server (mssql-python, batches of 2,000 rows or more), array
-binds on Oracle and MySQL,
+bulk copy on SQL Server (mssql-python, batches of 2,000 rows or more; the key
+registry from 300), array binds on Oracle and MySQL,
 then one set-based merge per batch.
 
 `make bench` measures the rows per second of `crm.full_load`, source to
@@ -250,7 +250,7 @@ taken from that same view.
   CRM module refuses to load unless the target's pool opens
   `2 x 16 + 2` connections (a transaction and SQL Server's bulk copy per
   range, plus the ETL records) and the source's 16. Raise `max_overflow`,
-  or cap the steps with `runs.max_parallel_steps`.
+  or cap the steps with `tuning.max_parallel_steps`.
 - `privacy.anonymize` is refused in production: an environment named
   `prod`, `production` or `prd` (or holding one of these words, `prod-eu`),
   or any environment setting `production = true`.
@@ -294,7 +294,8 @@ push; a release also signs the image and attests its provenance.
 
 - the architecture;
 - a guide to mapping workbooks for business analysts;
-- operations;
+- operations, with the known limitations of this release ("Known
+  limitations" in `docs/operations.md`);
 - the cutover runbook;
 - deployment;
 - the architecture decision records;
@@ -329,7 +330,7 @@ Logs go through the standard `logging` module, carrying the context of the
 run (`etl.pipeline`, `etl.run_id`, `etl.step`...), secrets redacted, off the
 pipelines' threads (a bounded queue). Two sinks: JSON lines on stdout (ECS
 field names), for log agents (Fluent Bit, Vector, Filebeat, Grafana Alloy),
-and OpenTelemetry (OTLP, `otel` extra). Through an OpenTelemetry Collector
+and OpenTelemetry (OTLP). Through an OpenTelemetry Collector
 (`deploy/otel-collector/`), they reach Elasticsearch and Kibana, Grafana
 Loki, Seq, or any OTLP backend, without code changes.
 

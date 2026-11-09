@@ -1,4 +1,4 @@
-"""Writing a mapping workbook to start from. Needs the `mappings` extra."""
+"""Writing a mapping workbook to start from."""
 
 from __future__ import annotations
 

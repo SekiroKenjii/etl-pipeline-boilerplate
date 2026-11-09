@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Collection, Sequence
+from collections.abc import Sequence
 import datetime
 import decimal
 import pathlib
@@ -159,60 +159,6 @@ def test_jsonl_registry_persists_and_appends_only_new_keys(
     assert len(reopened.path_for("crm.customer").read_text().splitlines()) == 2
 
 
-class SpyRegistry(core_keys.InMemoryKeyRegistry):
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.known_calls: list[list[str]] = []
-
-    def known(self, entity: str, surrogate_keys: Collection[str]) -> set[str]:
-        self.known_calls.append(sorted(surrogate_keys))
-        return super().known(entity, surrogate_keys)
-
-
-class TestCachedKeyRegistry:
-
-    def test_hits_are_served_from_the_cache(self) -> None:
-        inner = SpyRegistry()
-        inner.register([_entry("k1"), _entry("k2")])
-        cached = core_keys.CachedKeyRegistry(inner)
-
-        assert cached.known("crm.customer", ["k1", "k2", "k3"]) == {"k1", "k2"}
-        assert cached.known("crm.customer", ["k1", "k2"]) == {"k1", "k2"}
-
-        assert inner.known_calls == [
-            ["k1", "k2", "k3"]
-        ]  # one call for all the misses
-        assert (cached.hits, cached.misses) == (2, 3)
-
-    def test_unknown_keys_are_not_cached(self) -> None:
-        inner = core_keys.InMemoryKeyRegistry()
-        cached = core_keys.CachedKeyRegistry(inner)
-        assert cached.known("crm.customer", ["k1"]) == set()
-
-        inner.register([_entry("k1")])  # e.g. by another step or host
-
-        assert cached.known("crm.customer", ["k1"]) == {"k1"}
-
-    def test_least_recently_used_keys_are_evicted(self) -> None:
-        inner = SpyRegistry()
-        cached = core_keys.CachedKeyRegistry(inner, max_entries=2)
-        cached.register([_entry("k1"), _entry("k2"), _entry("k3")])
-
-        cached.known("crm.customer", ["k1"])
-
-        assert inner.known_calls == [["k1"]]  # k1 was evicted, k2 / k3 kept
-
-    def test_register_writes_through_with_the_natural_key(self) -> None:
-        inner = core_keys.InMemoryKeyRegistry()
-        cached = core_keys.CachedKeyRegistry(inner)
-
-        cached.register([_entry("k1", "C001")])
-
-        assert inner.known("crm.customer", ["k1"]) == {"k1"}
-        assert cached.natural_key("crm.customer", "k1") == ("C001",)
-
-
 class TestRegisteringLoader:
 
     def test_keys_are_registered_once_loaded(self) -> None:
@@ -262,7 +208,7 @@ class TestRegisteringLoader:
         assert registry.known("crm.customer", ["k1"]) == set()
 
 
-@pytest.mark.parametrize("kind", ["memory", "files", "cached"])
+@pytest.mark.parametrize("kind", ["memory", "files", "tiered"])
 def test_registries_forget_a_natural_key(
     kind: str, tmp_path: pathlib.Path
 ) -> None:
@@ -272,7 +218,9 @@ def test_registries_forget_a_natural_key(
     elif kind == "files":
         registry = core_keys.JsonLinesKeyRegistry(tmp_path)
     else:
-        registry = core_keys.CachedKeyRegistry(core_keys.InMemoryKeyRegistry())
+        registry = core_keys.TieredKeyCache(
+            core_keys.InMemoryKeyRegistry(), memory_budget=1
+        )
 
     registries.check_forget(registry)
 

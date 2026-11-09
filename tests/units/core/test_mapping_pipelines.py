@@ -2,16 +2,22 @@
 
 from __future__ import annotations
 
+import datetime
+import decimal
 import pathlib
 from typing import Any
+import uuid
 
 import pytest
 
 import config
+from core import contract
 from core import mapping
 from core import mapping_pipelines
 from core import runtime
 from core.mapping import catalog as mapping_catalog
+from core.mapping_pipelines import kinds
+from tests.factories import fake_ports
 from tests.factories import mapping_specs
 
 field = mapping_specs.field
@@ -81,3 +87,51 @@ def test_a_module_is_its_name_settings_and_transforms(
     assert [m.name for m in module.catalogs()[0].mappings] == ["invoice"]
     assert set(module.fingerprint()) == {"mappings", runtime.KEYS}
     assert module.fingerprint()[runtime.KEYS].startswith("invoice:")
+
+
+class TestReplayKeys:
+    """Replay reads rejected rows by their source key, a text."""
+
+    @pytest.mark.parametrize(
+        ("family", "texts", "values"),
+        [
+            (contract.TypeFamily.INTEGER, ["7", "x", "1003"], [7, 1003]),
+            (
+                contract.TypeFamily.DECIMAL,
+                ["2.25", "x"],
+                [decimal.Decimal("2.25")],
+            ),
+            (
+                contract.TypeFamily.BOOLEAN,
+                ["true", "1", "false"],
+                [True, False],
+            ),
+            (
+                contract.TypeFamily.DATE,
+                ["2026-01-02", "02/01/2026"],
+                [datetime.date(2026, 1, 2)],
+            ),
+            (contract.TypeFamily.UUID, ["0" * 32, "x"], [uuid.UUID(int=0)]),
+            (contract.TypeFamily.TEXT, ["C001", "7"], ["C001", "7"]),
+            (contract.TypeFamily.OTHER, ["C001"], ["C001"]),
+            (contract.TypeFamily.INTEGER, [], []),
+        ],
+    )
+    def test_keys_take_the_type_of_their_column(
+        self,
+        family: contract.TypeFamily,
+        texts: list[str],
+        values: list[object],
+    ) -> None:
+        assert kinds.key_values(family, texts) == values
+
+    def test_a_reader_without_a_catalog_guesses_from_the_largest_value(
+        self,
+    ) -> None:
+        reader = fake_ports.InMemoryTableReader({
+            "t": [{"k": 7}, {"k": 1003}],
+            "empty": [],
+        })
+
+        assert reader.column_family("t", "k") is contract.TypeFamily.INTEGER
+        assert reader.column_family("empty", "k") is contract.TypeFamily.OTHER

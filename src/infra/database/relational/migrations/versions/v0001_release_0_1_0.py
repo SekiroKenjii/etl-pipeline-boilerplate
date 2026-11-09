@@ -6,7 +6,7 @@ Revises: none
 
 from __future__ import annotations
 
-from typing import Any
+import datetime
 
 from alembic import op
 import sqlalchemy as sa
@@ -105,7 +105,7 @@ def upgrade(*, schema: str | None, prefix: str) -> None:
     )
 
 
-def _identity() -> sa.Column[Any]:
+def _identity() -> sa.Column[int]:
     # SQLite only auto-increments an INTEGER primary key.
     return sa.Column(
         "id",
@@ -115,5 +115,5 @@ def _identity() -> sa.Column[Any]:
     )
 
 
-def _stamp(name: str) -> sa.Column[Any]:
+def _stamp(name: str) -> sa.Column[datetime.datetime]:
     return sa.Column(name, sa.DateTime(timezone=True), nullable=False)

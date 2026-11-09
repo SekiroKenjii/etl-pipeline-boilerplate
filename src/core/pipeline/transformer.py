@@ -5,12 +5,20 @@ from __future__ import annotations
 import abc
 from collections.abc import Iterable
 import functools
-from typing import Any
+import typing
 
 from core import contract
 
+# Declared, not PEP 695: mypy infers both parameters invariant, as `then`
+# returns this class with other arguments; and a transformer of
+# `Row | ChangeEvent` must take a batch of rows.
+TIn_contra = typing.TypeVar("TIn_contra", contravariant=True)
+TOut_co = typing.TypeVar("TOut_co", covariant=True)
 
-class IDataTransformer[TIn, TOut](contract.Lifecycle, abc.ABC):
+
+class IDataTransformer(
+    contract.Lifecycle, abc.ABC, typing.Generic[TIn_contra, TOut_co]
+):
     """Turns records into other records, one batch at a time.
 
     It may emit more or fewer records than it receives; records dropped on
@@ -20,8 +28,8 @@ class IDataTransformer[TIn, TOut](contract.Lifecycle, abc.ABC):
 
     @abc.abstractmethod
     def transform(
-        self, records: Iterable[TIn], ctx: contract.ETLContext
-    ) -> Iterable[TOut]:
+        self, records: Iterable[TIn_contra], ctx: contract.ETLContext
+    ) -> Iterable[TOut_co]:
         """Yields the transformed records of one batch."""
 
     def collect_stats(self) -> contract.ETLStats:
@@ -33,8 +41,8 @@ class IDataTransformer[TIn, TOut](contract.Lifecycle, abc.ABC):
         return contract.ETLStats()
 
     def then[TNext](
-        self, following: IDataTransformer[TOut, TNext]
-    ) -> IDataTransformer[TIn, TNext]:
+        self, following: IDataTransformer[TOut_co, TNext]
+    ) -> IDataTransformer[TIn_contra, TNext]:
         """Returns a transformer running this one, then `following`."""
         return ChainedTransformer(self, following)
 
@@ -82,12 +90,13 @@ class ChainedTransformer[TIn, TMid, TOut](IDataTransformer[TIn, TOut]):
         return self.first.collect_stats() + self.second.collect_stats()
 
 
-def chain(
-    first: IDataTransformer[Any, Any], *rest: IDataTransformer[Any, Any]
-) -> IDataTransformer[Any, Any]:
-    """Chains transformers: `chain(a, b, c)` is `a.then(b).then(c)`.
+def chain[T](
+    first: IDataTransformer[T, T], *rest: IDataTransformer[T, T]
+) -> IDataTransformer[T, T]:
+    """Chains transformers of one record type (filters, deduplication...):
+    `chain(a, b, c)` is `a.then(b).then(c)`.
 
-    Prefer `then`, which keeps the record types.
+    Transformers that change the type chain with `then`.
     """
     return functools.reduce(
         lambda chained, following: chained.then(following), rest, first

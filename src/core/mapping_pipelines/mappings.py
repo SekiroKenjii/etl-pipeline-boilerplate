@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
 
 from core import contract
 from core import keys
 from core import mapping
 from core import operators
-from core.mapping_pipelines import settings as pipelines_settings
+from core.mapping_pipelines import types as pipelines_types
 
 
 class Mappings:
@@ -26,7 +25,7 @@ class Mappings:
 
     def __init__(
         self,
-        settings: pipelines_settings.MappingSettings,
+        settings: pipelines_types.MappingSettings,
         catalog: contract.MappingCatalog,
         compiled: dict[str, mapping.CompiledMapping],
     ) -> None:
@@ -66,7 +65,7 @@ class Mappings:
             f.sources for f in self.compiled[name].spec.fields if f.primary_key
         )
 
-    def lineage(self, name: str) -> Callable[[Any], str]:
+    def lineage(self, name: str) -> Callable[[operators.SourceRecord], str]:
         """Identifies a source row (or change) by its natural key, as text:
         the `source_key` of what it maps to, and of its corrections.
 
@@ -77,7 +76,7 @@ class Mappings:
         columns = self.natural_key(name)
         case = self.compiled[name].spec.key_case
 
-        def lineage(record: Any) -> str:
+        def lineage(record: operators.SourceRecord) -> str:
             row = (
                 record.row
                 if isinstance(record, contract.ChangeEvent)

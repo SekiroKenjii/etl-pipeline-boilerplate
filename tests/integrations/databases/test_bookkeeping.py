@@ -73,15 +73,27 @@ class TestKeyRegistry:
         )
 
     def test_behind_a_cache(self, etl: conftest.Backend) -> None:
-        cached = keys.CachedKeyRegistry(
-            relational.RelationalKeyRegistry(etl.db, prefix=etl.prefix)
+        # Memory for one key: k1 goes to disk when k2 comes.
+        cached = keys.TieredKeyCache(
+            relational.RelationalKeyRegistry(etl.db, prefix=etl.prefix),
+            memory_budget=1,
+            disk_budget=10**6,
         )
 
-        def use(r: keys.CachedKeyRegistry) -> Any:
-            r.register([contract.KeyEntry("e", "k1", ("1",))])
-            return r.known("e", ["k1", "k2"]), r.natural_key("e", "k1")
+        def use(r: keys.TieredKeyCache) -> Any:
+            r.register([
+                contract.KeyEntry("e", "k1", ("1",)),
+                contract.KeyEntry("e", "k2", ("2",)),
+            ])
+            return (
+                r.known("e", ["k1", "k2", "k3"]),
+                r.natural_key("e", "k1"),
+                r.natural_key("e", "k3"),
+                (r.memory_hits, r.disk_hits, r.misses),
+            )
 
-        assert use(cached) == ({"k1"}, ("1",))
+        with cached:
+            assert use(cached) == ({"k1", "k2"}, ("1",), None, (1, 1, 1))
 
 
 def test_state_round_trips(etl: conftest.Backend) -> None:
@@ -309,21 +321,57 @@ def test_the_run_ledger_and_lock(etl: conftest.Backend) -> None:
     def use_lock(l: relational.RelationalRunLock) -> Any:
         first = l.acquire("crm.load", "a", 60)
         second = l.acquire("crm.load", "b", 60)
+        held = l.holder("crm.load")
         renewed = l.renew("crm.load", "a", 60), l.renew("crm.load", "b", 60)
         l.release("crm.load", "a")
         return (
             first,
             second,
+            held,
             renewed,
             l.acquire("crm.load", "b", -1),
+            l.holder("crm.load"),
             l.acquire("crm.load", "c", 60),
         )
 
     # b's lease is already over: c takes the lock.
-    assert use_lock(lock) == (True, False, (True, False), True, True)
+    assert use_lock(lock) == (
+        True,
+        False,
+        "a",
+        (True, False),
+        True,
+        None,
+        True,
+    )
+
+    def taken_over(l: relational.RelationalRunLock) -> Any:
+        l.acquire("crm.step", "dead", -1)
+        l.acquire("crm.step", "retry", 60)
+        # The first owner, back: it frees and renews nothing of the retry's.
+        l.release("crm.step", "dead")
+        return l.renew("crm.step", "dead", 60), l.holder("crm.step")
+
+    assert taken_over(lock) == (False, "retry")
+    # The owner of the longest label the kernel takes fits the column.
+    longest = "label:" + "x" * 161 + "@" + "f" * 32
+    assert lock.acquire("crm.long", longest, 60)
+    assert lock.holder("crm.long") == longest
 
 
 def test_the_steps_of_a_run(etl: conftest.Backend) -> None:
     ledgers.check_steps(
+        relational.RelationalRunLedger(etl.db, prefix=etl.prefix)
+    )
+
+
+def test_the_latest_run_that_loaded(etl: conftest.Backend) -> None:
+    ledgers.check_latest(
+        relational.RelationalRunLedger(etl.db, prefix=etl.prefix)
+    )
+
+
+def test_the_last_run_of_a_label(etl: conftest.Backend) -> None:
+    ledgers.check_last_run(
         relational.RelationalRunLedger(etl.db, prefix=etl.prefix)
     )

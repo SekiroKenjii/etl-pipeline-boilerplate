@@ -5,11 +5,11 @@ from __future__ import annotations
 from collections.abc import Sequence
 import datetime
 import decimal
-from typing import Any
 import uuid
 
 from sqlalchemy import exc as sa_exc
 import sqlalchemy as sa
+from sqlalchemy.dialects import mysql
 
 from core import contract
 from infra.database.relational import database
@@ -89,13 +89,13 @@ class RelationalSchemaInspector(
         if not columns:
             return {}
         reflected = self.db.table(table)
-        source: sa.Select[Any] = sa.select(
+        source = sa.select(
             *(database.column(reflected, name) for name in columns)
         )
         if sample_rows is not None:
             source = source.limit(sample_rows)
         rows = source.subquery("etl_profiled")
-        counts: list[sa.ColumnElement[Any]] = [sa.func.count()]
+        counts: list[sa.ColumnElement[int]] = [sa.func.count()]
         for name in columns:
             counts.append(sa.func.count(rows.c[name]))
             counts.append(sa.func.count(sa.distinct(rows.c[name])))
@@ -195,13 +195,16 @@ class RelationalSchemaInspector(
         )
 
 
-def family(type_: sa.types.TypeEngine[Any]) -> contract.TypeFamily:
+def family[T](type_: sa.types.TypeEngine[T]) -> contract.TypeFamily:
     """Returns the family of a SQLAlchemy type, as reflected.
 
-    Oracle's `NUMBER(p, 0)` is an INTEGER, `NUMBER` a DECIMAL.
+    Oracle's `NUMBER(p, 0)` is an INTEGER, `NUMBER` a DECIMAL. MySQL's
+    `BIT(n)` is an INTEGER, `BIT(1)` too: its values are read as integers.
     """
     if isinstance(type_, sa.Boolean):
         return contract.TypeFamily.BOOLEAN
+    if isinstance(type_, mysql.BIT):
+        return contract.TypeFamily.INTEGER
     if isinstance(type_, sa.JSON):
         return contract.TypeFamily.JSON
     if isinstance(type_, sa.Numeric) and not isinstance(type_, sa.Float):
@@ -219,7 +222,7 @@ def family(type_: sa.types.TypeEngine[Any]) -> contract.TypeFamily:
     return contract.TypeFamily.OTHER
 
 
-_PYTHON_FAMILIES: list[tuple[type[Any], contract.TypeFamily]] = [
+_PYTHON_FAMILIES: list[tuple[type[object], contract.TypeFamily]] = [
     (bool, contract.TypeFamily.BOOLEAN),
     (int, contract.TypeFamily.INTEGER),
     (decimal.Decimal, contract.TypeFamily.DECIMAL),

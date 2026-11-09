@@ -8,7 +8,6 @@ import datetime
 import json
 import pathlib
 import threading
-from typing import Any
 
 from core import contract
 from shared import utils
@@ -24,14 +23,14 @@ class InMemoryQuarantine(contract.IQuarantine):
     """
 
     def __init__(self) -> None:
-        self.records: list[contract.RejectedRecord[Any]] = []
+        self.records: list[contract.RejectedRecord[object]] = []
         self._entries: list[contract.QuarantineEntry] = []
         self._next_id = 1
         self._lock = threading.Lock()
 
     def put(
         self,
-        records: Sequence[contract.RejectedRecord[Any]],
+        records: Sequence[contract.RejectedRecord[object]],
         ctx: contract.ETLContext,
     ) -> None:
         now = utils.utc_now()
@@ -228,11 +227,13 @@ class JsonLinesIssueSink(_JsonLinesStore, contract.IIssueSink):
 
     def purge(self, before: datetime.datetime) -> int:
         return self._keep(
-            lambda item: datetime.datetime.fromisoformat(item["written_at"])
+            lambda item: datetime.datetime.fromisoformat(
+                str(item["written_at"])
+            )
             >= before
         )
 
-    def _keep(self, kept: Callable[[dict[str, Any]], bool]) -> int:
+    def _keep(self, kept: Callable[[Mapping[str, object]], bool]) -> int:
         """Keeps the lines `kept` says; returns how many are deleted."""
         deleted = 0
         for path in self._files(None):
@@ -281,7 +282,7 @@ class JsonLinesQuarantine(_JsonLinesStore, contract.IQuarantine):
 
     def put(
         self,
-        records: Sequence[contract.RejectedRecord[Any]],
+        records: Sequence[contract.RejectedRecord[object]],
         ctx: contract.ETLContext,
     ) -> None:
         """See `contract.IQuarantine.put`: a record rejected again rewrites

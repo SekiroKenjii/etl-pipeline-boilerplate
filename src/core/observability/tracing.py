@@ -16,9 +16,8 @@ from collections.abc import Generator, Mapping
 import contextlib
 import contextvars
 
+from core import contract
 from core.observability import context as log_context
-
-type Attribute = str | bool | int | float
 
 
 class Span(abc.ABC):
@@ -35,7 +34,9 @@ class Span(abc.ABC):
         """The span, 16 hex digits; empty when not recorded."""
 
     @abc.abstractmethod
-    def set_attributes(self, attributes: Mapping[str, Attribute]) -> None:
+    def set_attributes(
+        self, attributes: Mapping[str, contract.Attribute]
+    ) -> None:
         """Adds attributes, e.g. the stats known at the end."""
 
     @abc.abstractmethod
@@ -54,7 +55,7 @@ class ITracer(abc.ABC):
     def start_span(
         self,
         name: str,
-        attributes: Mapping[str, Attribute],
+        attributes: Mapping[str, contract.Attribute],
         parent: Span | None,
     ) -> Span:
         """Starts a span, child of `parent` (a new trace when None)."""
@@ -71,7 +72,9 @@ class _NoSpan(Span):
     def span_id(self) -> str:
         return ""
 
-    def set_attributes(self, attributes: Mapping[str, Attribute]) -> None:
+    def set_attributes(
+        self, attributes: Mapping[str, contract.Attribute]
+    ) -> None:
         del attributes  # Unused.
 
     def fail(self, error: BaseException | str) -> None:
@@ -87,7 +90,7 @@ class NoopTracer(ITracer):
     def start_span(
         self,
         name: str,
-        attributes: Mapping[str, Attribute],
+        attributes: Mapping[str, contract.Attribute],
         parent: Span | None,
     ) -> Span:
         del name, attributes, parent  # Unused.
@@ -119,7 +122,8 @@ def current() -> Span | None:
 
 @contextlib.contextmanager
 def span(
-    name: str, attributes: Mapping[str, Attribute] | None = None
+    name: str,
+    attributes: Mapping[str, contract.Attribute] | None = None,
 ) -> Generator[Span]:
     """Runs the block in a span, child of the current one.
 

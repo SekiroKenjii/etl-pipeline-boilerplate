@@ -1,7 +1,7 @@
 """Traces and metrics exported by OpenTelemetry (OTLP), behind the core's
 ports (`core.observability.tracing`, `core.observability.metrics`).
 
-Needs the `otel` extra. The collector routes them with the logs: traces to
+The collector routes them with the logs: traces to
 Tempo, Elastic APM or Seq; metrics to Prometheus, Mimir or Elasticsearch
 (`deploy/otel-collector/`).
 
@@ -13,9 +13,8 @@ Tempo, Elastic APM or Seq; metrics to Prometheus, Mimir or Elasticsearch
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 import threading
-from typing import Any
 
 from opentelemetry import context as otel_context
 from opentelemetry import trace as otel_trace
@@ -27,15 +26,25 @@ from opentelemetry.sdk import trace as otel_sdk_trace
 from opentelemetry.sdk.metrics import export as metrics_export
 from opentelemetry.sdk.trace import export as trace_export
 
+from core import contract
+from core import observability
 from core.observability import metrics
 from core.observability import tracing
 
 
 class OtelSpan(tracing.Span):
-    """An OpenTelemetry span."""
+    """An OpenTelemetry span, whose errors are exported redacted.
 
-    def __init__(self, span: otel_trace.Span) -> None:
+    Attributes:
+        span: The span.
+        redact: More secret names, on top of `observability.SECRET_NAMES`.
+    """
+
+    def __init__(
+        self, span: otel_trace.Span, redact: Collection[str] = ()
+    ) -> None:
         self.span = span
+        self.redact = tuple(redact)
         found = span.get_span_context()
         self._trace_id = otel_trace.format_trace_id(found.trace_id)
         self._span_id = otel_trace.format_span_id(found.span_id)
@@ -49,16 +58,26 @@ class OtelSpan(tracing.Span):
         return self._span_id
 
     def set_attributes(
-        self, attributes: Mapping[str, tracing.Attribute]
+        self, attributes: Mapping[str, contract.Attribute]
     ) -> None:
         self.span.set_attributes(dict(attributes))
 
     def fail(self, error: BaseException | str) -> None:
+        # Never `span.record_exception`: it exports the raw text and stack,
+        # which quote rows and passwords.
         if isinstance(error, BaseException):
-            self.span.record_exception(error)
-            description = str(error) or type(error).__name__
+            described = observability.describe_error(error, self.redact)
+            self.span.add_event(
+                "exception",
+                {
+                    "exception.type": described.qualified_type,
+                    "exception.message": described.message,
+                    "exception.stacktrace": described.stack_trace,
+                },
+            )
+            description = described.message or described.type
         else:
-            description = error
+            description = observability.redact_text(error, self.redact)
         self.span.set_status(
             otel_trace.Status(otel_trace.StatusCode.ERROR, description)
         )
@@ -72,16 +91,22 @@ class OtelTracer(tracing.ITracer):
 
     Attributes:
         provider: The provider, which batches and exports.
+        redact: More secret names, on top of `observability.SECRET_NAMES`.
     """
 
-    def __init__(self, provider: otel_sdk_trace.TracerProvider) -> None:
+    def __init__(
+        self,
+        provider: otel_sdk_trace.TracerProvider,
+        redact: Collection[str] = (),
+    ) -> None:
         self.provider = provider
+        self.redact = tuple(redact)
         self._tracer = provider.get_tracer("etl")
 
     def start_span(
         self,
         name: str,
-        attributes: Mapping[str, tracing.Attribute],
+        attributes: Mapping[str, contract.Attribute],
         parent: tracing.Span | None,
     ) -> tracing.Span:
         # A root span: not a child of whatever span the thread holds.
@@ -93,8 +118,12 @@ class OtelTracer(tracing.ITracer):
         return OtelSpan(
             self._tracer.start_span(
                 name, context=context, attributes=dict(attributes)
-            )
+            ),
+            self.redact,
         )
+
+
+type _Record = Callable[[float, contract.Attributes], None]
 
 
 class OtelMeter(metrics.IMeter):
@@ -107,57 +136,66 @@ class OtelMeter(metrics.IMeter):
     def __init__(self, provider: otel_metrics.MeterProvider) -> None:
         self.provider = provider
         self._meter = provider.get_meter("etl")
-        self._instruments: dict[tuple[str, str], Any] = {}
+        self._records: dict[tuple[str, str], _Record] = {}
         self._lock = threading.Lock()
 
     def add(
         self,
         name: str,
         value: float,
-        attributes: metrics.Attributes | None = None,
+        attributes: contract.Attributes | None = None,
         *,
         unit: str = "1",
         description: str = "",
     ) -> None:
-        self._instrument("counter", name, unit, description).add(
-            value, dict(attributes or {})
+        record = self._record(
+            "counter",
+            name,
+            lambda: self._meter.create_counter(name, unit, description).add,
         )
+        record(value, dict(attributes or {}))
 
     def record(
         self,
         name: str,
         value: float,
-        attributes: metrics.Attributes | None = None,
+        attributes: contract.Attributes | None = None,
         *,
         unit: str = "1",
         description: str = "",
     ) -> None:
-        self._instrument("histogram", name, unit, description).record(
-            value, dict(attributes or {})
+        record = self._record(
+            "histogram",
+            name,
+            lambda: self._meter.create_histogram(
+                name, unit, description
+            ).record,
         )
+        record(value, dict(attributes or {}))
 
     def gauge(
         self,
         name: str,
         value: float,
-        attributes: metrics.Attributes | None = None,
+        attributes: contract.Attributes | None = None,
         *,
         unit: str = "1",
         description: str = "",
     ) -> None:
-        self._instrument("gauge", name, unit, description).set(
-            value, dict(attributes or {})
+        record = self._record(
+            "gauge",
+            name,
+            lambda: self._meter.create_gauge(name, unit, description).set,
         )
+        record(value, dict(attributes or {}))
 
-    def _instrument(
-        self, kind: str, name: str, unit: str, description: str
-    ) -> Any:
+    def _record(
+        self, kind: str, name: str, create: Callable[[], _Record]
+    ) -> _Record:
         with self._lock:
-            found = self._instruments.get((kind, name))
+            found = self._records.get((kind, name))
             if found is None:
-                create = getattr(self._meter, f"create_{kind}")
-                found = create(name, unit=unit, description=description)
-                self._instruments[(kind, name)] = found
+                found = self._records[(kind, name)] = create()
             return found
 
 
@@ -196,6 +234,7 @@ def configure_telemetry(
     export_seconds: float = 15.0,
     span_exporter: trace_export.SpanExporter | None = None,
     metric_readers: Sequence[metrics_export.MetricReader] = (),
+    redact: Collection[str] = (),
 ) -> Telemetry:
     """Exports traces and metrics, and installs them in the core's ports.
 
@@ -210,6 +249,8 @@ def configure_telemetry(
             `stop`.
         span_exporter: Exports spans instead of OTLP (tests).
         metric_readers: Read metrics instead of OTLP (tests).
+        redact: More secret names hidden in the errors of spans, on top of
+            `observability.SECRET_NAMES`: the logs' `redact`.
     """
     resource = resources.Resource.create(
         {"service.name": service, "deployment.environment": environment}
@@ -228,7 +269,7 @@ def configure_telemetry(
                 )
             )
         )
-        tracer = OtelTracer(provider)
+        tracer = OtelTracer(provider, redact)
         tracing.set_tracer(tracer)
     if "metrics" in signals:
         readers = list(metric_readers) or [

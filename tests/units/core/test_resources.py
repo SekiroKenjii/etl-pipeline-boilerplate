@@ -104,7 +104,9 @@ def test_every_resource_is_closed_even_if_one_fails() -> None:
 
     resources = runtime.Resources([
         _spec("db", log),
-        runtime.ResourceSpec("bad", lambda r: Thing("bad", log), close=broken),
+        runtime.ResourceSpec[Thing](
+            "bad", lambda r: Thing("bad", log), close=broken
+        ),
     ])
     resources.get("db", Thing)
     resources.get("bad", Thing)
@@ -123,15 +125,43 @@ def test_health_reports_each_resource() -> None:
             raise ConnectionError("refused")
 
     resources = runtime.Resources([
-        runtime.ResourceSpec("up", lambda r: Thing("up", []), health=ping),
-        runtime.ResourceSpec("down", lambda r: Thing("down", []), health=ping),
+        runtime.ResourceSpec[Thing](
+            "up", lambda r: Thing("up", []), health=ping
+        ),
+        runtime.ResourceSpec[Thing](
+            "down", lambda r: Thing("down", []), health=ping
+        ),
         runtime.ResourceSpec("plain", lambda r: Thing("plain", [])),
     ])
 
     assert resources.health() == {
-        "down": "ConnectionError: refused",
-        "up": "ok",
+        "down": runtime.Health("ConnectionError: refused"),
+        "up": runtime.Health("ok"),
     }
+
+
+def test_health_carries_the_warnings_of_a_working_resource() -> None:
+    def ping(thing: Thing) -> list[str]:
+        if thing.name == "down":
+            raise ConnectionError("refused")
+        return [f"{thing.name} is slow"]
+
+    resources = runtime.Resources([
+        runtime.ResourceSpec[Thing](
+            "up", lambda r: Thing("up", []), health=ping
+        ),
+        runtime.ResourceSpec[Thing](
+            "down", lambda r: Thing("down", []), health=ping
+        ),
+    ])
+
+    report = resources.health()
+
+    assert report == {
+        "down": runtime.Health("ConnectionError: refused"),
+        "up": runtime.Health("ok", ("up is slow",)),
+    }
+    assert [report["up"].ok, report["down"].ok] == [True, False]
 
 
 def test_threads_asking_at_once_share_one_resource() -> None:

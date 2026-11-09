@@ -16,9 +16,16 @@ etl check                         # can every resource be reached? exit 5 if not
 store's directory, a page of a `gcs` bucket) and event endpoint
 (`lineage.endpoint`, `logging.otlp.endpoint`: a TCP connection, no event
 sent). Use it as a readiness probe: it exits 5 (not ready) when one fails,
-not 1, which schedulers retry. `etl config show` prints the settings,
-secrets hidden, without reaching Vault, GCP or Azure: their placeholders are
-shown as they are written.
+not 1, which schedulers retry. A database that works but whose sessions the
+ETL does not expect (Postgres messages not in English) stays `ok`, followed
+by a `WARN database.<name>: <what>` line (logged at WARNING too); the exit
+code stays 0, and a `FAIL` of another resource still exits 5. Its first line, `tuning ...`, is the thresholds the
+process runs with, those derived from its memory and CPU limits marked
+`*`, logged at INFO too ({doc}`tuning`). `etl config show` prints the
+settings, secrets hidden, without reaching Vault, GCP or Azure: their
+placeholders are shown as they are written; `etl config tuning` the
+thresholds with where each came from; `etl calibrate <database>` measures
+a database and prints the `[tuning]` values to set.
 
 The exit codes of every command are in {doc}`reference/cli`; what
 schedulers do with them is in {doc}`deployment`. The ledger records the user, the build and the hashes of
@@ -28,13 +35,27 @@ process. The locks of its steps expire after `runs.lease_seconds`, and the
 next run goes on from its last loaded batch.
 
 - **A partial success** (`partial_success`, exit 3) means rows were
-  rejected into the quarantine, nothing else. A step that failed fails the
-  run (exit 1), even when its policy let the other steps go on.
+  rejected into the quarantine, or a step was skipped: by itself (nothing
+  to do, such as no file landed) or after a dependency skipped. A step that
+  failed fails the run (exit 1), even when its policy let the other steps
+  go on; so does a step that counts records failed (`failed`, a system
+  error, not bad data), whatever else it loaded: `--partial-ok` never lets
+  it pass. A run whose every step skipped itself is `skipped`, exit 0.
+- **The bookkeeping database down**, or a resource the command needs: the
+  command exits 1 with one line, `FAILED <reason>` (secrets hidden), or the
+  summary of `etl run --format json` as its last line; never a traceback.
+- **Deletes to confirm.** `etl run crm.deletes` refuses to delete more than
+  `max_delete_share` of an entity's loaded rows (a tenth by default), or
+  every row of an empty source, until the run confirms the count (`--param
+  confirm_deletes=<entity>:<count>`): the run exits 2, as retrying would
+  refuse again ({doc}`cutover-runbook`).
 - **A pipeline that cannot be built** (missing compiled mappings, a setting
   the module refuses) exits 2 and records no run: retrying would not help.
 - **The locks.** A run locks each step it runs, `<pipeline>/<step>`, with a
-  lease renewed every third of `runs.lease_seconds`. A step locked by
-  another run makes it exit 4 at once, holding nothing. If the lock's
+  lease renewed every third of `runs.lease_seconds`. The locks are its
+  process's: no other process renews or frees them. A step locked by
+  another run makes it exit 4 at once, holding nothing; a retry of the same
+  `--label` first waits for it, up to the lease (below). If the lock's
   database cannot be reached, it tries again until the lease is about to
   expire, then cancels the run (`EtlLockLost`).
 
@@ -46,10 +67,21 @@ next run goes on from its last loaded batch.
   `etl runs --run <id>` shows the attempts of each step.
 - **Transient** is a lost connection, a timeout, a deadlock or
   serialization failure, too many connections, a server starting or
-  stopping (told by the database's error codes and SQLSTATEs), a MongoDB
-  transient transaction error. **Fatal** is everything else, and fails the
-  step at once: a login refused, bad SQL, a missing table or column, bad
-  data, a constraint. Retrying those would only repeat them.
+  stopping, resources short for a moment (Oracle's snapshot too old,
+  ORA-01555, and shared pool, ORA-04031; SQL Server waiting for query
+  memory, 8645), a statement cancelled by another session (told by the
+  database's error codes and SQLSTATEs), a MongoDB transient transaction
+  error. **Fatal** is everything else, and fails the step at once: a login
+  refused, bad SQL, a missing table or column, bad data, a constraint.
+  Retrying those would only repeat them.
+- **Postgres's `statement_timeout` is fatal.** Every page is a short query,
+  so a statement past it is slow for a reason a retry cannot fix (a missing
+  index, a plan). Bound waits on locks with `lock_timeout`, below
+  `statement_timeout`: a lock timeout is retried. A cancel by another
+  session (`pg_cancel_backend`) is retried. The statement timeout is told
+  by its message: with `lc_messages` other than English it is retried as a
+  cancel. `etl check` warns of it; set the role's
+  (`ALTER ROLE etl SET lc_messages = 'C'`, {doc}`deployment`).
 - **Across runs.** A failed run exits 1. The scheduler retries it with the
   same `--label` and `--resume` (below): the steps it finished are not run
   again.
@@ -63,10 +95,13 @@ or the client. Behind PgBouncer in transaction pooling the session's time
 zone is lost between transactions: give the ETL session pooling, or set
 its role's zone (`ALTER ROLE etl SET timezone = 'UTC'`).
 
-MySQL sessions also run in READ COMMITTED, the default of the other
+MySQL transactions also run in READ COMMITTED, the default of the other
 databases: under InnoDB's REPEATABLE READ, key ranges written at once
-deadlock in the merge. READ COMMITTED needs row-based binary logging
-(`binlog_format = ROW`, MySQL 8's default) on a target that logs.
+deadlock in the merge. It is the engine's isolation level, which SQLAlchemy
+sets on every connection of the pool again after an autocommit read
+(`options.isolation_level` overrides it). READ COMMITTED needs row-based
+binary logging (`binlog_format = ROW`, MySQL 8's default) on a target that
+logs.
 
 ## Resuming, and running a step again
 
@@ -87,7 +122,8 @@ etl run crm.full_load --label "$JOB" --resume   # a scheduler's job, retried
     failed half-way does not start over.
   - Without a run id, it resumes the last run of the pipeline, unless that
     one succeeded: then every step runs. With `--label`, the last run of
-    that label only.
+    that label only, among every run of the pipeline, whatever its outcome:
+    a retry of a job that succeeded runs nothing.
   - Resume retries, not the next scheduled run: after a failed night, a
     resuming run would not run the steps that night finished, and their
     new rows would wait for the night after. Hence the labels.
@@ -95,18 +131,44 @@ etl run crm.full_load --label "$JOB" --resume   # a scheduler's job, retried
 - **`--label`.** The scheduler's name of the job: the Kubernetes Job
   (`$(JOB_NAME)`), the Airflow DAG run and task. With `--resume`, a retry of
   the job resumes its run, and the next night's job, another label, runs
-  every step. A retry also takes over the locks of a try that died (OOM,
-  `kill -9`) at once, instead of waiting for their lease: never give two
-  runs at once the same label.
+  every step. A retry finding the steps locked by another run of its label
+  waits for them, up to `runs.lease_seconds` (a poll every tenth of it;
+  SIGTERM ends the wait, exit 130): a try that died (OOM, `kill -9`, a node
+  lost) frees them when its lease expires, and the retry takes over then; a
+  try still running (a zombie pod, an operator running the same label)
+  keeps them, and the retry exits 4 without running anything. A retry that
+  waited reads the ledger again: it carries over the steps the try finished
+  meanwhile (nothing runs again if it succeeded, as for a retry arriving
+  after the success) and runs the steps that try failed, even those its own
+  first try had done, taking their locks first by the same rules (waiting
+  again for its label if need be). It reads the ledger again after a wait
+  twice at most, then runs what it read last, every lock held. Steps
+  locked by a run of another label exit 4 at once; so do those of an
+  unlabelled run. A label has at most 161 characters.
 - **`--step`.** Runs these steps only, by name or pattern; `--step` again
   for more. The others are taken as done: they do not hold back the steps
   selected, and do not run. Use it to load an entity again after fixing
   its mapping, or a range of a partitioned table (`customer:2`).
 - Pass the same `--since`, `--until` and `--param` as the run resumed: the
   ledger does not keep them.
+- **A backfill** (`--since`, `--until`) reads that window by watermark. It
+  moves the saved position only when it starts at or before it (it read
+  every row in between), and never backwards: one starting later, or before
+  any position is saved, saves nothing, so the next run still reads the
+  rows it skipped. The rows at the last saved watermark are read again by
+  the next run until one run has read them all: a run dying, cancelled or
+  losing its lock half-way leaves the rest to the next, and a backfill that
+  did not read them leaves them pending.
+- **SQL Server `datetime` and `smalldatetime` watermarks** are compared as
+  the column stores them: the reader casts every bound value (a position, a
+  `--since`/`--until`, a filter) to the column's type, since the driver
+  binds a Python datetime as `datetime2(7)` and `.003` would otherwise
+  never equal the stored `.0033333`. A bound `--until 10:00:00.002` thus
+  reads the rows at `.003`, as the column would store `.002` so.
 - **`--rekey`.** A run refuses to start (exit 2) when the module's keys
-  changed since the last successful run: a rotated `key_secret`, a renamed
-  key namespace ({doc}`security`). `--rekey` runs it anyway, once the
+  changed since its last run that loaded (success or partial success, not a
+  dry run), of any pipeline of the module, however long ago: a rotated
+  `key_secret`, a renamed key namespace ({doc}`security`). `--rekey` runs it anyway, once the
   target is ready for new keys; the ledger records `rekeyed_from`.
 
 ## Several processes for one pipeline
@@ -133,6 +195,12 @@ etl run crm.full_load --label orders --step 'order:*'      # the children last
   the last key loaded. The later runs read by watermark, and want an index
   on `(watermark, key)`. A backfill (`--since`, `--until`) run during an
   unfinished first read saves no position.
+- **An index on the target's key.** Jobs writing one table at once need
+  its key (`TableTarget.key`) to lead an index of the target, a primary key
+  or any other. Without one, SQL Server merges each batch by a scan of the
+  table, without the hints that keep writers apart, and writes at once may
+  deadlock: the writer logs `<table> has no index on [...]` once per run.
+  MySQL and Postgres need a unique index on the key anyway.
 - **Parents before children.** The steps a job does not select are taken
   as done: run the ranges of a parent table before those of its children,
   or the orphans are parked.
@@ -140,6 +208,18 @@ etl run crm.full_load --label orders --step 'order:*'      # the children last
   overlap one running exits 4.
 - **The bookkeeping** must be in a database every job reaches
   (`bookkeeping.database`): the files of a local bookkeeping serve one host.
+- **The key cache.** Each process keeps the keys it checked or registered
+  in memory, up to `tuning.key_cache_memory` (a quarter of the memory budget by default,
+  about 280 MB per million keys), and the keys past that in a SQLite file
+  under `$TMPDIR`, up to `tuning.key_cache_disk` (`"2GiB"` at most): a key in
+  either tier costs the registry nothing when it is checked or registered
+  again. Past the disk budget the cache logs one warning and the registry
+  answers for the keys evicted since; nothing is lost either way. The file
+  is in a directory of the process owner only, removed when the process
+  ends; a `$TMPDIR` on tmpfs would spend memory on it. Give the memory
+  what the keys a job touches need, the parents of the children it loads
+  and the keys it loads again; a smaller cache is correct, and reads disk
+  or asks the registry more often.
 - **Retries** are the scheduler's, per job: a label each, and `--resume`.
   {doc}`deployment` has the Kubernetes and Airflow shapes.
 
@@ -159,7 +239,10 @@ etl housekeeping                         # purge after retention_days
   are read again by the next run, a run resumed) refreshes its open entry:
   its issues, run and time, keeping its id. One open entry per record and
   checkpoint: a mapped record is identified by its mapping, source key and
-  part, any other record by its data.
+  part, any other record by its data. Steps rejecting the same record at
+  once leave one entry: a unique index of the open entries (partial on
+  Postgres, SQL Server, SQLite and MongoDB; on expressions on Oracle; none on
+  MySQL, where two may be left).
 - **`etl quarantine export`.** A CSV for the BAs, opened in Excel: its own
   columns, prefixed with `_` (`_id`, `_pipeline`, `_run_id`,
   `_rejected_at`, `_status`, `_entity`, `_key`, `_issues`, `_record`), and
@@ -225,6 +308,13 @@ its upgrade before its pipelines.
   open with a key of their own. The SQL of `etl-db ddl --from` cannot
   compute the keys: every entry gets its own, and a record rejected again
   gets one more entry, once.
+- **MongoDB** has no revisions: `etl-db upgrade` (or a first run with
+  `bookkeeping.create = true`) creates the missing collections and indexes.
+  The unique index of the open quarantine entries, `one_open_entry_per_record`,
+  replaces 0.1.0's `pipeline_1_record_key_1`; before it is created, the open
+  entries of a record but the latest get a key of their own
+  (`legacy-<id>`), still open, nothing deleted. If processes of 0.1.0 keep
+  adding entries meanwhile, it fails and says so: stop them, run it again.
 - **At startup.** With `bookkeeping.create = true` (development), the
   first process to need the tables creates or upgrades them. Otherwise a
   run refuses to start while they are behind, with exit 2 and what to run;
@@ -281,9 +371,23 @@ and restore them together.
 | Exit 3, rows rejected | `etl quarantine list` | Fix the cause or correct the rows, `etl run crm.replay` |
 | Exit 2 | The message: settings, missing compiled mappings, keys changed | Fix it; nothing ran, nothing was recorded |
 | Exit 2, "The ETL tables are at revision ..." | `etl-db current` | `etl-db upgrade`, or the SQL of `etl-db ddl --from <revision>` (see above) |
-| Exit 4, already running | `etl runs`: a run `in_progress` with some of the same steps | Wait; a dead run's locks expire after their lease, or its retry (same `--label`) takes them over |
+| Exit 4, already running | `etl runs`: a run `in_progress` with some of the same steps; the log names the lock's holder | Wait; a dead run's locks expire after their lease. A retry of the same `--label` that exits 4 waited the lease: the other try still runs (a zombie) |
 | Exit 130, cancelled | The logs: SIGTERM (a pod evicted, a timeout) or Ctrl-C | Run it again with `--resume`: running steps ended their batch |
 | `etl check` exit 5 | The `FAIL` lines: which resource, why | Fix the network, the credentials or the setting; check again |
 | Orphans waiting | `etl parked list <queue>` | Load their parents; `crm.parked` replays them |
 | Change log lag growing | The `EtlChangesLagging` alert | Is the sync scheduled? Is the slot/stream kept? |
 | Debezium message rejected | The dead letter topic (`changes.dead_letter_topic`) | The `etl.error` header says why |
+
+## Known limitations
+
+Behaviours accepted in this release, each documented where it applies.
+
+| Behaviour | Why | What to do |
+| --- | --- | --- |
+| `etl cutover report --counts-only` exits 0 (`COUNTED`) whatever the counts, even 10 source rows against none in the target | It counts the rows and compares none: there is no verdict to fail | Read the counts, never sign them off; the sign-off is a full report ({doc}`cutover-runbook`) |
+| The `FAILED <reason>` line of a command that fails, and the JSON summary of `etl run`, are redacted by the built-in names only, not those of `logging.redact` | The settings may be what failed, so the line does without them | Give secrets a built-in name (`password`, `token`, `secret`...) where they may show; the logs and the run ledger use `logging.redact` too ({doc}`security`) |
+| `etl cutover record` adopts a report of 0.1.0 that was edited and sealed again: `verify` then says `ADOPTED` | 0.1.0 recorded no report in the run ledger: only the seal vouches for it, and anyone can seal again | Record only the copy kept where it was saved, whose SHA-256 the sign-off quotes; `ADOPTED` names who recorded it, and when |
+| A Postgres statement past its `statement_timeout` is retried, as a cancel is, when the session's messages are not in English | A timeout and a cancel share their SQLSTATE (57014): only the English message tells them apart | `ALTER ROLE etl SET lc_messages = 'C'`; `etl check` warns of a session in another language ({doc}`deployment`) |
+| On Oracle, deleting by a column holding `''` deletes nothing for that row, and raises nothing | Oracle stores `''` as NULL, which matches no row; the writer refuses a NULL (`None`) in a column to delete by, not `''` | Delete by columns never empty, such as the key |
+| On MySQL and SQL Server, the stack trace logged with a failed step can quote the value of a duplicate key | The message the ETL keeps (logs, run ledger) cuts it; the driver's error, chained to it, still has it | Treat the logs as holding personal data: who reads them, their retention ({doc}`security`) |
+| The key cache registers again a key it evicted: one more round trip to the key registry, nothing written twice | The cache holds `tuning.key_cache_memory` of keys in memory and `key_cache_disk` of them on disk, and drops the least recently used past both; the registry still has them | Size the memory to the keys a job touches ([Several processes for one pipeline](#several-processes-for-one-pipeline), {doc}`tuning`), or give the disk tier more |

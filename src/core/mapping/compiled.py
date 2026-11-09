@@ -2,18 +2,30 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 import dataclasses
+import enum
+import hashlib
 import threading
 import typing
 
 from core import contract
 from core import keys as core_keys
-from core.mapping import privacy
+from core.mapping import casts
 from core.mapping import results
 from core.mapping import transforms
 from core.mapping import types
 from shared import utils
+
+# What a field makes of one row: the value (None on an issue), the issue,
+# and, for a key field, the canonical natural key the value derives from.
+type _Outcome = tuple[
+    object, results.MappingIssue | None, tuple[str, ...] | None
+]
+# Maps one row; the sequence identifies the record, for anonymizing.
+type _Runner = Callable[[Mapping[str, object], Sequence[str]], _Outcome]
+type _Reader = Callable[[Mapping[str, object]], list[object]]
+type _Settler = Callable[[object, list[object], Sequence[str]], _Outcome]
 
 
 class IncompleteKeyError(ValueError):
@@ -33,6 +45,10 @@ class CompiledField:
         maker: For a primary or foreign key, the key maker of its entity.
         anonymize: Replaces the value of a personal column, when its data
             must not leave production.
+        run: Maps one row, compiled once from the above: the sources, the
+            transform, the default, the cast and the anonymizer are chosen
+            here, not at every row. A key field derives its natural key
+            once and returns it with the value.
 
     The issues of a personal column (`spec.personal`) never carry its value,
     in their value or their message: they go to the quarantine, the issue
@@ -41,11 +57,15 @@ class CompiledField:
 
     spec: contract.FieldSpec
     transform: transforms.Transform
-    fn: transforms.TransformFn
-    target_type: types.TargetType | None
+    fn: types.TransformFn
+    target_type: casts.TargetType | None
     is_key: bool = False
     maker: core_keys.KeyMaker | None = None
-    anonymize: privacy.Anonymizer | None = None
+    anonymize: types.Anonymizer | None = None
+    run: _Runner = dataclasses.field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "run", _runner(self))
 
     def natural_key(self, row: Mapping[str, object]) -> tuple[str, ...]:
         """Returns the canonical natural key a key field reads in `row`."""
@@ -67,78 +87,10 @@ class CompiledField:
         Returns:
             The value (None on an issue), and the issue, if any.
         """
-        values = [
-            None if transforms.is_empty(value) else value
-            for value in (
-                source_value(row, source) for source in self.spec.sources
-            )
-        ]
-        value, issue = self._transformed(values)
-        if issue is not None:
-            return None, issue
-        if value is None:
-            if self.spec.required or self.is_key:
-                return None, self._issue(
-                    "is required but empty", _first(values)
-                )
-            return None, None
-        return self._typed(value, record)
+        value, issue, _ = self.run(row, record)
+        return value, issue
 
-    def _transformed(
-        self, values: Sequence[object]
-    ) -> tuple[object, results.MappingIssue | None]:
-        """The value of the transform, or the default when it is empty."""
-        spec = self.spec
-        untranslated: transforms.UnmappedValueError | None = None
-        try:
-            value = self.fn(*values, **spec.params)
-        except transforms.UnmappedValueError as exc:
-            value, untranslated = None, exc
-        except IncompleteKeyError as exc:
-            return None, self._issue(str(exc), _first(values))
-        # A custom transform choking on legacy data is an issue of that row.
-        except Exception as exc:  # pylint: disable=broad-exception-caught
-            kind = type(exc).__name__
-            failed = f"transform '{self.transform.name}' failed: {kind}"
-            return None, self._issue(
-                f"{failed}: {exc}", _first(values), redacted=failed
-            )
-        if not transforms.is_empty(value):
-            return value, None
-        if spec.default is not None:
-            return spec.default, None
-        if untranslated is not None:
-            return None, self._issue(
-                str(untranslated),
-                untranslated.value,
-                redacted="no translation for the value",
-            )
-        return None, None
-
-    def _typed(
-        self, value: object, record: Sequence[str]
-    ) -> tuple[object, results.MappingIssue | None]:
-        """The value cast to the target type, then anonymized."""
-        if self.target_type is not None:
-            try:
-                value = self.target_type.cast(value, self.spec.format)
-            except types.CastError as exc:
-                return None, self._issue(str(exc), value, exc.redacted)
-
-        if self.anonymize is not None:
-            value = self.anonymize(value, record)
-            if self.target_type is not None:
-                # The fake value must fit the column as the real one did.
-                try:
-                    value = self.target_type.cast(value)
-                except types.CastError as exc:
-                    return None, self._issue(
-                        f"the anonymized value does not fit: {exc.redacted}",
-                        None,
-                    )
-        return value, None
-
-    def _issue(
+    def issue(
         self, message: str, value: object, redacted: str | None = None
     ) -> results.MappingIssue:
         """Returns an issue of the field; without the value for a personal
@@ -148,6 +100,14 @@ class CompiledField:
                 self.spec.target, message if redacted is None else redacted
             )
         return results.MappingIssue(self.spec.target, message, value)
+
+
+class _Role(enum.Enum):
+    """What the natural key of a field serves in the record."""
+
+    NONE = enum.auto()
+    PRIMARY = enum.auto()
+    REFERENCE = enum.auto()
 
 
 class CompiledMapping:
@@ -173,9 +133,9 @@ class CompiledMapping:
         self._row_split = row_split
         self.references = references or {}
         self._key_field = next((f for f in fields if f.spec.primary_key), None)
-        self._reference_fields = [
-            f for f in fields if f.spec.target in self.references
-        ]
+        self._plan = tuple(
+            (f.spec.target, f.run, self._role(f), f) for f in fields
+        )
         sources: set[str] = set()
         for f in fields:
             sources.update(f.spec.sources)
@@ -309,29 +269,24 @@ class CompiledMapping:
         """
         data: dict[str, object] = {}
         issues: list[results.MappingIssue] = []
-
-        record = self._record(row, source_key) if self._anonymizes else ()
-        for f in self._fields:
-            value, issue = f.apply(row, record)
-            data[f.spec.target] = value
-            if issue is not None:
-                issues.append(issue)
-
         key: str | None = None
         natural: tuple[str, ...] | None = None
-        if (
-            self._key_field is not None
-            and data[self._key_field.spec.target] is not None
-        ):
-            key = str(data[self._key_field.spec.target])
-            natural = self._key_field.natural_key(row)
-
         # Set foreign keys were derived from complete natural keys.
-        foreign_keys = {
-            f.spec.target: f.natural_key(row)
-            for f in self._reference_fields
-            if data[f.spec.target] is not None
-        }
+        foreign_keys: dict[str, tuple[str, ...]] = {}
+
+        record = self._record(row, source_key) if self._anonymizes else ()
+        for target, run, role, field in self._plan:
+            value, issue, derived = run(row, record)
+            data[target] = value
+            if issue is not None:
+                issues.append(issue)
+            elif value is not None and role is not _Role.NONE:
+                if derived is None:
+                    derived = field.natural_key(row)
+                if role is _Role.PRIMARY:
+                    key, natural = str(value), derived
+                else:
+                    foreign_keys[target] = derived
 
         return results.MappedRecord(
             data,
@@ -412,17 +367,30 @@ class CompiledMapping:
     def splits_rows(self) -> bool:
         return self._row_split is not None
 
+    def _role(self, field: CompiledField) -> _Role:
+        if field is self._key_field:
+            return _Role.PRIMARY
+        if field.spec.target in self.references:
+            return _Role.REFERENCE
+        return _Role.NONE
+
     def _record(
         self, row: Mapping[str, object], source_key: str | None
     ) -> tuple[str, ...]:
         """Identifies the record a row maps to, for anonymizing: its natural
-        key, else the source key."""
+        key, else the source key, else the row itself.
+
+        Without the last, the rows of a mapping without identity would all
+        share one date shift: one real date known, every other follows. A
+        row is its own identity only while it stays the same: changed, its
+        dates get another shift.
+        """
         if self._key_field is not None:
             try:
                 return self._key_field.natural_key(row)
             except core_keys.MissingKeyComponentError:
-                return ()
-        return () if source_key is None else (source_key,)
+                return _row_identity(row)
+        return _row_identity(row) if source_key is None else (source_key,)
 
     def _failed(
         self,
@@ -431,7 +399,12 @@ class CompiledMapping:
         exc: Exception,
         source_key: str | None,
     ) -> results.MappedRecord:
-        message = f"{kind} '{hook.name}' failed: {type(exc).__name__}: {exc}"
+        """The record of a row whose row filter or splitter failed: an issue
+        of the whole row, on one line."""
+        message = (
+            f"{kind} '{hook.name}' failed: {type(exc).__name__}:"
+            f" {utils.one_line(str(exc))}"
+        )
         issue = results.MappingIssue(results.ROW, message)
         return results.MappedRecord(
             {},
@@ -445,7 +418,7 @@ class CompiledMapping:
 
 def key_function(
     maker: core_keys.KeyMaker, sources: tuple[str, ...]
-) -> transforms.TransformFn:
+) -> types.TransformFn:
     """Returns the function deriving a surrogate key from `sources`.
 
     The function returns None when every component is empty, and raises
@@ -453,21 +426,13 @@ def key_function(
     """
 
     def key(*values: object) -> object:
-        if all(value is None for value in values):
-            return None
-        missing = [
-            source for source, value in zip(sources, values) if value is None
-        ]
-        if missing:
-            raise IncompleteKeyError(
-                f"incomplete natural key: {', '.join(missing)} empty"
-            )
-        return maker.key(maker.canonical(values))
+        natural = _natural_key(maker, sources, list(values))
+        return None if natural is None else maker.key(natural)
 
     return key
 
 
-def lookup_function(table: Mapping[str, str]) -> transforms.TransformFn:
+def lookup_function(table: Mapping[str, str]) -> types.TransformFn:
     """Returns the function translating values through a lookup table.
 
     The function raises `UnmappedValueError` for a value not in the table.
@@ -483,6 +448,202 @@ def lookup_function(table: Mapping[str, str]) -> transforms.TransformFn:
         raise transforms.UnmappedValueError(value)
 
     return lookup
+
+
+def _runner(field: CompiledField) -> _Runner:
+    """Compiles a field into the function mapping one row."""
+    read = _reader(field.spec.sources)
+    settle = _settler(field)
+    if field.maker is not None:
+        return _key_runner(field, read, settle)
+    return _value_runner(field, read, settle)
+
+
+def _value_runner(
+    field: CompiledField, read: _Reader, settle: _Settler
+) -> _Runner:
+    """The runner of a field computing its value with its transform."""
+    fn, params = field.fn, field.spec.params
+    default = field.spec.default
+
+    if fn is transforms.IDENTITY.fn and len(field.spec.sources) == 1:
+
+        def run_source(
+            row: Mapping[str, object], record: Sequence[str]
+        ) -> _Outcome:
+            values = read(row)
+            return settle(values[0], values, record)
+
+        return run_source
+
+    def run(row: Mapping[str, object], record: Sequence[str]) -> _Outcome:
+        values = read(row)
+        try:
+            value = fn(*values, **params) if params else fn(*values)
+        except transforms.UnmappedValueError as exc:
+            if default is not None:
+                return settle(default, values, record)
+            return (
+                None,
+                field.issue(
+                    str(exc), exc.value, redacted="no translation for the value"
+                ),
+                None,
+            )
+        except IncompleteKeyError as exc:
+            return None, field.issue(str(exc), _first(values)), None
+        # A custom transform choking on legacy data is an issue of that row.
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            return None, _transform_failed(field, exc, values), None
+        if transforms.is_empty(value):
+            value = None
+        return settle(value, values, record)
+
+    return run
+
+
+def _key_runner(
+    field: CompiledField, read: _Reader, settle: _Settler
+) -> _Runner:
+    """The runner of a primary or foreign key: the natural key is derived
+    once, for the value and for the record."""
+    maker = field.maker
+    if maker is None:
+        raise ValueError(f"{field.spec.target!r} has no key maker")
+    sources = field.spec.sources
+
+    def run(row: Mapping[str, object], record: Sequence[str]) -> _Outcome:
+        values = read(row)
+        try:
+            natural = _natural_key(maker, sources, values)
+            key = None if natural is None else maker.key(natural)
+        except IncompleteKeyError as exc:
+            return None, field.issue(str(exc), _first(values)), None
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            return None, _transform_failed(field, exc, values), None
+        value, issue, _ = settle(key, values, record)
+        return value, issue, natural
+
+    return run
+
+
+def _settler(field: CompiledField) -> _Settler:
+    """The function finishing a value: the default of an empty one, the
+    cast to the target type, the anonymizing."""
+    default = field.spec.default
+    required = field.spec.required or field.is_key
+    target_type, anonymize = field.target_type, field.anonymize
+    cast = (
+        target_type.caster(field.spec.format)
+        if target_type is not None
+        else None
+    )
+    recast = target_type.caster() if target_type is not None else None
+
+    def settle(
+        value: object, values: list[object], record: Sequence[str]
+    ) -> _Outcome:
+        if value is None:
+            if default is None:
+                if required:
+                    return (
+                        None,
+                        field.issue("is required but empty", _first(values)),
+                        None,
+                    )
+                return None, None, None
+            value = default
+        if cast is not None:
+            try:
+                value = cast(value)
+            except casts.CastError as exc:
+                return None, field.issue(str(exc), value, exc.redacted), None
+        if anonymize is not None:
+            value = anonymize(value, record)
+            if recast is not None:
+                # The fake value must fit the column as the real one did.
+                try:
+                    value = recast(value)
+                except casts.CastError as exc:
+                    return (
+                        None,
+                        field.issue(
+                            "the anonymized value does not fit:"
+                            f" {exc.redacted}",
+                            None,
+                        ),
+                        None,
+                    )
+        return value, None, None
+
+    return settle
+
+
+def _reader(sources: tuple[str, ...]) -> _Reader:
+    """The function reading the source values of a field in a row, an empty
+    value (None, blank text) as None."""
+    is_empty = transforms.is_empty
+    if any("." in source for source in sources):
+
+        def read_paths(row: Mapping[str, object]) -> list[object]:
+            return [
+                None if is_empty(value) else value
+                for value in (source_value(row, s) for s in sources)
+            ]
+
+        return read_paths
+
+    if len(sources) == 1:
+        (source,) = sources
+
+        def read_one(row: Mapping[str, object]) -> list[object]:
+            value = row[source]
+            return [None if is_empty(value) else value]
+
+        return read_one
+
+    def read(row: Mapping[str, object]) -> list[object]:
+        return [
+            None if is_empty(value) else value
+            for value in (row[s] for s in sources)
+        ]
+
+    return read
+
+
+def _natural_key(
+    maker: core_keys.KeyMaker, sources: tuple[str, ...], values: list[object]
+) -> tuple[str, ...] | None:
+    """The canonical natural key of `values`: None when every component is
+    empty.
+
+    Raises:
+        IncompleteKeyError: When only some components are empty.
+    """
+    if None in values:
+        missing = [s for s, value in zip(sources, values) if value is None]
+        if len(missing) == len(values):
+            return None
+        raise IncompleteKeyError(
+            f"incomplete natural key: {', '.join(missing)} empty"
+        )
+    return maker.canonical(values)
+
+
+def _transform_failed(
+    field: CompiledField, exc: Exception, values: list[object]
+) -> results.MappingIssue:
+    kind = type(exc).__name__
+    failed = f"transform '{field.transform.name}' failed: {kind}"
+    return field.issue(
+        f"{failed}: {utils.one_line(str(exc))}", _first(values), redacted=failed
+    )
+
+
+def _row_identity(row: Mapping[str, object]) -> tuple[str, ...]:
+    """A row as an identity: the digest of its columns and values."""
+    text = repr(sorted((str(name), repr(value)) for name, value in row.items()))
+    return ("row", hashlib.sha256(text.encode()).hexdigest())
 
 
 def source_value(row: Mapping[str, object], source: str) -> object:

@@ -6,7 +6,8 @@ bearer tokens, private keys, and the values database errors quote (the
 parameters SQLAlchemy prints, the rows and keys Postgres, SQL Server and
 MySQL quote). `RedactingFilter` applies it to every part of a log record:
 message, extra fields, and the exception and its traceback, which it
-renders once, redacted, for every formatter and handler.
+renders once, redacted, for every formatter and handler. `describe_error`
+renders an exception the same way for the other sinks (traces).
 
 It is a safety net, not a guarantee: it hides what it recognises. Data
 quoted in free text (`ValueError(f"bad email {email}")`) is not
@@ -203,19 +204,39 @@ def logged_error(record: logging.LogRecord) -> LoggedError | None:
     if isinstance(stored, LoggedError):
         return stored
     if record.exc_info and record.exc_info[1] is not None:
-        return _describe(record.exc_info[1], ())
+        return describe_error(record.exc_info[1])
     return None
 
 
-def _describe(error: BaseException, names: Collection[str]) -> LoggedError:
+def describe_error(
+    error: BaseException, names: Collection[str] = ()
+) -> LoggedError:
+    """An exception as the sinks may show it: its text and stack redacted.
+
+    Every sink outside the process (logs, traces) shows this, never the
+    exception itself. An exception whose `str()` raises is described by its
+    type.
+
+    Args:
+        error: The exception.
+        names: More secret names, on top of `SECRET_NAMES`.
+    """
     return LoggedError(
         type=type(error).__qualname__,
         module=type(error).__module__,
-        message=redact_text(str(error), names),
+        message=redact_text(_text_of(error), names),
         stack_trace=redact_text(
             "".join(traceback.format_exception(error)), names
         ),
     )
+
+
+def _text_of(error: BaseException) -> str:
+    try:
+        return str(error)
+    # What a broken `__str__` raises may quote the data: never shown.
+    except Exception:  # pylint: disable=broad-exception-caught
+        return f"<{type(error).__qualname__}: str() failed>"
 
 
 class RedactingFilter(logging.Filter):
@@ -251,7 +272,7 @@ class RedactingFilter(logging.Filter):
             else:
                 setattr(record, key, redact_value(value, self.names))
         if record.exc_info and record.exc_info[1] is not None:
-            error = _describe(record.exc_info[1], self.names)
+            error = describe_error(record.exc_info[1], self.names)
             setattr(record, ERROR_ATTRIBUTE, error)
             record.exc_text = error.stack_trace.rstrip("\n")
         elif record.exc_text:

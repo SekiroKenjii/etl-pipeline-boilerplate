@@ -118,6 +118,24 @@ def test_errors_are_redacted() -> None:
     assert "etl:***@db" in json.dumps(events)
 
 
+def test_errors_hide_the_secret_names_of_the_settings() -> None:
+    events: list[dict[str, Any]] = []
+
+    class Leaky(pipeline.BaseOrchestrator):
+
+        def steps(self) -> Sequence[contract.PipelineStep]:
+            def step(ctx: contract.ETLContext, upstream: Any) -> Any:
+                raise contract.FatalError("bad row: iban=DE8937040044")
+
+            return [contract.PipelineStep("customer", step)]
+
+    listener = lineage.LineageListener(events.append, redact=("iban",))
+    Leaky(listeners=[listener]).run(fakes.make_context("crm"))
+
+    assert [e for e in events if e["eventType"] == "FAIL"]
+    assert "DE8937040044" not in json.dumps(events)
+
+
 def test_failures_carry_their_error() -> None:
     events, _ = _run(fail=True)
 

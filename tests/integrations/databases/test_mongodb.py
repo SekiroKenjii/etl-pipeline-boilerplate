@@ -332,7 +332,7 @@ class TestBookkeeping:
             for i in range(600)
         ]
 
-        def use(r: keys.CachedKeyRegistry) -> Any:
+        def use(r: keys.TieredKeyCache) -> Any:
             with concurrent.futures.ThreadPoolExecutor(4) as threads:
                 list(threads.map(lambda _: r.register(entries), range(4)))
             return (
@@ -344,8 +344,12 @@ class TestBookkeeping:
                 r.natural_key("crm.order", "k1"),
             )
 
-        cached = keys.CachedKeyRegistry(registry)
-        assert use(cached) == (600, {"k1"}, ("1", "Zürich"), None)
+        # Memory for about 200 of the 600 keys: the rest on disk.
+        with keys.TieredKeyCache(
+            registry, memory_budget=64 * 1024, disk_budget=10**6
+        ) as cached:
+            assert use(cached) == (600, {"k1"}, ("1", "Zürich"), None)
+            assert cached.disk_entries > 0
 
     def test_state_round_trips(self, mongo: mongodb.MongoDatabase) -> None:
         store = mongodb.MongoStateStore(mongo)
@@ -588,6 +592,22 @@ class TestDeletesAndUpdates:
         assert (updated.created, updated.updated, deleted) == (0, 2, 3)
         assert [d["_id"] for d in mongo.collection("items").find()] == [2]
 
+    def test_null_in_a_field_to_delete_by_is_refused(
+        self, mongo: mongodb.MongoDatabase
+    ) -> None:
+        # `{"parent": None}` matches every document without a parent too.
+        mongo.collection("items").insert_many([
+            {"_id": 1, "parent": 1},
+            {"_id": 2},
+            {"_id": 3, "parent": None},
+        ])
+        writer = mongodb.MongoTableWriter(mongo)
+
+        with pytest.raises(contract.FatalError, match="NULL"):
+            writer.delete("items", [{"parent": 1}, {"parent": None}])
+
+        assert mongo.collection("items").count_documents({}) == 3
+
     def test_the_crosswalk_lists_its_keys(
         self, mongo: mongodb.MongoDatabase
     ) -> None:
@@ -657,15 +677,40 @@ def test_the_run_ledger_and_lock(mongo: mongodb.MongoDatabase) -> None:
         ledger.start(ctx.run, "h", {"user": "an"})
         ledger.finish(result)
         taken = lock.acquire("p", "a", 60), lock.acquire("p", "b", 60)
+        held = lock.holder("p")
         lock.release("p", "a")
-        return ledger.recent("crm.load"), taken, lock.acquire("p", "b", 60)
+        retaken = lock.acquire("p", "b", 60)
+        lock.acquire("q", "dead", -1)
+        expired = lock.holder("q")
+        lock.acquire("q", "retry", 60)
+        lock.release("q", "dead")
+        return (
+            ledger.recent("crm.load"),
+            taken,
+            held,
+            retaken,
+            expired,
+            (lock.renew("q", "dead", 60), lock.holder("q")),
+        )
 
-    (record,), taken, retaken = use(ledger)
+    (record,), taken, held, retaken, expired, back = use(ledger)
     assert record.status is contract.ETLStatus.SUCCESS
     assert record.meta == {"user": "an"}
-    assert (taken, retaken) == ((True, False), True)
+    assert (taken, held, retaken, expired) == ((True, False), "a", True, None)
+    # The first owner, back: it frees and renews nothing of the retry's.
+    assert back == (False, "retry")
 
 
 def test_the_steps_of_a_run(mongo: mongodb.MongoDatabase) -> None:
     mongodb.create_etl_collections(mongo)
     ledgers.check_steps(mongodb.MongoRunLedger(mongo))
+
+
+def test_the_latest_run_that_loaded(mongo: mongodb.MongoDatabase) -> None:
+    mongodb.create_etl_collections(mongo)
+    ledgers.check_latest(mongodb.MongoRunLedger(mongo))
+
+
+def test_the_last_run_of_a_label(mongo: mongodb.MongoDatabase) -> None:
+    mongodb.create_etl_collections(mongo)
+    ledgers.check_last_run(mongodb.MongoRunLedger(mongo))

@@ -409,7 +409,7 @@ def test_crm_sync_from_debezium_topics(
         with bootstrap.bootstrap(
             "test", directory=tmp_path / "none", overrides=settings, logs=False
         ) as application:
-            assert application.kernel.check()["kafka.main"] == "ok"
+            assert application.kernel.check()["kafka.main"].ok
             return application.kernel.run("crm.sync")
 
     try:

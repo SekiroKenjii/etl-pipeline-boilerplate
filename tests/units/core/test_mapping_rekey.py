@@ -6,6 +6,7 @@ in the `keys` fingerprint the kernel compares between runs.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 import dataclasses
 import pathlib
 
@@ -14,7 +15,10 @@ import pytest
 from core import contract
 from core import keys as core_keys
 from core import mapping
+from core import pipeline
+from core import runtime
 from core.mapping import catalog as mapping_catalog
+from core.runtime import names
 from modules.crm import module as crm_module
 from modules.crm import settings as crm_settings
 from tests.factories import mapping_specs
@@ -179,7 +183,10 @@ class TestKeyFingerprint:
         self, catalog: contract.MappingCatalog, secret: bytes | None
     ) -> dict[str, str]:
         text = mapping.key_fingerprint(catalog, secret)
-        return dict(entry.split(":") for entry in text.split(","))
+        return {
+            name: value
+            for name, _, value in (e.rpartition(":") for e in text.split(","))
+        }
 
     def test_one_entry_per_mapping_that_changes_with_its_keys(self) -> None:
         catalog = mapping_specs.catalog(CUSTOMER, ORDER)
@@ -206,7 +213,12 @@ class TestKeyFingerprint:
             SECRET,
         )
 
-        assert sorted(before) == ["customer", "order"]
+        assert sorted(before) == [
+            "customer",
+            "customer:natural_key",
+            "order",
+            "order:natural_key",
+        ]
         # Rotating the secret changes the HMAC keys only.
         assert rotated["customer"] == before["customer"]
         assert rotated["order"] != before["order"]
@@ -228,6 +240,48 @@ class TestKeyFingerprint:
             catalog, SECRET
         ) == mapping.key_fingerprint(edited, SECRET)
 
+    def test_replacing_the_natural_key_columns_changes_its_entry(
+        self,
+    ) -> None:
+        before = self._entries(mapping_specs.catalog(CUSTOMER, ORDER), SECRET)
+        replaced = _with_key_sources(CUSTOMER, "CUST_ID")
+        reordered = _with_key_sources(
+            _with_key_sources(CUSTOMER, "BRANCH", "CUST_NO"),
+            "CUST_NO",
+            "BRANCH",
+        )
+        now = self._entries(mapping_specs.catalog(replaced, ORDER), SECRET)
+
+        changed = {name for name in before if before[name] != now.get(name)}
+        assert changed == {"customer:natural_key"}
+        assert self._entries(
+            mapping_specs.catalog(reordered, ORDER), SECRET
+        ) != self._entries(
+            mapping_specs.catalog(
+                _with_key_sources(CUSTOMER, "BRANCH", "CUST_NO"), ORDER
+            ),
+            SECRET,
+        )
+        # Compiled again, an unchanged mapping keeps its entries.
+        assert now == self._entries(
+            mapping_specs.catalog(replaced, ORDER), SECRET
+        )
+
+    def test_a_fingerprint_recorded_before_the_natural_key_still_matches(
+        self,
+    ) -> None:
+        # What 0.1.0 recorded for these mappings: a run of this version must
+        # find its keys unchanged, not ask for --rekey.
+        recorded = {"customer": "292b36cb5256", "order": "1372a31424b2"}
+
+        now = self._entries(mapping_specs.catalog(CUSTOMER, ORDER), SECRET)
+
+        assert {name: now[name] for name in recorded} == recorded
+        assert sorted(now.keys() - recorded.keys()) == [
+            "customer:natural_key",
+            "order:natural_key",
+        ]
+
     def test_the_module_fingerprint_has_it_and_never_the_secret(
         self, tmp_path: pathlib.Path
     ) -> None:
@@ -246,3 +300,103 @@ class TestKeyFingerprint:
         assert found["keys"] == mapping.key_fingerprint(
             mapping_catalog.load_catalog(path), SECRET
         )
+
+
+def _with_key_sources(
+    spec: contract.MappingSpec, *sources: str
+) -> contract.MappingSpec:
+    """`spec` with its primary key read from `sources`."""
+    return dataclasses.replace(
+        spec,
+        fields=tuple(
+            dataclasses.replace(f, sources=sources) if f.primary_key else f
+            for f in spec.fields
+        ),
+    )
+
+
+class _Mapped(runtime.Module):
+    """A module whose keys are those of a mapping catalog."""
+
+    def __init__(self, catalog: contract.MappingCatalog) -> None:
+        self.catalog = catalog
+
+    @property
+    def name(self) -> str:
+        return "mapped"
+
+    def pipelines(self) -> dict[str, runtime.PipelineFactory]:
+        return {
+            "load": lambda resources: _Nothing(),
+            "sync": lambda resources: _Nothing(),
+        }
+
+    def fingerprint(self) -> dict[str, str]:
+        return {runtime.KEYS: mapping.key_fingerprint(self.catalog, SECRET)}
+
+
+class _Nothing(pipeline.BaseOrchestrator):
+
+    def steps(self) -> Sequence[contract.PipelineStep]:
+        def nothing(
+            ctx: contract.ETLContext, upstream: object
+        ) -> contract.ETLResult:
+            del ctx, upstream  # Unused.
+            return contract.ETLResult()
+
+        return [contract.PipelineStep("nothing", nothing)]
+
+
+class TestTheKernelAndTheNaturalKey:
+
+    def _kernel(
+        self, module: runtime.Module
+    ) -> tuple[runtime.Kernel, runtime.InMemoryRunLedger]:
+        ledger = runtime.InMemoryRunLedger()
+        kernel = runtime.Kernel(
+            runtime.Resources(
+                [runtime.ResourceSpec(names.LEDGER, lambda r: ledger)]
+            ),
+            [module],
+        )
+        return kernel, ledger
+
+    def test_a_sibling_is_refused_once_the_natural_key_changed(self) -> None:
+        module = _Mapped(mapping_specs.catalog(CUSTOMER, ORDER))
+        kernel, ledger = self._kernel(module)
+        kernel.run("mapped.load")
+        module.catalog = mapping_specs.catalog(
+            _with_key_sources(CUSTOMER, "CUST_ID"), ORDER
+        )
+
+        with pytest.raises(
+            contract.PipelineConfigError, match="customer:natural_key"
+        ):
+            kernel.run("mapped.sync")
+        rekeyed = kernel.run("mapped.sync", rekey=True)
+
+        assert rekeyed.result is not None
+        record = ledger.get(rekeyed.result.run_id)
+        assert record is not None
+        assert "rekeyed_from" in record.meta
+
+    def test_the_first_run_after_the_upgrade_is_not_refused(self) -> None:
+        module = _Mapped(mapping_specs.catalog(CUSTOMER, ORDER))
+        kernel, ledger = self._kernel(module)
+        run = contract.ETLRunInfo("mapped.load")
+        ledger.start(
+            run, "h", {runtime.KEYS: "customer:292b36cb5256,order:1372a31424b2"}
+        )
+        result = contract.PipelineResult(
+            pipeline_name="mapped.load", run_id=run.run_id
+        )
+        result.complete(contract.ETLStatus.SUCCESS)
+        ledger.finish(result)
+
+        outcome = kernel.run("mapped.sync")
+
+        assert outcome.exit_code is runtime.ExitCode.SUCCESS
+        assert outcome.result is not None
+        record = ledger.get(outcome.result.run_id)
+        assert record is not None
+        assert "rekeyed_from" not in record.meta

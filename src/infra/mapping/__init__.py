@@ -1,7 +1,4 @@
-"""Mapping workbooks (xlsx): reader and template.
-
-Needs the `mappings` extra (openpyxl).
-"""
+"""Mapping workbooks (xlsx): reader and template."""
 
 from infra.mapping.reader import XlsxMappingReader
 from infra.mapping.template import write_template

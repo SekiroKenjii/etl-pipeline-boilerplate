@@ -15,18 +15,18 @@ Avro, pass a `decode` built on a Schema Registry deserializer.
 from __future__ import annotations
 
 import base64
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 import datetime
 import decimal
 import json
 import logging
-from typing import Any
 
 from core import contract
+from infra.messaging import types as messaging_types
+from shared import utils
 
-type Decoder = Callable[[bytes], Any]
-
-_OPERATIONS = {
+# Looked up with whatever an event holds: an unhashable `op` is no change.
+_OPERATIONS: dict[object, contract.ChangeOperation] = {
     "c": contract.ChangeOperation.INSERT,
     "r": contract.ChangeOperation.INSERT,  # A row of Debezium's snapshot.
     "u": contract.ChangeOperation.UPDATE,
@@ -41,9 +41,10 @@ class _NotAChange(ValueError):
     """A message that is not a change event of the table."""
 
 
-def decode_json(data: bytes) -> Any:
+def decode_json(data: bytes) -> utils.JsonValue:
     """Decodes a JSON key or value, with or without its schema."""
-    return json.loads(data)
+    decoded: utils.JsonValue = json.loads(data)
+    return decoded
 
 
 class DebeziumChangeSource(contract.IChangeSource):
@@ -71,7 +72,7 @@ class DebeziumChangeSource(contract.IChangeSource):
         table: str,
         *,
         key: Sequence[str] | None = None,
-        decode: Decoder = decode_json,
+        decode: messaging_types.Decoder = decode_json,
         dead_letters: contract.IDeadLetters | None = None,
     ) -> None:
         """Initializes the source.
@@ -183,6 +184,7 @@ class DebeziumChangeSource(contract.IChangeSource):
         Raises:
             _NotAChange: If it is not a change event.
         """
+        committed: object
         try:
             value = self._decode(message.value or b"")
             payload, schema = _unwrap(value)
@@ -213,8 +215,8 @@ class DebeziumChangeSource(contract.IChangeSource):
         )
 
     def _key_of(
-        self, message: contract.Message, row: Mapping[str, Any], where: str
-    ) -> tuple[Any, ...]:
+        self, message: contract.Message, row: Mapping[str, object], where: str
+    ) -> tuple[object, ...]:
         """The primary key of the row: its key columns, or the message key."""
         if self._key is not None:
             try:
@@ -243,7 +245,7 @@ class DebeziumChangeLog(contract.IChangeLog):
         *,
         prefix: str | None = None,
         topics: Mapping[str, str] | None = None,
-        decode: Decoder = decode_json,
+        decode: messaging_types.Decoder = decode_json,
         dead_letters: contract.IDeadLetters | None = None,
     ) -> None:
         self._messages = messages
@@ -269,7 +271,7 @@ class DebeziumChangeLog(contract.IChangeLog):
         )
 
 
-def _unwrap(value: Any) -> tuple[Any, Any]:
+def _unwrap(value: object) -> tuple[object, object]:
     """The payload and schema of a value of the JSON converter."""
     if isinstance(value, dict) and value.keys() == {"schema", "payload"}:
         return value["payload"], value["schema"]
@@ -277,8 +279,8 @@ def _unwrap(value: Any) -> tuple[Any, Any]:
 
 
 def _envelope(
-    payload: dict[str, Any], schema: Any
-) -> tuple[contract.ChangeOperation | None, dict[str, Any], Any]:
+    payload: Mapping[str, object], schema: object
+) -> tuple[contract.ChangeOperation | None, contract.Row, object]:
     """The operation, row and commit time of a change envelope."""
     op = payload["op"]
     if op == "t":
@@ -292,7 +294,7 @@ def _envelope(
     row = payload[side]
     if not isinstance(row, dict):
         raise ValueError(f"no {side!r} row")
-    source = payload.get("source") or {}
+    source = _object(payload.get("source") or {})
     return (
         operation,
         _typed(row, _fields(schema, side)),
@@ -301,8 +303,8 @@ def _envelope(
 
 
 def _flattened(
-    payload: dict[str, Any],
-) -> tuple[contract.ChangeOperation | None, dict[str, Any]]:
+    payload: Mapping[str, object],
+) -> tuple[contract.ChangeOperation | None, contract.Row]:
     """The operation and row of a record of `ExtractNewRecordState`."""
     row = {k: v for k, v in payload.items() if not k.startswith("__")}
     if str(payload.get("__deleted", "")).lower() == "true":
@@ -310,21 +312,28 @@ def _flattened(
     return _OPERATIONS.get(payload.get("__op", "c")), row
 
 
-def _fields(schema: Any, side: str) -> dict[str, dict[str, Any]]:
+def _fields(schema: object, side: str) -> dict[str, Mapping[str, object]]:
     """The schemas of the columns of the `before` or `after` row."""
     if not isinstance(schema, dict):
         return {}
-    for field in schema.get("fields", ()):
+    for field in _objects(schema.get("fields", ())):
         if field.get("field") == side:
-            return {
-                column["field"]: column for column in field.get("fields", ())
-            }
+            return _columns(field.get("fields", ()))
     return {}
 
 
+def _columns(fields: object) -> dict[str, Mapping[str, object]]:
+    found: dict[str, Mapping[str, object]] = {}
+    for column in _objects(fields):
+        name = column["field"]
+        if isinstance(name, str):
+            found[name] = column
+    return found
+
+
 def _typed(
-    row: dict[str, Any], fields: Mapping[str, dict[str, Any]]
-) -> dict[str, Any]:
+    row: contract.Row, fields: Mapping[str, Mapping[str, object]]
+) -> contract.Row:
     """Decodes the values whose schema has a logical type."""
     if not fields:
         return row
@@ -334,29 +343,39 @@ def _typed(
     }
 
 
-def _logical(value: Any, field: dict[str, Any] | None) -> Any:
-    """Decodes a temporal or decimal value of the JSON converter."""
+def _logical(value: object, field: Mapping[str, object] | None) -> object:
+    """Decodes a temporal or decimal value of the JSON converter.
+
+    Raises:
+        TypeError: If the value is not of the type its schema says.
+    """
     if value is None or field is None:
         return value
     match field.get("name"):
         case "io.debezium.time.Date" | "org.apache.kafka.connect.data.Date":
-            return _EPOCH_DATE + datetime.timedelta(days=value)
+            return _EPOCH_DATE + datetime.timedelta(days=_number(value))
         case (
             "io.debezium.time.Timestamp"
             | "org.apache.kafka.connect.data.Timestamp"
         ):
-            return _EPOCH + datetime.timedelta(milliseconds=value)
+            return _EPOCH + datetime.timedelta(milliseconds=_number(value))
         case "io.debezium.time.MicroTimestamp":
-            return _EPOCH + datetime.timedelta(microseconds=value)
+            return _EPOCH + datetime.timedelta(microseconds=_number(value))
         case "io.debezium.time.NanoTimestamp":
-            return _EPOCH + datetime.timedelta(microseconds=value // 1000)
+            return _EPOCH + datetime.timedelta(
+                microseconds=_number(value) // 1000
+            )
         case "io.debezium.time.ZonedTimestamp":
-            return datetime.datetime.fromisoformat(value)
+            return datetime.datetime.fromisoformat(_text(value))
         case "org.apache.kafka.connect.data.Decimal":
-            scale = int(field.get("parameters", {}).get("scale", 0))
-            return _decimal(base64.b64decode(value), scale)
+            parameters = _object(field.get("parameters", {}))
+            scale = int(_text_or_number(parameters.get("scale", 0)))
+            return _decimal(_base64(value), scale)
         case "io.debezium.data.VariableScaleDecimal":
-            return _decimal(base64.b64decode(value["value"]), value["scale"])
+            variable = _object(value)
+            return _decimal(
+                _base64(variable["value"]), _integer(variable["scale"])
+            )
         case _:
             return value
 
@@ -365,3 +384,46 @@ def _decimal(unscaled: bytes, scale: int) -> decimal.Decimal:
     """A decimal sent as its unscaled two's complement big-endian bytes."""
     number = int.from_bytes(unscaled, "big", signed=True)
     return decimal.Decimal(number).scaleb(-scale)
+
+
+def _object(value: object) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise TypeError(f"not an object: {type(value).__name__}")
+    return value
+
+
+def _objects(value: object) -> Iterator[Mapping[str, object]]:
+    if not isinstance(value, Iterable):
+        raise TypeError(f"not an array: {type(value).__name__}")
+    for item in value:
+        yield _object(item)
+
+
+def _number(value: object) -> float:
+    if not isinstance(value, (int, float)):
+        raise TypeError(f"not a number: {type(value).__name__}")
+    return value
+
+
+def _integer(value: object) -> int:
+    if not isinstance(value, int):
+        raise TypeError(f"not an integer: {type(value).__name__}")
+    return value
+
+
+def _text(value: object) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"not a text: {type(value).__name__}")
+    return value
+
+
+def _text_or_number(value: object) -> str | float:
+    if not isinstance(value, (str, int, float)):
+        raise TypeError(f"not a text nor a number: {type(value).__name__}")
+    return value
+
+
+def _base64(value: object) -> bytes:
+    if not isinstance(value, (str, bytes)):
+        raise TypeError(f"not base64: {type(value).__name__}")
+    return base64.b64decode(value)

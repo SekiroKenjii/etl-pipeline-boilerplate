@@ -23,6 +23,7 @@ from infra.database import relational
 from infra.database.relational import bookkeeping
 from infra.database.relational import migrations
 from tests.factories import fakes
+from tests.factories import quarantines
 from tests.integrations.databases import conftest
 from tests.integrations.databases import legacy_etl_tables
 
@@ -191,7 +192,7 @@ def test_tables_of_earlier_code_are_told_upgraded_and_kept(
     # Every record kept; one open entry per record, the latest.
     quarantine = relational.RelationalQuarantine(backend.db, prefix=prefix)
     entries = list(quarantine.entries())
-    assert [e.record["source_key"] for e in entries] == [
+    assert [quarantines.fields(e)["source_key"] for e in entries] == [
         ["1003"],
         ["1003"],
         ["1004"],

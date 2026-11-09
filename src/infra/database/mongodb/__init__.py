@@ -1,4 +1,4 @@
-"""MongoDB, through PyMongo. Needs the `mongodb` extra.
+"""MongoDB, through PyMongo.
 
     from infra.database import mongodb
 

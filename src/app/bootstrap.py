@@ -19,7 +19,7 @@ import json
 import os
 import pathlib
 import subprocess  # nosec B404
-from typing import Any, cast, TextIO
+from typing import cast, TextIO
 
 from app import factories
 from app import secret_managers
@@ -29,12 +29,13 @@ from core import runtime
 from core.observability import listener as run_listener
 from infra import observability
 from infra.observability import lineage as observability_lineage
+from infra.observability import telemetry as otel_telemetry
 
 ENTRY_POINTS = "etl.modules"
 # Read only when `git describe` fails (an image, not a clone).
 BUILD_VARIABLE = "ETL_BUILD"
 
-type ModuleFactory = Callable[[config.AppSettings], runtime.Module]
+type _ModuleFactory = Callable[[config.AppSettings], runtime.Module]
 
 
 @dataclasses.dataclass
@@ -53,7 +54,7 @@ class Application:
     resources: runtime.Resources
     kernel: runtime.Kernel
     logs: observability.Logging | None = None
-    telemetry: Any = None
+    telemetry: otel_telemetry.Telemetry | None = None
 
     def close(self) -> None:
         """Closes the resources, then flushes the traces, metrics and logs."""
@@ -78,7 +79,7 @@ def bootstrap(
     env: str | None = None,
     *,
     directory: pathlib.Path | str = "config",
-    overrides: Mapping[str, Any] | None = None,
+    overrides: Mapping[str, object] | None = None,
     logs: bool = True,
     log_stream: TextIO | None = None,
 ) -> Application:
@@ -103,7 +104,7 @@ def bootstrap(
     telemetry = setup_telemetry(settings) if logs else None
     try:
         modules = load_modules(settings)
-        specs = factories.resource_specs(settings)
+        specs: list[runtime.Declaration] = [*factories.resource_specs(settings)]
         for module in modules:
             specs.extend(module.resources())
         resources = runtime.Resources(specs)
@@ -117,7 +118,10 @@ def bootstrap(
             ],
             meta=run_meta(settings),
             lease_seconds=settings.runs.lease_seconds,
-            max_parallel_steps=settings.runs.max_parallel_steps,
+            max_parallel_steps=(
+                settings.tuning.effective().max_parallel_steps.value
+            ),
+            redact=settings.logging.redact,
         )
     except BaseException:
         if telemetry is not None:
@@ -132,7 +136,7 @@ def load_settings(
     env: str | None = None,
     *,
     directory: pathlib.Path | str = "config",
-    overrides: Mapping[str, Any] | None = None,
+    overrides: Mapping[str, object] | None = None,
 ) -> config.AppSettings:
     """Loads the settings, secret managers' placeholders resolved.
 
@@ -201,25 +205,23 @@ def lineage_listeners(
                 timeout_seconds=lineage.timeout_seconds,
             ),
             namespace=lineage.namespace or settings.service_name,
+            redact=settings.logging.redact,
         )
     ]
 
 
-def setup_telemetry(settings: config.AppSettings) -> Any:
+def setup_telemetry(
+    settings: config.AppSettings,
+) -> otel_telemetry.Telemetry | None:
     """Exports the traces and metrics the settings ask for, if any.
 
     Returns:
-        The telemetry (`infra.observability.telemetry.Telemetry`), to stop at
-        exit; None when nothing is exported.
+        The telemetry, to stop at exit; None when nothing is exported.
     """
     otlp = settings.logging.otlp
     if otlp is None or not {"traces", "metrics"} & set(otlp.signals):
         return None
-    # Imported here: only OTLP needs the `otel` extra.
-    # pylint: disable-next=import-outside-toplevel
-    from infra.observability import telemetry
-
-    return telemetry.configure_telemetry(
+    return otel_telemetry.configure_telemetry(
         service=settings.service_name,
         environment=settings.env,
         endpoint=otlp.endpoint,
@@ -227,6 +229,7 @@ def setup_telemetry(settings: config.AppSettings) -> Any:
         timeout_seconds=otlp.timeout_seconds,
         signals=[s for s in otlp.signals if s != "logs"],
         export_seconds=otlp.export_seconds,
+        redact=settings.logging.redact,
     )
 
 
@@ -255,7 +258,7 @@ def setup_logging(
         format=options.format,
         otlp=otlp,
         redact=options.redact,
-        queue_size=options.queue_size,
+        queue_size=settings.tuning.queue_size,
         stream=stream,
     )
 
@@ -274,7 +277,7 @@ def load_modules(settings: config.AppSettings) -> list[runtime.Module]:
         target = _import(entry.module) if entry.module else _entry_point(name)
         module: object = target
         if not isinstance(target, runtime.Module) and callable(target):
-            create = cast(ModuleFactory, target)
+            create = cast(_ModuleFactory, target)
             module = create(settings)
         if not isinstance(module, runtime.Module):
             raise contract.PipelineConfigError(

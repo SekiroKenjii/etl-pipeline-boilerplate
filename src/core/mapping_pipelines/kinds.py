@@ -6,8 +6,9 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator, Sequence
 import datetime
 import decimal
+import functools
 import typing
-from typing import Any
+import uuid
 
 from core import contract
 from core import mapping
@@ -167,12 +168,20 @@ class Replay(base.MappingPipeline):
         )
         lineage = self.mappings.lineage(name)
 
+        @functools.cache
+        def family() -> contract.TypeFamily:
+            return reader.column_family(table, columns[0])
+
         def fetch(
             entries: Sequence[contract.QuarantineEntry],
             ctx: contract.ETLContext,
         ) -> Iterator[contract.Row]:
             del ctx  # Unused.
-            wanted = {str(entry.record["source_key"]) for entry in entries}
+            wanted = {
+                key
+                for entry in entries
+                if (key := self._source_key(entry, name)) is not None
+            }
             first = sorted({key.split("|")[0] for key in wanted})
             query = contract.TableQuery(
                 table,
@@ -181,7 +190,7 @@ class Replay(base.MappingPipeline):
                     contract.Condition(
                         columns[0],
                         contract.Operator.IN,
-                        _typed(reader, table, columns[0], first),
+                        key_values(family(), first),
                     ),
                 ),
             )
@@ -216,34 +225,42 @@ class Replay(base.MappingPipeline):
         return str(fields["source_key"])
 
 
-def _typed(
-    reader: contract.ITableReader, table: str, column: str, texts: Sequence[str]
-) -> list[Any]:
-    """Key values as text, in the type of the column: the source key is text."""
-    sample = reader.max_value(table, column)
-    convert: Callable[[str], Any]
-    match sample:
-        case bool() | None | str():
-            return list(texts)
-        case int():
-            convert = int
-        case decimal.Decimal():
-            convert = decimal.Decimal
-        case float():
-            convert = float
-        case datetime.datetime():
-            convert = datetime.datetime.fromisoformat
-        case datetime.date():
-            convert = datetime.date.fromisoformat
-        case _:
-            return list(texts)
-    typed: list[Any] = []
+def key_values(
+    family: contract.TypeFamily, texts: Sequence[str]
+) -> list[object]:
+    """Key values as text (the source key is), in the type of their column.
+
+    A text that is no value of the type is left out: no row has it.
+    """
+    convert = _KEY_TYPES.get(family)
+    if convert is None:
+        return list(texts)
+    typed: list[object] = []
     for text in texts:
         try:
             typed.append(convert(text))
         except (ValueError, ArithmeticError):
-            continue  # Not a value of the column: no row has it.
+            continue
     return typed
+
+
+def _boolean(text: str) -> bool:
+    """`true` or `false`, as `keys.canonical_text` writes booleans."""
+    if text not in ("true", "false"):
+        raise ValueError(f"not a boolean: {text!r}")
+    return text == "true"
+
+
+_KEY_TYPES: dict[contract.TypeFamily, Callable[[str], object]] = {
+    contract.TypeFamily.INTEGER: int,
+    contract.TypeFamily.DECIMAL: decimal.Decimal,
+    contract.TypeFamily.FLOAT: float,
+    contract.TypeFamily.BOOLEAN: _boolean,
+    contract.TypeFamily.DATE: datetime.date.fromisoformat,
+    contract.TypeFamily.DATETIME: datetime.datetime.fromisoformat,
+    contract.TypeFamily.TIME: datetime.time.fromisoformat,
+    contract.TypeFamily.UUID: uuid.UUID,
+}
 
 
 class Deletes(base.MappingPipeline):
@@ -268,6 +285,7 @@ class Deletes(base.MappingPipeline):
             entity=compiled.entity,
             case=compiled.spec.key_case,
             max_share=self.settings.max_delete_share,
+            spill_rows=self.settings.spill_rows,
         )
         return self.etl_job(
             extractor, self.transformer(name), name, changes=True

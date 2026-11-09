@@ -280,6 +280,62 @@ def test_a_window_of_rejected_rows_only_is_a_partial_success() -> None:
     assert result.status is contract.ETLStatus.PARTIAL_SUCCESS
 
 
+class TestCancelledRetries:
+    """A run cancelled is not retried: no backoff, no new attempt."""
+
+    def test_a_step_failing_once_cancelled_is_not_retried(self) -> None:
+        calls = []
+
+        def cancelled_then_failed(
+            ctx: contract.ETLContext,
+            upstream: Mapping[str, contract.ETLResult],
+        ) -> contract.ETLResult:
+            calls.append(1)
+            ctx.cancel()  # SIGTERM, while the batch fails.
+            raise contract.RetryableError("timeout")
+
+        orchestrator = StaticOrchestrator([
+            contract.PipelineStep(
+                "a",
+                cancelled_then_failed,
+                retry=contract.RetryPolicy(max_attempts=3),
+            )
+        ])
+
+        result = orchestrator.run(fakes.make_context())
+
+        assert (len(calls), orchestrator.slept) == (1, [])
+        assert result.status is contract.ETLStatus.CANCELLED
+        assert result.step_results["a"].errors
+
+    def test_a_cancel_during_the_backoff_ends_it(self) -> None:
+        flaky = Flaky(failures=1)
+
+        class Waiting(pipeline.BaseOrchestrator):
+            """Waits its backoff for real."""
+
+            def steps(self) -> Sequence[contract.PipelineStep]:
+                return [
+                    contract.PipelineStep(
+                        "a",
+                        flaky,
+                        retry=contract.RetryPolicy(
+                            max_attempts=2, backoff_seconds=30.0
+                        ),
+                    )
+                ]
+
+        ctx = fakes.make_context()
+        threading.Timer(0.1, ctx.cancel).start()
+        started = time.monotonic()
+
+        result = Waiting().run(ctx)
+
+        assert time.monotonic() - started < 10
+        assert flaky.calls == 1
+        assert result.status is contract.ETLStatus.CANCELLED
+
+
 def test_cancelled_run() -> None:
     def cancel(
         ctx: contract.ETLContext, upstream: Mapping[str, contract.ETLResult]

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 import dataclasses
 import datetime
 import json
@@ -15,7 +15,7 @@ import typing
 from core import contract
 from shared import utils
 
-type Clock = Callable[[], float]
+type _Clock = Callable[[], float]
 
 
 def record_of(result: contract.PipelineResult) -> dict[str, object]:
@@ -95,6 +95,23 @@ class InMemoryRunLedger(contract.IRunLedger):
                 else dataclasses.replace(found, steps=dict(found.steps))
             )
 
+    def latest(
+        self,
+        pipeline_prefix: str,
+        statuses: Collection[contract.ETLStatus],
+        meta_key: str,
+    ) -> contract.RunRecord | None:
+        with self._lock:
+            runs = list(self._runs.values())
+        return _latest(runs, pipeline_prefix, statuses, meta_key)
+
+    def last_run(
+        self, pipeline_name: str, label: str | None = None
+    ) -> contract.RunRecord | None:
+        with self._lock:
+            runs = list(self._runs.values())
+        return _last_run(runs, pipeline_name, label)
+
 
 class JsonLinesRunLedger(contract.IRunLedger):
     """Appends every start and end of a run, and of its steps, to
@@ -164,6 +181,19 @@ class JsonLinesRunLedger(contract.IRunLedger):
             None,
         )
 
+    def latest(
+        self,
+        pipeline_prefix: str,
+        statuses: Collection[contract.ETLStatus],
+        meta_key: str,
+    ) -> contract.RunRecord | None:
+        return _latest(self._read(), pipeline_prefix, statuses, meta_key)
+
+    def last_run(
+        self, pipeline_name: str, label: str | None = None
+    ) -> contract.RunRecord | None:
+        return _last_run(self._read(), pipeline_name, label)
+
     def _read(self) -> list[contract.RunRecord]:
         """Every run, its lines merged in order."""
         runs: dict[str, dict[str, object]] = {}
@@ -196,6 +226,45 @@ class JsonLinesRunLedger(contract.IRunLedger):
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self.path.open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+
+def _latest(
+    runs: list[contract.RunRecord],
+    pipeline_prefix: str,
+    statuses: Collection[contract.ETLStatus],
+    meta_key: str,
+) -> contract.RunRecord | None:
+    found = [
+        run
+        for run in runs
+        if not run.dry_run
+        and run.pipeline.startswith(pipeline_prefix)
+        and run.status in statuses
+        and meta_key in run.meta
+    ]
+    if not found:
+        return None
+    return dataclasses.replace(
+        max(found, key=lambda run: run.started_at), steps={}
+    )
+
+
+def _last_run(
+    runs: list[contract.RunRecord], pipeline_name: str, label: str | None
+) -> contract.RunRecord | None:
+    """`IRunLedger.last_run` over every run."""
+    found = [
+        run
+        for run in runs
+        if not run.dry_run
+        and run.pipeline == pipeline_name
+        and (label is None or run.meta.get("label") == label)
+    ]
+    if not found:
+        return None
+    return dataclasses.replace(
+        max(found, key=lambda run: run.started_at), steps={}
+    )
 
 
 def _entries(value: object) -> dict[str, object]:
@@ -250,7 +319,7 @@ def _step(item: dict[str, object]) -> contract.StepRecord:
 class InMemoryRunLock(contract.IRunLock):
     """Locks in memory: for tests, and a single process."""
 
-    def __init__(self, clock: Clock = time.time) -> None:
+    def __init__(self, clock: _Clock = time.time) -> None:
         self._leases: dict[str, tuple[str, float]] = {}
         self._clock = clock
         self._lock = threading.Lock()
@@ -278,6 +347,11 @@ class InMemoryRunLock(contract.IRunLock):
             if held is not None and held[0] == owner:
                 del self._leases[name]
 
+    def holder(self, name: str) -> str | None:
+        with self._lock:
+            held = self._leases.get(name)
+            return held[0] if held and held[1] > self._clock() else None
+
 
 class FileRunLock(contract.IRunLock):
     """Locks as files, `{directory}/<name>.lock`: for one host.
@@ -290,7 +364,7 @@ class FileRunLock(contract.IRunLock):
     """
 
     def __init__(
-        self, directory: pathlib.Path | str, clock: Clock = time.time
+        self, directory: pathlib.Path | str, clock: _Clock = time.time
     ) -> None:
         self.directory = pathlib.Path(directory)
         self._clock = clock
@@ -333,6 +407,11 @@ class FileRunLock(contract.IRunLock):
             held = self._read(path)
             if held is not None and held[0] == owner:
                 path.unlink(missing_ok=True)
+
+    def holder(self, name: str) -> str | None:
+        with self._lock:
+            held = self._read(self._path(name))
+        return held[0] if held and held[1] > self._clock() else None
 
     def _path(self, name: str) -> pathlib.Path:
         return self.directory / f"{name.replace('/', '_')}.lock"

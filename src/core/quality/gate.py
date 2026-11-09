@@ -6,14 +6,21 @@ from collections.abc import Callable, Mapping, Sequence
 import dataclasses
 import random
 import threading
-from typing import Any, NamedTuple
+import typing
+from typing import NamedTuple, Never
 
 from core import contract
 
+# Contravariant, so that the check sets of every checkpoint go in one
+# mapping (`CheckSet[Never]`). Declared, not PEP 695: pyright infers the
+# parameters of a dataclass invariant on Python 3.13+, from the
+# `__replace__` it synthesizes.
+TRecord_contra = typing.TypeVar("TRecord_contra", contravariant=True)
+
 
 class _SetAside(NamedTuple):
-    rejected: list[contract.RejectedRecord[Any]]
-    issues: list[contract.QualityIssue]
+    rejected: Sequence[contract.RejectedRecord[object]]
+    issues: Sequence[contract.QualityIssue]
 
 
 _STRENGTH = {
@@ -24,7 +31,7 @@ _STRENGTH = {
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
-class CheckSet[T]:
+class CheckSet(typing.Generic[TRecord_contra]):
     """The rules run at one checkpoint.
 
     Attributes:
@@ -35,10 +42,10 @@ class CheckSet[T]:
         record_id: Gets the identifier of a record, for the issues.
     """
 
-    records: Sequence[contract.RecordRule[T]] = ()
-    batch: Sequence[contract.BatchRule[T]] = ()
+    records: Sequence[contract.RecordRule[TRecord_contra]] = ()
+    batch: Sequence[contract.BatchRule[TRecord_contra]] = ()
     max_reject_rate: float | None = None
-    record_id: Callable[[T], str | None] | None = None
+    record_id: Callable[[TRecord_contra], str | None] | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -72,7 +79,7 @@ class QualityGate(contract.IQualityGate):
 
     def __init__(
         self,
-        checks: Mapping[contract.Checkpoint, CheckSet[Any]],
+        checks: Mapping[contract.Checkpoint, CheckSet[Never]],
         quarantine: contract.IQuarantine | None = None,
         *,
         issue_sink: contract.IIssueSink | None = None,
@@ -124,7 +131,10 @@ class QualityGate(contract.IQualityGate):
         ctx: contract.ETLContext,
     ) -> contract.GateOutcome[T]:
         """See `contract.IQualityGate.inspect`."""
-        check_set: CheckSet[T] | None = self._checks.get(checkpoint)
+        # The rules of a checkpoint take the records of that checkpoint.
+        check_set = typing.cast(
+            CheckSet[T] | None, self._checks.get(checkpoint)
+        )
         if check_set is None:
             return contract.GateOutcome(list(records))
 
@@ -176,10 +186,10 @@ class QualityGate(contract.IQualityGate):
         self._local.pending = pending
         return pending
 
-    def _report(
+    def _report[T](
         self,
         checkpoint: contract.Checkpoint,
-        check_set: CheckSet[Any],
+        check_set: CheckSet[T],
         checked: int,
     ) -> contract.QualityReport:
         return contract.QualityReport(
@@ -358,9 +368,9 @@ class QualityGate(contract.IQualityGate):
             )
 
 
-def _rules(
-    check_set: CheckSet[Any],
-) -> list[contract.RecordRule[Any] | contract.BatchRule[Any]]:
+def _rules[T](
+    check_set: CheckSet[T],
+) -> list[contract.RecordRule[T] | contract.BatchRule[T]]:
     return [*check_set.records, *check_set.batch]
 
 

@@ -32,6 +32,7 @@ from typing import TextIO
 from cli import exit_codes
 from core import contract
 from core import keys
+from infra.database import mongodb
 from infra.database import relational
 from infra.database.relational import migrations
 
@@ -269,10 +270,6 @@ def _mongodb(args: argparse.Namespace, url: str, stream: TextIO) -> int:
     Its collections have no revision: `upgrade` creates what is missing,
     indexes included.
     """
-    # Imported here: only MongoDB URLs need the `mongodb` extra.
-    # pylint: disable-next=import-outside-toplevel
-    from infra.database import mongodb
-
     try:
         db = mongodb.MongoDatabase(
             url, database=getattr(args, "schema", None) or None

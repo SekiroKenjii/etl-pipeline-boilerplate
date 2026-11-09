@@ -23,7 +23,6 @@ import argparse
 import dataclasses
 import datetime
 import decimal
-import inspect
 import json
 import pathlib
 import resource
@@ -225,15 +224,9 @@ def _child(job: dict[str, Any]) -> int:
         key=("key",),
         columns=("key", "name", "amount", "at"),
     )
-    options: dict[str, Any] = {}
-    if (
-        job["hash"]
-        and "ranges" in inspect.signature(cutover.reconcile).parameters
-    ):
-        options["ranges"] = False
     base = _rss_mb()
     started = time.monotonic()
-    report = cutover.reconcile(reconciliation, **options)
+    report = cutover.reconcile(reconciliation, ranges=not job["hash"])
     seconds = time.monotonic() - started
     measure = Measure(
         drift=job["drift"],
@@ -243,7 +236,7 @@ def _child(job: dict[str, Any]) -> int:
         base_mb=round(base, 1),
         source_read=source.rows,
         target_read=target.rows,
-        partitioning=getattr(report, "partitioning", "") or "hash",
+        partitioning=report.partitioning,
         status=report.status,
         differences=report.missing + report.extra + report.different,
     )

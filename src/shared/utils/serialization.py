@@ -9,8 +9,13 @@ import datetime
 import decimal
 import enum
 import pathlib
-from typing import Any
+import typing
 import uuid
+
+type JsonValue = (
+    str | int | float | bool | None | list[JsonValue] | dict[str, JsonValue]
+)
+type JsonObject = dict[str, JsonValue]
 
 
 def to_jsonable(value: object) -> object:
@@ -50,14 +55,15 @@ _DECODER_BY_TAG: dict[str, Callable[[str], object]] = {
     "bytes": base64.b64decode,
 }
 _TAG = "$type"
-_ADAPTER_TYPE_BY_TAG: dict[str, tuple[type[Any], Callable[[Any], str]]] = {}
+# Each encoder is called with instances of its type only (`to_tagged`).
+_ADAPTER_TYPE_BY_TAG: dict[str, tuple[type, Callable[[object], str]]] = {}
 
 
-def register_tag(
+def register_tag[T](
     tag: str,
-    type_: type[Any],
-    encode: Callable[[Any], str],
-    decode: Callable[[str], object],
+    type_: type[T],
+    encode: Callable[[T], str],
+    decode: Callable[[str], T],
 ) -> None:
     """Teaches `to_tagged` and `from_tagged` a type of a library.
 
@@ -80,7 +86,10 @@ def register_tag(
         or tag == "dict"
     ):
         raise ValueError(f"{tag!r} is a built-in tag")
-    _ADAPTER_TYPE_BY_TAG[tag] = (type_, encode)
+    _ADAPTER_TYPE_BY_TAG[tag] = (
+        type_,
+        typing.cast(Callable[[object], str], encode),
+    )
     _DECODER_BY_TAG[tag] = decode
 
 

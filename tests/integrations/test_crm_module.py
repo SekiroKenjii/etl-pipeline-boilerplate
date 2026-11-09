@@ -78,11 +78,11 @@ def test_full_load_late_parents_and_deletes(
 ) -> None:
     legacy, crm, settings = sqlite
 
-    def run(pipeline: str) -> runtime.RunOutcome:
+    def run(pipeline: str, **params: str) -> runtime.RunOutcome:
         with bootstrap.bootstrap(
             "test", directory=tmp_path / "none", overrides=settings, logs=False
         ) as application:
-            return application.kernel.run(pipeline)
+            return application.kernel.run(pipeline, params=params)
 
     first = run("crm.full_load")
 
@@ -126,8 +126,11 @@ def test_full_load_late_parents_and_deletes(
         connection.execute(
             customers.delete().where(customers.c.CUST_NO == "1002")
         )
-    deletes = run("crm.deletes")
+    # A third of the rows of each entity: above the share deleted unasked.
+    refused = run("crm.deletes")
+    deletes = run("crm.deletes", confirm_deletes="crm.customer:1,crm.order:1")
 
+    assert refused.exit_code is runtime.ExitCode.INVALID
     assert deletes.result is not None
     assert deletes.result.stats.deleted == 2
     assert _rows(crm, "SELECT customer_id FROM customer WHERE is_deleted") == [(
@@ -140,8 +143,9 @@ def test_full_load_late_parents_and_deletes(
         "test", directory=tmp_path / "none", overrides=settings, logs=False
     ) as application:
         ledger = application.resources.get("etl.runs", object)
-        assert [r.status.value for r in ledger.recent(None)][:2] == [  # type: ignore[attr-defined]
+        assert [r.status.value for r in ledger.recent(None)][:3] == [  # type: ignore[attr-defined]
             "success",
+            "failed",
             "success",
         ]
 

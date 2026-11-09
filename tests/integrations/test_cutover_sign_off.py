@@ -7,6 +7,7 @@ import json
 import pathlib
 from typing import Any
 
+import pytest
 import sqlalchemy as sa
 
 from app import bootstrap
@@ -75,7 +76,7 @@ def test_the_report_tells_what_produced_it(
 
     code, path = _save(
         settings, tmp_path, "--accept-rejections", str(accepted),
-        "--time-resolution", "300",
+        "--time-resolution", "300", "--accept-empty", "order",
     )  # fmt: skip
     report = json.loads(path.read_text(encoding="utf-8"))
     provenance = report["provenance"]
@@ -94,6 +95,7 @@ def test_the_report_tells_what_produced_it(
     ]
     assert target[0]["database"].endswith("crm.db")
     assert provenance["options"]["time_resolution"] == 300
+    assert provenance["accepted_rejections"]["empty"] == ["order"]
     assert provenance["accepted_rejections"]["rows"] == {"customer": {"*": 2}}
     assert len(provenance["accepted_rejections"]["sha256"]) == 64
 
@@ -129,3 +131,120 @@ def test_no_credential_in_the_provenance(
     ]
     assert "s3cr3t" not in json.dumps(found)
     assert "etl" not in json.dumps(found)
+
+
+def _made_before_the_ledger(
+    report: dict[str, Any], path: pathlib.Path
+) -> pathlib.Path:
+    """Writes `report` as 0.1.0 saved it: no provenance, no verdict, in no
+    ledger."""
+    old = {
+        key: value
+        for key, value in report.items()
+        if key not in ("provenance", "verdict", "digest")
+    }
+    path.write_text(json.dumps(cutover.seal(old)), encoding="utf-8")
+    return path
+
+
+class TestReportsSavedBeforeTheLedger:
+
+    def _saved(
+        self,
+        sqlite: tuple[sa.Engine, sa.Engine, dict[str, Any]],
+        tmp_path: pathlib.Path,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        _, _, settings = sqlite
+        _etl(settings, tmp_path, "run", "crm.full_load")
+        _, path = _save(settings, tmp_path)
+        return settings, json.loads(path.read_text(encoding="utf-8"))
+
+    def test_one_is_recorded_then_verifies_as_adopted(
+        self,
+        sqlite: tuple[sa.Engine, sa.Engine, dict[str, Any]],
+        tmp_path: pathlib.Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        settings, report = self._saved(sqlite, tmp_path)
+        old = _made_before_the_ledger(report, tmp_path / "old.json")
+        monkeypatch.setenv("ETL_OPERATOR", "alice (CHG-42)")
+
+        before = _etl(settings, tmp_path, "cutover", "verify", str(old))
+        recorded = _etl(settings, tmp_path, "cutover", "record", str(old))
+        after = _etl(settings, tmp_path, "cutover", "verify", str(old))
+        again = _etl(settings, tmp_path, "cutover", "record", str(old))
+        runs = _etl(settings, tmp_path, "runs", "etl.cutover")[1]
+
+        assert before[0] == runtime.ExitCode.FAILED
+        assert before[1].startswith(f"UNRECORDED {old}")
+        assert recorded[0] == runtime.ExitCode.SUCCESS, recorded[1]
+        assert recorded[1].startswith(f"RECORDED   {old}")
+        assert after[0] == runtime.ExitCode.SUCCESS, after[1]
+        assert after[1].startswith(f"ADOPTED    {old}: FAILED crm,")
+        assert "recorded by alice (CHG-42)" in after[1]
+        # Once only: recording again changes nothing.
+        assert again[0] == runtime.ExitCode.SUCCESS
+        assert again[1].startswith(f"ADOPTED    {old}")
+        assert runs.count("etl.cutover success") == 2
+
+    def test_a_report_of_this_version_is_never_adopted(
+        self,
+        sqlite: tuple[sa.Engine, sa.Engine, dict[str, Any]],
+        tmp_path: pathlib.Path,
+    ) -> None:
+        # Made by this version and not in the ledger: not saved by
+        # `--save`, or edited and sealed again.
+        settings, report = self._saved(sqlite, tmp_path)
+        forged = tmp_path / "forged.json"
+        forged.write_text(
+            json.dumps(
+                cutover.seal({**report, "verdict": "PASSED", "passed": True})
+            ),
+            encoding="utf-8",
+        )
+
+        recorded = _etl(settings, tmp_path, "cutover", "record", str(forged))
+        verified = _etl(settings, tmp_path, "cutover", "verify", str(forged))
+
+        assert recorded[0] == runtime.ExitCode.FAILED
+        assert recorded[1].startswith(f"REFUSED    {forged}")
+        assert verified[1].startswith(f"UNRECORDED {forged}")
+
+    def test_nothing_is_recorded_when_one_report_is_wrong(
+        self,
+        sqlite: tuple[sa.Engine, sa.Engine, dict[str, Any]],
+        tmp_path: pathlib.Path,
+    ) -> None:
+        settings, report = self._saved(sqlite, tmp_path)
+        old = _made_before_the_ledger(report, tmp_path / "old.json")
+        edited = _made_before_the_ledger(report, tmp_path / "edited.json")
+        data = json.loads(edited.read_text(encoding="utf-8"))
+        edited.write_text(
+            json.dumps({**data, "passed": True}), encoding="utf-8"
+        )
+
+        recorded = _etl(
+            settings, tmp_path, "cutover", "record", str(old), str(edited)
+        )
+        verified = _etl(settings, tmp_path, "cutover", "verify", str(old))
+
+        assert recorded[0] == runtime.ExitCode.FAILED
+        assert f"CHANGED    {edited}" in recorded[1]
+        assert verified[1].startswith(f"UNRECORDED {old}")
+
+    def test_a_report_saved_by_this_version_is_already_recorded(
+        self,
+        sqlite: tuple[sa.Engine, sa.Engine, dict[str, Any]],
+        tmp_path: pathlib.Path,
+    ) -> None:
+        settings, _ = self._saved(sqlite, tmp_path)
+        (path,) = (tmp_path / "rehearsals" / "crm").glob("*.json")
+
+        recorded = _etl(settings, tmp_path, "cutover", "record", str(path))
+        verified = _etl(settings, tmp_path, "cutover", "verify", str(path))
+        runs = _etl(settings, tmp_path, "runs", "etl.cutover")[1]
+
+        assert recorded[0] == runtime.ExitCode.SUCCESS
+        assert recorded[1].startswith(f"OK         {path}")
+        assert verified[1].startswith(f"OK         {path}")
+        assert runs.count("etl.cutover success") == 1

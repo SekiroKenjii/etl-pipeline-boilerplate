@@ -12,7 +12,6 @@ from collections.abc import Iterator
 import dataclasses
 import datetime
 import enum
-from typing import Any
 
 from core.contract import exceptions
 from core.contract import formats
@@ -45,7 +44,7 @@ class ChangeEvent:
     table: str
     operation: ChangeOperation
     row: formats.Row
-    key: tuple[Any, ...]
+    key: tuple[object, ...]
     position: state.StateValue = None
     committed_at: datetime.datetime | None = None
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Any
+from typing import Never
 
 from core import contract
 from core import cutover
@@ -162,7 +162,7 @@ class MappingPipeline(pipeline.BaseOrchestrator):
                 identity=mapping.record_identity,
                 fallback=quarantine,
             )
-        checks: dict[contract.Checkpoint, quality.CheckSet[Any]] = {
+        checks: dict[contract.Checkpoint, quality.CheckSet[Never]] = {
             contract.Checkpoint.AFTER_TRANSFORM: quality.CheckSet(
                 [
                     mapping.MappingIssuesRule(),
@@ -198,6 +198,7 @@ class MappingPipeline(pipeline.BaseOrchestrator):
                 f.target for f in self.mappings.compiled[name].spec.fields
             ),
             row=lambda record: None if record.deleted else record.data,
+            chunk=self.settings.in_chunk,
         )
 
     def loader(
@@ -236,24 +237,26 @@ class MappingPipeline(pipeline.BaseOrchestrator):
 
     def transformer(
         self, name: str
-    ) -> pipeline.IDataTransformer[Any, mapping.MappedRecord]:
+    ) -> pipeline.IDataTransformer[
+        operators.SourceRecord, mapping.MappedRecord
+    ]:
         """The corrections of the rows, then their mapping."""
         lineage = self.mappings.lineage(name)
         return self.mappings.corrections.transformer(name, lineage).then(
-            mapping.MappingTransformer(
+            mapping.MappingTransformer[operators.SourceRecord](
                 self.mappings.compiled[name], key=lineage
             )
         )
 
-    def etl_job(
+    def etl_job[T](
         self,
-        extractor: pipeline.IDataExtractor[Any],
-        transformer: pipeline.IDataTransformer[Any, mapping.MappedRecord],
+        extractor: pipeline.IDataExtractor[T],
+        transformer: pipeline.IDataTransformer[T, mapping.MappedRecord],
         name: str,
         *,
         changes: bool = False,
         breaker: bool = True,
-    ) -> pipeline.ETLJob[Any, mapping.MappedRecord]:
+    ) -> pipeline.ETLJob[T, mapping.MappedRecord]:
         """The job of mapping `name`: extracted, transformed, gated, loaded.
 
         Args:

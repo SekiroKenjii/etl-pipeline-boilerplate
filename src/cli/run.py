@@ -12,6 +12,8 @@
     etl runs --run 3f2a...              # The steps of a run.
     etl runs crm.full_load --format json        # For scripts.
     etl config show                     # The settings, secrets hidden.
+    etl config tuning                   # The thresholds, and their sources.
+    etl calibrate crm                   # Measure a database: [tuning] values.
     etl new-module billing              # The skeleton of a new module.
     etl cutover report crm              # Reconcile the target with the source.
     etl quarantine list                 # Rejected records; also parked,
@@ -33,11 +35,13 @@ from collections.abc import Sequence
 import datetime
 import io
 import json
+import logging
 import pathlib
 import sys
 from typing import TextIO
 
 from app import bootstrap
+from cli import calibrate
 from cli import cutover
 from cli import exit_codes
 from cli import operations
@@ -46,8 +50,10 @@ import config
 from config import secrets as config_secrets
 from core import contract
 from core import runtime
+from core.observability import redaction
 from core.runtime import names
 
+_LOG = logging.getLogger("etl.cli")
 _DESCRIPTION = "Runs the ETL application."
 _FORMATS = ("text", "json")
 
@@ -66,26 +72,11 @@ def main(argv: Sequence[str] | None = None, out: TextIO | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         if args.command == "new-module":
-            try:
-                written = scaffold.scaffold(args.name, args.root)
-            except ValueError as exc:
-                stream.write(f"FAILED {exc}\n")
-                return exit_codes.ExitCode.INVALID
-            for path in written:
-                stream.write(f"Wrote {path}\n")
-            stream.write(scaffold.SNIPPET.format(name=args.name))
-            return exit_codes.ExitCode.SUCCESS
+            return _new_module(args, stream)
         if args.command == "cutover" and args.action in cutover.OFFLINE:
             return cutover.offline(args, stream)
         if args.command == "config":
-            # Placeholders unresolved: showing them needs no secret manager.
-            with config_secrets.unresolved():
-                settings = config.load_settings(args.env, directory=args.config)
-            stream.write(
-                json.dumps(settings.redacted(), indent=2, ensure_ascii=False)
-            )
-            stream.write("\n")
-            return exit_codes.ExitCode.SUCCESS
+            return _show_config(args, stream)
         # Written last, after the run's logs: `... --format json | tail -n 1`.
         last = (
             io.StringIO()
@@ -95,19 +86,74 @@ def main(argv: Sequence[str] | None = None, out: TextIO | None = None) -> int:
         with bootstrap.bootstrap(
             args.env, directory=args.config, logs=args.command == "run"
         ) as application:
-            code = _command(args, application, stream if last is None else last)
+            try:
+                code = _command(
+                    args, application, stream if last is None else last
+                )
+            except contract.PipelineConfigError:
+                raise
+            except contract.PipelineError as exc:
+                if application.logs is not None:
+                    _LOG.error(
+                        "etl %s failed: %s", args.command, exc, exc_info=False
+                    )
+                raise
         if last is not None:
             stream.write(last.getvalue())
         return code
     except (config.ConfigError, contract.PipelineConfigError) as exc:
-        if args.command == "run" and args.format == "json":
-            _write_json(
-                stream,
-                _summary(args.pipeline, exit_codes.ExitCode.INVALID, str(exc)),
-            )
-        else:
-            stream.write(f"FAILED {exc}\n")
+        return _failed(args, stream, exit_codes.ExitCode.INVALID, exc)
+    # The bookkeeping or a resource down, a directory not writable: a line
+    # for the scheduler, not a traceback.
+    except (contract.PipelineError, OSError) as exc:
+        return _failed(args, stream, exit_codes.ExitCode.FAILED, exc)
+
+
+def _new_module(args: argparse.Namespace, stream: TextIO) -> int:
+    """`etl new-module`: writes the skeleton of a module."""
+    try:
+        written = scaffold.scaffold(args.name, args.root)
+    except ValueError as exc:
+        stream.write(f"FAILED {exc}\n")
         return exit_codes.ExitCode.INVALID
+    for path in written:
+        stream.write(f"Wrote {path}\n")
+    stream.write(scaffold.SNIPPET.format(name=args.name))
+    return exit_codes.ExitCode.SUCCESS
+
+
+def _show_config(args: argparse.Namespace, stream: TextIO) -> int:
+    """`etl config show`: the settings, secrets hidden; `etl config
+    tuning`: the thresholds as this process would run with them, each with
+    its source.
+
+    Raises:
+        ConfigError: If the settings are not valid.
+    """
+    # Placeholders unresolved: showing them needs no secret manager.
+    with config_secrets.unresolved():
+        settings = config.load_settings(args.env, directory=args.config)
+    if args.action == "tuning":
+        stream.write(settings.tuning.effective().toml())
+        return exit_codes.ExitCode.SUCCESS
+    stream.write(json.dumps(settings.redacted(), indent=2, ensure_ascii=False))
+    stream.write("\n")
+    return exit_codes.ExitCode.SUCCESS
+
+
+def _failed(
+    args: argparse.Namespace,
+    stream: TextIO,
+    code: exit_codes.ExitCode,
+    error: Exception,
+) -> int:
+    """Tells why a command failed, its secrets hidden; returns `code`."""
+    message = redaction.redact_text(str(error))
+    if args.command == "run" and args.format == "json":
+        _write_json(stream, _summary(args.pipeline, code, message))
+    else:
+        stream.write(f"FAILED {message}\n")
+    return code
 
 
 def _command(
@@ -124,7 +170,9 @@ def _command(
         case "plan":
             _plan(kernel, args.pipeline, stream)
         case "check":
-            return _check(kernel, stream)
+            return _check(application, stream)
+        case "calibrate":
+            return calibrate.command(args, application, stream)
         case "runs" if args.run:
             return _run_steps(application, args.run, stream, args.format)
         case "runs":
@@ -151,16 +199,24 @@ def _plan(kernel: runtime.Kernel, pipeline: str, stream: TextIO) -> None:
         stream.write(f"{step.name}{after}\n")
 
 
-def _check(kernel: runtime.Kernel, stream: TextIO) -> int:
-    """`etl check`: whether every resource that can be checked works."""
-    report = kernel.check()
-    for name, status in report.items():
-        stream.write(
-            f"{status:<4} {name}\n"
-            if status == "ok"
-            else f"FAIL {name}: {status}\n"
-        )
-    if any(status != "ok" for status in report.values()):
+def _check(application: bootstrap.Application, stream: TextIO) -> int:
+    """`etl check`: whether every resource that can be checked works, after
+    one line of the thresholds the process runs with (`*`: derived from
+    its budgets; `etl config tuning` says from what). A `WARN` line follows
+    the `ok` of a resource that works but not as the ETL expects."""
+    tuning = application.settings.tuning.effective().summary()
+    _LOG.info("tuning: %s", tuning)
+    stream.write(f"tuning {tuning} (* derived; etl config tuning)\n")
+    report = application.kernel.check()
+    for name, health in report.items():
+        if not health.ok:
+            stream.write(f"FAIL {name}: {health.status}\n")
+            continue
+        stream.write(f"ok   {name}\n")
+        for warning in health.warnings:
+            _LOG.warning("%s: %s", name, warning)
+            stream.write(f"WARN {name}: {warning}\n")
+    if not all(health.ok for health in report.values()):
         return exit_codes.ExitCode.NOT_READY
     return exit_codes.ExitCode.SUCCESS
 
@@ -211,7 +267,7 @@ def _run(
             )
             + ")\n"
         )
-        if result.status is contract.ETLStatus.FAILED and result.message:
+        if result.message:
             stream.write(f"  {result.message}\n")
     return code
 
@@ -344,6 +400,7 @@ def _run_steps(
             for key in ("label", "resumed_from", "steps", "rekeyed_from")
             if record.meta.get(key)
         )
+        + (f": {record.message}" if record.message else "")
         + "\n"
     )
     for step in steps:
@@ -438,16 +495,17 @@ def _parser() -> argparse.ArgumentParser:
         help=(
             "the scheduler's name of this job, recorded with the run, e.g."
             " the Kubernetes Job: with --resume, a retry of the job resumes"
-            " its run, and takes over the locks it left. Never give two runs"
-            " at once the same label"
+            " its run. A run of a label waits, up to the lease, for the"
+            " locks another run of that label holds, then exits 4"
         ),
     )
     run.add_argument(
         "--rekey",
         action="store_true",
         help=(
-            "run even though the surrogate keys changed since the last"
-            " successful run (key secret or namespaces): every key changes"
+            "run even though the surrogate keys changed since the module's"
+            " last run that loaded (key secret or namespaces): every key"
+            " changes"
         ),
     )
     run.add_argument(
@@ -483,6 +541,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     cutover.add_parser(commands)
     operations.add_parsers(commands)
+    calibrate.add_parser(commands)
     new = commands.add_parser("new-module", help="write a module skeleton")
     new.add_argument("name", help="the module, e.g. billing")
     new.add_argument(
@@ -492,7 +551,14 @@ def _parser() -> argparse.ArgumentParser:
         help="where the `modules` package is (default: %(default)s)",
     )
     settings = commands.add_parser("config", help="the settings")
-    settings.add_subparsers(dest="action", required=True).add_parser(
-        "show", help="show the settings, secrets hidden"
+    actions = settings.add_subparsers(dest="action", required=True)
+    actions.add_parser("show", help="show the settings, secrets hidden")
+    actions.add_parser(
+        "tuning",
+        help=(
+            "show the [tuning] thresholds as this process would run with"
+            " them, each with where it comes from (set, or derived from the"
+            " memory and CPU limits found)"
+        ),
     )
     return parser

@@ -21,9 +21,13 @@ distributed transactions, which legacy databases rarely offer.
   ends in the same state. A record rejected again refreshes its open
   quarantine entry rather than adding one.
 - **The boundary is read twice.** A table read by watermark reads the rows
-  at the last saved watermark again once, at the next run, for rows
-  committed late with a smaller key. A row rejected there is rejected
-  again: the run is a partial success once more.
+  at the last saved watermark again at the next run, for rows committed
+  late with a smaller key, until one run has acknowledged every one of them:
+  a run that dies, is cancelled or loses its lease half-way saves how far
+  it went, and the next one goes on from there. A backfill (`--since`,
+  `--until`) leaves that pending unless it read those rows itself, and
+  moves the saved position only when it starts at or before it. A row
+  rejected there is rejected again: the run is a partial success once more.
 
 ## Consequences
 

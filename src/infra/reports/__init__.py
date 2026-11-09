@@ -1,1 +1,1 @@
-"""Reports as files people open: xlsx (`mappings` extra)."""
+"""Reports as files people open: xlsx."""

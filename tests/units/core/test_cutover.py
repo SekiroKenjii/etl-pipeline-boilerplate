@@ -1,14 +1,13 @@
-"""Cutover: canonical values, the data diff, the report, load verification."""
+"""Cutover: the data diff, the report, load verification."""
 
 from __future__ import annotations
 
 import dataclasses
 import datetime
 import decimal
-import functools
 import pathlib
+import re
 from typing import Any
-import uuid
 
 import pytest
 
@@ -16,202 +15,12 @@ from core import contract
 from core import cutover
 from core import quality
 from core import runtime
-from core.cutover import checksum
 from tests.factories import fake_ports
 from tests.factories import fakes
+from tests.factories import reconciliations
 
 UTC = datetime.UTC
 NOW = datetime.datetime(2026, 11, 3, tzinfo=UTC)
-
-
-class TestCanonicalValue:
-
-    @pytest.mark.parametrize(
-        ("left", "right"),
-        [
-            (decimal.Decimal("120.50"), 120.5),
-            (decimal.Decimal("120"), 120),
-            (120.0, 120),
-            (True, 1),
-            (uuid.UUID(int=1), "00000000-0000-0000-0000-000000000001"),
-            (
-                datetime.datetime(
-                    2024,
-                    1,
-                    1,
-                    7,
-                    tzinfo=datetime.timezone(datetime.timedelta(hours=7)),
-                ),
-                datetime.datetime(2024, 1, 1, 0),
-            ),
-            ("", None),
-            ("Müller", "Müller"),  # NFD and NFC.
-        ],
-    )
-    def test_the_same_value_read_from_two_databases(
-        self, left: object, right: object
-    ) -> None:
-        assert cutover.canonical_value(left) == cutover.canonical_value(right)
-
-    @pytest.mark.parametrize(
-        ("left", "right"),
-        [
-            ("1", 1),
-            (decimal.Decimal("1.5"), decimal.Decimal("1.05")),
-            ("1.5", decimal.Decimal("1.5")),
-            ("1.5", 1.5),
-            ("NaN", float("nan")),
-            ("Infinity", decimal.Decimal("Infinity")),
-        ],
-    )
-    def test_different_values_stay_different(
-        self, left: object, right: object
-    ) -> None:
-        assert cutover.canonical_value(left) != cutover.canonical_value(right)
-
-    def test_a_number_and_its_text_digest_apart(self) -> None:
-        number = checksum.canonical_row({"v": decimal.Decimal("1.50")}, ["v"])
-        text = checksum.canonical_row({"v": "1.5"}, ["v"])
-
-        assert checksum.text(number) != checksum.text(text)
-        assert checksum.digest(number) != checksum.digest(text)
-
-    def test_a_number_not_a_number_equals_itself(self) -> None:
-        assert cutover.canonical_value(
-            decimal.Decimal("NaN")
-        ) == cutover.canonical_value(float("nan"))
-
-    def test_reports_show_a_number_apart_from_its_text(self) -> None:
-        text, number, inexact = map(
-            cutover.canonical_value,
-            ("1.5", 1.5, decimal.Decimal("0.1000000000000000000001")),
-        )
-
-        assert (checksum.shown(text), checksum.shown(number)) == ("1.5", 1.5)
-        assert (repr(text), repr(number)) == ("'1.5'", "1.5")
-        assert checksum.shown(inexact) == "0.1000000000000000000001"
-
-
-class TestTimestampResolution:
-    """Timestamps compare to the microsecond, unless told a coarser
-    resolution: then both sides round to its nearest tick."""
-
-    def test_microseconds_by_default_a_coarser_side_differs(self) -> None:
-        precise = datetime.datetime(2026, 1, 1, 10, 0, 0, 123456)
-        sql_server = datetime.datetime(2026, 1, 1, 10, 0, 0, 123000)
-
-        assert cutover.canonical_value(precise) != cutover.canonical_value(
-            sql_server
-        )
-
-    @pytest.mark.parametrize(
-        ("precise", "stored", "resolution"),
-        [
-            # SQL Server `datetime`: 1/300 s, read back as milliseconds.
-            ("10:00:00.123456", "10:00:00.123", 300),
-            ("10:00:00.125000", "10:00:00.127", 300),
-            ("10:00:00.001700", "10:00:00.003", 300),
-            ("10:00:00.998000", "10:00:00.997", 300),
-            ("10:00:00.999000", "10:00:01.000", 300),
-            # Milliseconds, whole seconds (MySQL DATETIME, Oracle DATE).
-            ("10:00:00.123456", "10:00:00.123", 1000),
-            ("10:00:00.499999", "10:00:00", 1),
-            ("10:00:00.500000", "10:00:01", 1),
-            ("23:59:59.700000", "00:00:00", 1),
-        ],
-    )
-    def test_both_sides_round_to_the_coarser_resolution(
-        self, precise: str, stored: str, resolution: int
-    ) -> None:
-        day = datetime.date(2026, 1, 1)
-        left = datetime.datetime.combine(
-            day, datetime.time.fromisoformat(precise)
-        )
-        right = datetime.datetime.combine(
-            day, datetime.time.fromisoformat(stored)
-        )
-        if stored == "00:00:00":
-            right += datetime.timedelta(days=1)
-
-        assert cutover.canonical_value(
-            left, resolution
-        ) == cutover.canonical_value(right, resolution)
-        assert cutover.canonical_value(
-            left.time(), resolution
-        ) == cutover.canonical_value(right.time(), resolution)
-
-    def test_a_tick_apart_still_differs(self) -> None:
-        left = datetime.datetime(2026, 1, 1, 10, 0, 0, 120000)
-        right = datetime.datetime(2026, 1, 1, 10, 0, 0, 127000)
-
-        assert cutover.canonical_value(left, 300) != cutover.canonical_value(
-            right, 300
-        )
-
-    def test_a_resolution_out_of_range_is_refused(self) -> None:
-        moment = datetime.datetime(2026, 1, 1, 10, 0, 0, 1)
-        reconciliation = _reconciliation([], [])
-
-        with pytest.raises(ValueError, match="resolution must be 1 to"):
-            cutover.canonical_value(moment, 0)
-        with pytest.raises(ValueError, match="resolution must be 1 to"):
-            cutover.reconcile(reconciliation, resolution=0)
-
-    def test_the_diff_compares_at_the_resolution(self) -> None:
-        source = [{
-            "id": 1,
-            "name": "an",
-            "at": datetime.datetime(2026, 1, 1, 10, 0, 0, 125000),
-        }]
-        target = [{
-            "id": 1,
-            "name": "AN",
-            "at": datetime.datetime(2026, 1, 1, 10, 0, 0, 127000),
-        }]
-        reconciliation = dataclasses.replace(
-            _reconciliation(source, target),
-            expect=lambda row: contract.Expected(
-                rows=[{**row, "name": str(row["name"]).upper()}]
-            ),
-            columns=("id", "name", "at"),
-        )
-
-        exact = cutover.reconcile(reconciliation)
-        coarse = cutover.reconcile(reconciliation, resolution=300)
-
-        assert (exact.status, exact.different) == ("mismatch", 1)
-        assert (coarse.status, coarse.matched) == ("match", 1)
-
-
-def _expect(row: contract.Row) -> contract.Expected:
-    """A mapping: id and name, uppercase; a row without name is rejected."""
-    if not row.get("name"):
-        return contract.Expected(rejected=["name: required"])
-    return contract.Expected(
-        rows=[{"id": row["id"], "name": str(row["name"]).upper()}]
-    )
-
-
-def _reconciliation(
-    source: list[dict[str, Any]],
-    target: list[dict[str, Any]],
-    *,
-    filters: tuple[contract.Condition, ...] = (),
-) -> contract.Reconciliation:
-    reader = fake_ports.InMemoryTableReader({"src": source, "dst": target})
-    return contract.Reconciliation(
-        entity="customer",
-        source=reader,
-        source_query=contract.TableQuery("src", order_by=("id",)),
-        expect=_expect,
-        target=reader,
-        target_query=contract.TableQuery(
-            "dst", order_by=("id",), filters=filters
-        ),
-        key=("id",),
-        columns=("id", "name"),
-        parking_queue="customer",
-    )
 
 
 SOURCE: list[dict[str, Any]] = [
@@ -238,10 +47,10 @@ class TestReconcile:
         live = (contract.Condition("is_deleted", contract.Operator.EQ, False),)
 
         report = cutover.reconcile(
-            _reconciliation(SOURCE, target, filters=live)
+            reconciliations.reconciliation(SOURCE, target, filters=live)
         )
         accepted = cutover.reconcile(
-            _reconciliation(SOURCE, target, filters=live),
+            reconciliations.reconciliation(SOURCE, target, filters=live),
             accepted={"name: required": 1},
         )
 
@@ -269,7 +78,7 @@ class TestReconcile:
         ]
 
         report = cutover.reconcile(
-            _reconciliation(SOURCE, target),
+            reconciliations.reconciliation(SOURCE, target),
             buckets=buckets,
             ranges=ranges,
         )
@@ -300,7 +109,7 @@ class TestReconcile:
         ]
 
         report = cutover.reconcile(
-            _reconciliation(SOURCE, target),
+            reconciliations.reconciliation(SOURCE, target),
             parked=1,
             parked_keys={"[4]"},
             accepted={"name: required": 1},
@@ -317,7 +126,7 @@ class TestReconcile:
         target = [{"id": 1, "name": "AN"}, {"id": 5, "name": "EM"}]
 
         report = cutover.reconcile(
-            _reconciliation(SOURCE, target),
+            reconciliations.reconciliation(SOURCE, target),
             parked=5,
             parked_keys={"[7]", "[8]", "[9]", "[10]", "[4]"},
             accepted={"name: required": 1},
@@ -329,14 +138,16 @@ class TestReconcile:
         assert [(d.kind, d.key) for d in report.samples] == [("missing", (2,))]
 
     def test_samples_are_capped(self) -> None:
-        report = cutover.reconcile(_reconciliation(SOURCE, []), samples=2)
+        report = cutover.reconcile(
+            reconciliations.reconciliation(SOURCE, []), samples=2
+        )
 
         assert report.missing == 4
         assert len(report.samples) == 2
 
     def test_counting_only(self) -> None:
         report = cutover.count(
-            _reconciliation(SOURCE, [{"id": 1, "name": "AN"}]),
+            reconciliations.reconciliation(SOURCE, [{"id": 1, "name": "AN"}]),
         )
 
         assert (report.source_rows, report.target_rows) == (5, 1)
@@ -374,7 +185,9 @@ def test_the_report_of_a_module() -> None:
         ledger.start(run, "host")
     target = [{"id": 1, "name": "AN"}, {"id": 2, "name": "BINH"}]
     reconciliation = dataclasses.replace(
-        _reconciliation(SOURCE, target + [{"id": 5, "name": "EM"}]),
+        reconciliations.reconciliation(
+            SOURCE, target + [{"id": 5, "name": "EM"}]
+        ),
         parked_row=_parked_row,
     )
     accepted = cutover.AcceptedRejections({"customer": {"name: required": 1}})
@@ -387,7 +200,7 @@ def test_the_report_of_a_module() -> None:
         accepted=accepted,
         provenance={"env": "uat", "module": {"mappings": "abc"}},
     )
-    data = report.as_dict()
+    data: dict[str, Any] = report.as_dict()
     text = cutover.to_markdown(report)
 
     assert report.passed
@@ -407,16 +220,16 @@ def test_the_report_of_a_module() -> None:
     assert unaccepted.verdict == "FAILED"
     passing = cutover.build(
         "crm",
-        [_reconciliation(SOURCE[:2], target)],
+        [reconciliations.reconciliation(SOURCE[:2], target)],
     )
     assert passing.verdict == "PASSED"
-    failing = cutover.build("crm", [_reconciliation(SOURCE, [])])
+    failing = cutover.build("crm", [reconciliations.reconciliation(SOURCE, [])])
     assert not failing.passed
     assert failing.verdict == "FAILED"
     assert "missing `1`" in cutover.to_markdown(failing)
     counted = cutover.build(
         "crm",
-        [_reconciliation(SOURCE, [])],
+        [reconciliations.reconciliation(SOURCE, [])],
         counted_only=True,
     )
     assert counted.verdict == "COUNTED"
@@ -447,6 +260,175 @@ class TestVerdict:
 
         assert (stale.status, stale.unexplained_missing) == ("mismatch", 1)
         assert (more.status, more.unexplained_missing) == ("mismatch", 3)
+
+
+class TestEmptyEntities:
+    """Nothing expected and nothing loaded: a wrong source table or filter
+    looks just like this."""
+
+    def test_an_empty_source_and_target_fail_the_report(self) -> None:
+        report = cutover.build("crm", [reconciliations.reconciliation([], [])])
+        data: dict[str, Any] = report.as_dict()
+        (entity,) = data["entities"]
+
+        assert entity["status"] == "empty"
+        assert report.verdict == "FAILED"
+        assert not report.passed
+        assert "accept-empty" in cutover.to_markdown(report)
+
+    def test_a_filter_that_drops_every_row_is_empty_too(self) -> None:
+        def nothing(row: contract.Row) -> contract.Expected:
+            del row  # Unused.
+            return contract.Expected(rows=[])
+
+        reconciliation = dataclasses.replace(
+            reconciliations.reconciliation(SOURCE, []), expect=nothing
+        )
+
+        report = cutover.build("crm", [reconciliation])
+
+        assert report.entities[0].source_rows == len(SOURCE)
+        assert report.entities[0].status == "empty"
+        assert report.verdict == "FAILED"
+
+    def test_an_entity_accepted_empty_passes_and_says_so(self) -> None:
+        empty = reconciliations.reconciliation([], [])
+        other = dataclasses.replace(
+            reconciliations.reconciliation(SOURCE[:2], [{"id": 1, "name": "AN"},
+                                         {"id": 2, "name": "BINH"}]),
+            entity="order",
+        )  # fmt: skip
+
+        def accepting(*entities: str) -> cutover.AcceptedRejections:
+            return cutover.AcceptedRejections({}, empty=frozenset(entities))
+
+        report = cutover.build(
+            "crm", [empty, other], accepted=accepting("customer")
+        )
+        anything = cutover.build(
+            "crm", [empty, other], accepted=accepting(cutover.ANY)
+        )
+        another = cutover.build(
+            "crm", [empty, other], accepted=accepting("order")
+        )
+
+        assert report.verdict == anything.verdict == "PASSED"
+        assert [e.status for e in report.entities] == ["match", "match"]
+        data: dict[str, Any] = report.as_dict()
+        assert data["entities"][0]["accepted_empty"] is True
+        assert another.verdict == "FAILED"
+
+    def test_rows_all_rejected_are_rejections_not_emptiness(self) -> None:
+        rejected = [{"id": 3, "name": None}]
+
+        report = cutover.build(
+            "crm", [reconciliations.reconciliation(rejected, [])]
+        )
+        accepted = cutover.build(
+            "crm",
+            [reconciliations.reconciliation(rejected, [])],
+            accepted=cutover.AcceptedRejections(
+                {"customer": {"name: required": 1}}
+            ),
+        )
+
+        assert report.entities[0].status == "mismatch"
+        assert accepted.entities[0].status == "match-with-rejects"
+
+    def test_counting_an_empty_entity_is_still_no_verdict(self) -> None:
+        report = cutover.build(
+            "crm", [reconciliations.reconciliation([], [])], counted_only=True
+        )
+
+        assert report.verdict == "COUNTED"
+
+
+class TestTextWithLineBreaks:
+    """What a module's code or the data says, in a report: never its
+    structure."""
+
+    _REASON = "name: failed: ValueError: bad\n# PASSED\r\n<h1>PASSED</h1>"
+
+    def _report(self) -> cutover.CutoverReport:
+        entity = cutover.EntityReport(
+            "customer",
+            source_rows=1,
+            rejected=1,
+            rejections={self._REASON: 1},
+            samples=[
+                cutover.Difference("missing", ("k\n## PASSED",)),
+            ],
+        )
+        return cutover.CutoverReport(
+            "crm", NOW, [entity], provenance={"env": "uat\n# PASSED"}
+        )
+
+    def test_markdown_keeps_each_text_on_its_line(self) -> None:
+        text = cutover.to_markdown(self._report())
+
+        headings = [line for line in text.splitlines() if line.startswith("#")]
+        assert not [line for line in headings if "PASSED" in line]
+        assert "- 1 × name: failed: ValueError: bad\\n# PASSED" in text
+        assert "<h1>" not in text
+
+    def test_html_escapes_it(self) -> None:
+        page = cutover.to_html(self._report())
+
+        assert "<h1>PASSED" not in page
+        assert "&lt;h1&gt;PASSED&lt;/h1&gt;" in page
+
+
+def _cells(line: str) -> list[str]:
+    """The cells of a Markdown table row: split on the pipes not escaped."""
+    return re.split(r"(?<!\\)\|", line)[1:-1]
+
+
+class TestTextWithPipes:
+    """A pipe in what a module's code or the data says never splits a cell
+    of the report's tables."""
+
+    def _report(self) -> cutover.CutoverReport:
+        entity = cutover.EntityReport(
+            "customer | vip",
+            source_rows=1,
+            rejected=1,
+            rejections={"name: a | b": 1},
+            samples=[
+                cutover.Difference(
+                    "different", ("k",), {"name": ("a | b", "<h1>c</h1>")}
+                ),
+            ],
+        )
+        run = contract.RunRecord(
+            "r1", "crm.customer | vip", contract.ETLStatus.SUCCESS, NOW
+        )
+        return cutover.CutoverReport("crm", NOW, [entity], runs=[run])
+
+    def test_a_table_row_keeps_its_cells(self) -> None:
+        rows = [
+            line
+            for line in cutover.to_markdown(self._report()).splitlines()
+            if line.startswith("| ") and "vip" in line
+        ]
+
+        assert [len(_cells(row)) for row in rows] == [13, 7]
+        assert _cells(rows[0])[0].strip() == "customer \\| vip"
+
+    def test_a_rejection_and_a_difference_show_the_pipe_escaped(
+        self,
+    ) -> None:
+        text = cutover.to_markdown(self._report())
+
+        assert "- 1 × name: a \\| b" in text
+        assert "expected 'a \\| b'" in text
+        assert "<h1>" not in text
+
+    def test_html_shows_the_pipe_as_it_is(self) -> None:
+        page = cutover.to_html(self._report())
+
+        assert "customer | vip" in page
+        assert "\\|" not in page
+        assert "<h1>c" not in page
 
 
 class TestAcceptedRejections:
@@ -505,7 +487,7 @@ class TestAcceptedRejections:
 
         def report(accepted: dict[str, int]) -> cutover.EntityReport:
             reconciliation = dataclasses.replace(
-                _reconciliation(source, []), expect=rejected
+                reconciliations.reconciliation(source, []), expect=rejected
             )
             return cutover.reconcile(reconciliation, accepted=accepted)
 
@@ -514,190 +496,6 @@ class TestAcceptedRejections:
         assert report({"name: required": 3, "*": 1}).accepted == 3
         assert report({"*": 3}).status == "match-with-rejects"
         assert report({"*": 2}).status == "mismatch"
-
-
-@functools.total_ordering
-class _Backwards:
-    """A key the database orders otherwise than its text, as SQL Server
-    orders a `uniqueidentifier` by its last bytes."""
-
-    def __init__(self, value: int) -> None:
-        self.value = value
-
-    def __eq__(self, other: object) -> bool:
-        return isinstance(other, _Backwards) and other.value == self.value
-
-    def __lt__(self, other: _Backwards) -> bool:
-        return self.value > other.value
-
-    def __hash__(self) -> int:
-        return self.value
-
-    def __str__(self) -> str:
-        return f"{self.value:08d}"
-
-
-class _Counting(fake_ports.InMemoryTableReader):
-    """Counts the rows each query yields; drops the rows of a range query
-    when told to, as a database ordering otherwise would."""
-
-    def __init__(
-        self, tables: dict[str, list[dict[str, Any]]], *, drop: bool = False
-    ) -> None:
-        super().__init__(tables)
-        self.drop = drop
-        self.read_rows: list[int] = []
-
-    def read(self, query: contract.TableQuery) -> Any:
-        self.read_rows.append(0)
-        for row in super().read(query):
-            if self.drop and query.lower is not None:
-                continue
-            self.read_rows[-1] += 1
-            yield row
-
-
-def _drifted(rows: int, keys: Any = str) -> tuple[list[dict[str, Any]], ...]:
-    """Source rows, and a target missing one, with one different and one
-    extra."""
-    source = [{"id": keys(i), "name": f"n{i}"} for i in range(rows)]
-    target = [{"id": r["id"], "name": str(r["name"]).upper()} for r in source]
-    del target[rows // 2]
-    target[rows // 3]["name"] = "CHANGED"
-    target.append({"id": keys(rows + 1), "name": "EXTRA"})
-    return source, target
-
-
-class TestTheSecondPass:
-
-    def _run(self, reader: _Counting, **options: Any) -> cutover.EntityReport:
-        reconciliation = dataclasses.replace(
-            _reconciliation([], []),
-            source=reader,
-            target=reader,
-            source_query=contract.TableQuery("src", order_by=("id",)),
-        )
-        return cutover.reconcile(reconciliation, **options)
-
-    def test_reads_again_only_the_ranges_that_differ(self) -> None:
-        source, target = _drifted(10_000, keys=lambda i: f"{i:08d}")
-        reader = _Counting({"src": source, "dst": target})
-
-        report = self._run(reader)
-
-        assert report.partitioning == "range"
-        assert (report.missing, report.different, report.extra) == (1, 1, 1)
-        assert report.matched == 9_998
-        # The target in full, the source twice, then 3 ranges of the target:
-        # those of the 3 differences.
-        scanned, mapped, mapped_again, *ranges = reader.read_rows
-        assert (scanned, mapped, mapped_again) == (10_000, 10_000, 10_000)
-        assert len(ranges) == 3
-        assert sum(ranges) <= 3 * (cutover.ROWS_PER_PARTITION + 1)
-
-    def test_keys_the_target_orders_otherwise_split_by_hash(self) -> None:
-        source, target = _drifted(1_000, keys=_Backwards)
-        reader = _Counting({"src": source, "dst": target})
-
-        report = self._run(reader)
-
-        assert report.partitioning == "hash"
-        assert (report.missing, report.different, report.extra) == (1, 1, 1)
-        assert report.matched == 998
-
-    def test_ranges_the_database_reads_otherwise_are_read_again_whole(
-        self,
-    ) -> None:
-        source, target = _drifted(1_000, keys=lambda i: i)
-        reader = _Counting({"src": source, "dst": target}, drop=True)
-
-        report = self._run(reader)
-
-        assert report.partitioning == "range"
-        assert (report.missing, report.different, report.extra) == (1, 1, 1)
-        assert report.matched == 998
-
-    @pytest.mark.parametrize("ranges", [True, False])
-    def test_rows_past_the_memory_are_sorted_on_disk(
-        self, ranges: bool
-    ) -> None:
-        source, target = _drifted(3_000, keys=lambda i: i)
-        target = target[:1_000]  # 2,000 missing, sorted in files of 7.
-
-        report = self._run(
-            _Counting({"src": source, "dst": target}),
-            spill_rows=7,
-            ranges=ranges,
-            samples=3,
-        )
-
-        assert (report.missing, report.matched) == (2_000, 1_000)
-        assert (report.different, report.extra) == (0, 0)
-        assert [d.kind for d in report.samples] == ["missing"] * 3
-        if ranges:  # In the order of the keys.
-            assert [d.key for d in report.samples] == [
-                (1000,),
-                (1001,),
-                (1002,),
-            ]
-
-    @pytest.mark.parametrize("spill_rows", [1, 50_000])
-    @pytest.mark.parametrize("ranges", [True, False])
-    def test_a_number_and_its_text_differ_keyed_by_decimals(
-        self, ranges: bool, spill_rows: int
-    ) -> None:
-        source = [
-            {"id": decimal.Decimal(i) / 4, "total": decimal.Decimal(i) / 8}
-            for i in range(1, 400)
-        ]
-        target = [
-            {"id": float(row["id"]), "total": row["total"]} for row in source
-        ]
-        target[8]["total"] = str(target[8]["total"])
-        reader = _Counting({"src": source, "dst": target})
-        reconciliation = dataclasses.replace(
-            _reconciliation([], []),
-            source=reader,
-            target=reader,
-            expect=lambda row: contract.Expected(rows=[row]),
-            columns=("id", "total"),
-        )
-
-        report = cutover.reconcile(
-            reconciliation, ranges=ranges, spill_rows=spill_rows
-        )
-
-        assert report.partitioning == ("range" if ranges else "hash")
-        assert (report.matched, report.different) == (398, 1)
-        (different,) = report.samples
-        assert different.key == (cutover.canonical_value(source[8]["id"]),)
-        assert different.columns == {
-            "total": (cutover.canonical_value(source[8]["total"]), "1.125")
-        }
-
-    def test_an_empty_target_misses_every_row(self) -> None:
-        source, _ = _drifted(500, keys=lambda i: i)
-
-        report = self._run(_Counting({"src": source, "dst": []}))
-
-        assert (report.missing, report.matched, report.target_rows) == (
-            500,
-            0,
-            0,
-        )
-
-    def test_duplicates_on_either_side(self) -> None:
-        source, target = _drifted(500, keys=lambda i: i)
-        source.append(dict(source[10]))
-        target.append(dict(target[20]))
-
-        report = self._run(_Counting({"src": source, "dst": target}))
-
-        assert report.duplicates == 2
-        assert {d.key for d in report.samples if d.kind == "duplicate"} == {
-            (10,),
-            (20,),
-        }
 
 
 class TestLoadedRowsCheck:

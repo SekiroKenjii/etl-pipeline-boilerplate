@@ -94,3 +94,25 @@ def test_the_summary_tells_the_verdict(tmp_path: pathlib.Path) -> None:
         ("env", "uat"),
         ("module.mappings", "x"),
     ]
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["bad\n# PASSED", "colour \x1b[31mred\x1b[0m", "nul \x00 byte", "\x0bx"],
+    ids=["line feed", "escape", "nul", "vertical tab"],
+)
+def test_any_text_is_written(tmp_path: pathlib.Path, value: str) -> None:
+    path = xlsx.write_cutover_report(_report(value), tmp_path / "r.xlsx")
+
+    rejected = list(
+        openpyxl.load_workbook(path)["Rejected"].iter_rows(values_only=True)
+    )
+
+    (reason,) = [row[1] for row in rejected[1:]]
+    assert isinstance(reason, str)
+    if value == "bad\n# PASSED":
+        # The Rejected sheet is the acceptance CSV's: a reason stays as is.
+        assert reason == value
+    else:
+        assert "\x1b" not in reason
+        assert "\x00" not in reason

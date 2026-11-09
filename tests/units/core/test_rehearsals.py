@@ -10,6 +10,11 @@ import pytest
 from core import cutover
 
 
+def _seal(report: dict[str, Any]) -> dict[str, Any]:
+    """A report sealed, as JSON its reader indexes."""
+    return cutover.seal(report)
+
+
 def _report(**entity: Any) -> dict[str, Any]:
     customer = {
         "entity": "customer",
@@ -34,18 +39,18 @@ class TestSeal:
     def test_a_report_sealed_again_verifies_alone(self) -> None:
         # Why the digest is recorded in the run ledger too: alone, it shows
         # an edit, not an edit sealed again (`etl cutover verify`).
-        sealed = cutover.seal(_report())
-        forged = cutover.seal({**sealed, "passed": True})
+        sealed = _seal(_report())
+        forged = _seal({**sealed, "passed": True})
 
         assert cutover.verify(forged)
         assert forged["digest"] != sealed["digest"]
 
     def test_a_sealed_report_verifies_until_changed(self) -> None:
-        sealed = cutover.seal(_report())
+        sealed = _seal(_report())
 
         assert cutover.verify(sealed)
         assert len(sealed["digest"]) == 64
-        assert cutover.seal(_report())["digest"] == sealed["digest"]
+        assert _seal(_report())["digest"] == sealed["digest"]
         sealed["entities"][0]["rejected"] = 0
         assert not cutover.verify(sealed)
 
@@ -56,8 +61,8 @@ class TestSeal:
 class TestCompare:
 
     def test_what_changed_between_rehearsals(self) -> None:
-        before = cutover.seal(_report())
-        after = cutover.seal(_report(status="match", rejected=0, matched=4))
+        before = _seal(_report())
+        after = _seal(_report(status="match", rejected=0, matched=4))
         after["entities"].append({"entity": "order", "status": "match"})
 
         comparison = cutover.compare(before, after)
@@ -74,7 +79,7 @@ class TestCompare:
         assert before["digest"][:16] in text
 
     def test_nothing_changed(self) -> None:
-        report = cutover.seal(_report())
+        report = _seal(_report())
 
         comparison = cutover.compare(report, report)
 

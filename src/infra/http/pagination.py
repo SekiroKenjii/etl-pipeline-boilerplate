@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 import dataclasses
-from typing import Any, Protocol
 
 import httpx
 
@@ -21,27 +20,13 @@ class Page:
     """
 
     url: str
-    params: Mapping[str, Any] = dataclasses.field(default_factory=dict)
-
-
-class Paginator(Protocol):
-    """Tells which page comes after which."""
-
-    def first_page(self, url: str, params: Mapping[str, Any]) -> Page:
-        """Returns the first page of the endpoint at `url`."""
-        ...
-
-    def next_page(
-        self, page: Page, response: httpx.Response, records: Sequence[object]
-    ) -> Page | None:
-        """Returns the page after `page`, or None when there is none."""
-        ...
+    params: Mapping[str, object] = dataclasses.field(default_factory=dict)
 
 
 class NoPagination:
     """A single request."""
 
-    def first_page(self, url: str, params: Mapping[str, Any]) -> Page:
+    def first_page(self, url: str, params: Mapping[str, object]) -> Page:
         return Page(url, dict(params))
 
     def next_page(
@@ -70,7 +55,7 @@ class PageNumberPaginator:
     size_param: str | None = None
     size: int | None = None
 
-    def first_page(self, url: str, params: Mapping[str, Any]) -> Page:
+    def first_page(self, url: str, params: Mapping[str, object]) -> Page:
         first = {**params, self.page_param: self.start}
         if self.size_param is not None and self.size is not None:
             first[self.size_param] = self.size
@@ -83,8 +68,12 @@ class PageNumberPaginator:
         if not records or (self.size is not None and len(records) < self.size):
             return None
 
-        current = int(page.params[self.page_param])
-        return Page(page.url, {**page.params, self.page_param: current + 1})
+        current = page.params[self.page_param]
+        if not isinstance(current, (str, int, float)):
+            raise TypeError(f"page {current!r} is not a number")
+        return Page(
+            page.url, {**page.params, self.page_param: int(current) + 1}
+        )
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -102,7 +91,7 @@ class CursorPaginator:
     cursor_param: str = "cursor"
     cursor_path: str = "next_cursor"
 
-    def first_page(self, url: str, params: Mapping[str, Any]) -> Page:
+    def first_page(self, url: str, params: Mapping[str, object]) -> Page:
         return Page(url, dict(params))
 
     def next_page(
@@ -119,7 +108,7 @@ class CursorPaginator:
 class LinkHeaderPaginator:
     """Pages by RFC 8288 `Link: <https://...?page=2>; rel="next"` headers."""
 
-    def first_page(self, url: str, params: Mapping[str, Any]) -> Page:
+    def first_page(self, url: str, params: Mapping[str, object]) -> Page:
         return Page(url, dict(params))
 
     def next_page(

@@ -7,7 +7,7 @@ import copy
 import dataclasses
 import datetime
 import threading
-from typing import Any
+import typing
 
 from core import contract
 from shared import utils
@@ -52,7 +52,7 @@ class InMemoryParkingLot(contract.IParkingLot):
                     del parked[entry.identity]
 
 
-class ParkingQuarantine(contract.IQuarantine):
+class ParkingQuarantine[T](contract.IQuarantine):
     """Parks the records rejected by some rules only; quarantines the others.
 
     Typically the referential integrity rules of foreign keys whose parents may
@@ -85,8 +85,8 @@ class ParkingQuarantine(contract.IQuarantine):
         queue: str,
         *,
         rules: Collection[str],
-        encode: Callable[[Any], contract.StateValue],
-        identity: Callable[[Any], str],
+        encode: Callable[[T], contract.StateValue],
+        identity: Callable[[T], str],
         fallback: contract.IQuarantine,
     ) -> None:
         """Initializes the quarantine.
@@ -130,11 +130,11 @@ class ParkingQuarantine(contract.IQuarantine):
 
     def put(
         self,
-        records: Sequence[contract.RejectedRecord[Any]],
+        records: Sequence[contract.RejectedRecord[object]],
         ctx: contract.ETLContext,
     ) -> None:
         parked: list[contract.ParkedEntry] = []
-        others: list[contract.RejectedRecord[Any]] = []
+        others: list[contract.RejectedRecord[object]] = []
         for rejected in records:
             reasons = [
                 issue
@@ -142,10 +142,12 @@ class ParkingQuarantine(contract.IQuarantine):
                 if issue.action is contract.QualityAction.REJECT
             ]
             if reasons and all(issue.rule in self.rules for issue in reasons):
+                # Its gate's checkpoint gives it the records of type T only.
+                record = typing.cast(T, rejected.record)
                 parked.append(
                     contract.ParkedEntry(
-                        identity=self._identity(rejected.record),
-                        payload=self._encode(rejected.record),
+                        identity=self._identity(record),
+                        payload=self._encode(record),
                         reason="; ".join(
                             f"{issue.rule}: {issue.message}"
                             for issue in reasons

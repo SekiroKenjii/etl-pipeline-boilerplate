@@ -112,6 +112,29 @@ class TestETLResultComplete:
 
         assert result.status is contract.ETLStatus.FAILED
 
+    @pytest.mark.parametrize(
+        "stats",
+        [
+            contract.ETLStats(total=10, successful=9, failed=1),
+            contract.ETLStats(total=10, successful=8, failed=1, rejected=1),
+        ],
+    )
+    def test_records_failed_mean_failure_whatever_was_loaded(
+        self, stats: contract.ETLStats
+    ) -> None:
+        # A system error, not bad data: `--partial-ok` must not let it pass.
+        result = contract.ETLResult(stats=stats)
+        result.complete()
+
+        assert result.status is contract.ETLStatus.FAILED
+
+    def test_errors_mean_failure_whatever_was_loaded(self) -> None:
+        result = contract.ETLResult(stats=contract.ETLStats(successful=8))
+        result.add_error(contract.ETLError("boom"))
+        result.complete()
+
+        assert result.status is contract.ETLStatus.FAILED
+
     def test_explicit_status_wins(self) -> None:
         result = contract.ETLResult()
         result.complete(contract.ETLStatus.SKIPPED, "nothing to do")

@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 import datetime
 import json
 import logging
-from typing import Any
 
 from core import observability
 from shared import utils
@@ -18,9 +17,11 @@ _STANDARD_RECORD_ATTRIBUTES = frozenset(vars(logging.makeLogRecord({}))) | {
 }
 
 
-def fields(record: logging.LogRecord) -> Iterator[tuple[str, Any]]:
+def fields(record: logging.LogRecord) -> Iterator[tuple[str, object]]:
     """Yields the context fields of a record, then its extra fields."""
-    context = getattr(record, observability.FIELDS_ATTRIBUTE, None) or {}
+    context: Mapping[str, object] = (
+        getattr(record, observability.FIELDS_ATTRIBUTE, None) or {}
+    )
     yield from context.items()
     for key, value in vars(record).items():
         if key not in _STANDARD_RECORD_ATTRIBUTES and not key.startswith("_"):
@@ -47,7 +48,7 @@ class JsonFormatter(logging.Formatter):
         self.environment = environment
 
     def format(self, record: logging.LogRecord) -> str:
-        document: dict[str, Any] = {
+        document: dict[str, object] = {
             "@timestamp": (
                 datetime.datetime.fromtimestamp(record.created, datetime.UTC)
                 .isoformat(timespec="milliseconds")

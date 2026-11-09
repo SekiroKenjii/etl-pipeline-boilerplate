@@ -9,10 +9,11 @@ import enum
 
 from core.contract import etl
 from core.contract import exceptions
+from core.contract import results
 from shared import utils
 
 type StepHandler = Callable[
-    [etl.ETLContext, Mapping[str, etl.ETLResult]], etl.ETLResult
+    [etl.ETLContext, Mapping[str, results.ETLResult]], results.ETLResult
 ]
 
 
@@ -114,8 +115,8 @@ class PipelineResult:
         default_factory=utils.utc_now
     )
     completed_at: datetime.datetime | None = None
-    step_results: dict[str, etl.ETLResult] = dataclasses.field(
-        default_factory=dict[str, etl.ETLResult]
+    step_results: dict[str, results.ETLResult] = dataclasses.field(
+        default_factory=dict[str, results.ETLResult]
     )
     stats: etl.ETLStats = dataclasses.field(default_factory=etl.ETLStats)
     message: str | None = None
@@ -132,7 +133,7 @@ class PipelineResult:
     def succeeded(self) -> bool:
         return self.status is etl.ETLStatus.SUCCESS
 
-    def add_step_result(self, name: str, result: etl.ETLResult) -> None:
+    def add_step_result(self, name: str, result: results.ETLResult) -> None:
         self.step_results[name] = result
         self.stats += result.stats
 
@@ -184,7 +185,7 @@ class PipelineListener:
     def on_step_end(
         self,
         step: PipelineStep,
-        result: etl.ETLResult,
+        result: results.ETLResult,
         ctx: etl.ETLContext,
     ) -> None:
         """Called once a step finished, after its last attempt."""

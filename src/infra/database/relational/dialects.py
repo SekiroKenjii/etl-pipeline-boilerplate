@@ -15,7 +15,8 @@ into a column with a time zone means the same instant whatever the server's,
 the client's or `PGTZ`'s zone. SQL Server and SQLite have no session time
 zone (a naive value written into a `datetimeoffset` gets +00:00).
 
-Other databases SQLAlchemy supports get the base `Dialect`.
+Other databases SQLAlchemy supports get the base `Dialect`
+(`base_dialect`).
 """
 
 from __future__ import annotations
@@ -23,283 +24,64 @@ from __future__ import annotations
 from collections.abc import Generator, Sequence
 import contextlib
 import hashlib
-import re
+import logging
+import sqlite3
 import threading
-from typing import Any
 import uuid
 
 from sqlalchemy import exc as sa_exc
 import sqlalchemy as sa
+from sqlalchemy.dialects import mysql as mysql_dialect
 from sqlalchemy.dialects import postgresql as pg_dialect
+from sqlalchemy.dialects import sqlite as sqlite_dialect
 
 from core import contract
+from infra.database.relational import base_dialect
+from infra.database.relational import bulk_loading
+from infra.database.relational import driver_errors
+from infra.database.relational import mssql_datetimes
+from infra.database.relational import mssql_indexes
+from infra.database.relational import staging
+from infra.database.relational import types as relational_types
 
-STAGE = "etl_stage"
+_LOG = logging.getLogger(__name__)
+
+STAGE = base_dialect.STAGE
 _ROW_LOCKS = "WITH (ROWLOCK)"
-type _Joining = sa.Insert | sa.Update | sa.Delete
-_UPDATING = (contract.WriteMode.UPSERT, contract.WriteMode.UPDATE)
+# SQL Server compiles a plan per IN list length: 1,000 keys read back in
+# lists of 500 took 13.3 ms, in one list of 1,000 15.6 ms (SQL Server 16,
+# `etl calibrate`, docs/tuning.md).
+MSSQL_IN_CHUNK = 500
 
-# SQLSTATEs (ISO SQL, ODBC, Postgres) of transient failures: connection
-# errors (08xxx), serialization failures and deadlocks, insufficient
-# resources (53xxx: too many connections...), lock timeouts, cancelled
-# statements (a statement or lock timeout), servers shutting down or
-# starting, ODBC timeouts. Any other SQLSTATE is fatal: authorization (28),
-# bad SQL or a missing table or column (42), a missing database (3D) or
-# schema (3F), bad data (22), a constraint (23)...
-_RETRYABLE_STATES = (
-    "01002",
-    "08",
-    "40001",
-    "40003",
-    "40P01",
-    "53",
-    "55P03",
-    "57014",
-    "57P01",
-    "57P02",
-    "57P03",
-    "HYT00",
-    "HYT01",
-)
-# "General error": the SQLSTATE of anything else, which tells nothing.
-_UNTOLD_STATES = frozenset({"HY000"})
-_SQLSTATE = re.compile(r"^[0-9A-Z]{5}$")
-# The native error number in pyodbc messages: `... (1205) (SQLExecDirectW)`.
-_ODBC_NATIVE = re.compile(r"\((-?\d+)\) \(SQL\w*\)")
-_BULK_NATIVE = re.compile(r"Sql Error: (\d+)")
+Dialect = base_dialect.Dialect
+error_code = driver_errors.error_code
+sqlstate = driver_errors.sqlstate
+is_unique_violation = driver_errors.is_unique_violation
 
 
-def _codes(text: str) -> frozenset[str]:
-    """Returns the error codes written in `text`, separated by blanks."""
-    return frozenset(text.split())
+class SqliteDialect(Dialect):
+    """SQLite: the base behavior, and INSERT ... ON CONFLICT DO NOTHING."""
 
+    name = "sqlite"
+    # SQLITE_MAX_VARIABLE_NUMBER: 999 before 3.32.0, 32,766 since.
+    parameter_limit = 32_766 if sqlite3.sqlite_version_info >= (3, 32) else 999
 
-class Dialect:
-    """The base behavior, for any database with TEMPORARY tables and
-    UPDATE ... FROM, like SQLite and MySQL.
+    def bind(self, column: sa.ColumnElement[object], value: object) -> object:
+        """`value` as it is: SQLite would bind a `Decimal` as a float, whose
+        digits stop at 2**53."""
+        del column  # Unused.
+        return value
 
-    Attributes:
-        session_setup: Statements run on each new connection, before any
-            use.
-        retryable_codes: Error codes of the database or its drivers that
-            are transient (`error_code`).
-        fatal_codes: Error codes retrying cannot fix.
-        retryable_messages: Parts of the message of transient errors with
-            neither code nor SQLSTATE.
-        fatal_messages: Parts of the message of errors retrying cannot fix,
-            with neither code nor SQLSTATE.
-    """
-
-    name = "generic"
-    session_setup: tuple[str, ...] = ()
-    # SQLite (the base dialect): busy, locked or unreadable files are transient;
-    # a missing table or a read-only database are not.
-    retryable_codes: frozenset[str] = _codes(
-        "SQLITE_BUSY SQLITE_LOCKED SQLITE_CANTOPEN SQLITE_IOERR SQLITE_PROTOCOL"
-    )
-    fatal_codes: frozenset[str] = _codes(
-        "SQLITE_ERROR SQLITE_AUTH SQLITE_CONSTRAINT SQLITE_CORRUPT "
-        "SQLITE_MISMATCH SQLITE_NOTADB SQLITE_PERM SQLITE_RANGE "
-        "SQLITE_READONLY SQLITE_TOOBIG"
-    )
-    retryable_messages: tuple[str, ...] = ()
-    fatal_messages: tuple[str, ...] = ("no such table", "no such column")
-
-    def transient(self, exc: sa_exc.DBAPIError) -> bool:
-        """Whether a database error may not happen again: worth a retry.
-
-        In order: a connection SQLAlchemy found lost; the database's error
-        code; the message; the SQLSTATE; at last the kind of error, an
-        operational or interface error being transient (a lost connection,
-        a timeout) and any other not.
-        """
-        if exc.connection_invalidated:
-            return True
-        orig = exc.orig
-        code = error_code(orig)
-        if code in self.retryable_codes:
-            return True
-        if code in self.fatal_codes:
-            return False
-        text = str(orig)
-        if any(part in text for part in self.retryable_messages):
-            return True
-        if any(part in text for part in self.fatal_messages):
-            return False
-        state = sqlstate(orig)
-        if state is not None and state not in _UNTOLD_STATES:
-            return state.startswith(_RETRYABLE_STATES)
-        return isinstance(exc, (sa_exc.OperationalError, sa_exc.InterfaceError))
-
-    def after(
-        self, columns: Sequence[sa.ColumnElement[Any]], values: Sequence[Any]
-    ) -> sa.ColumnElement[bool]:
-        """Returns `(columns) > (values)`, the keyset condition.
-
-        Written `c1 >= v1 AND (c1 > v1 OR (c2 >= v2 AND (c2 > v2 OR ...)))`:
-        the leading `c1 >= v1` lets an index on the columns serve it, where
-        row value comparisons are not supported.
-        """
-        condition: sa.ColumnElement[bool] = columns[-1] > values[-1]
-        for col, value in zip(reversed(columns[:-1]), reversed(values[:-1])):
-            condition = sa.and_(col >= value, sa.or_(col > value, condition))
-        return condition
-
-    def stage(self, target: sa.Table, columns: Sequence[str]) -> sa.Table:
-        """Returns the staging table of a batch: the columns of the target."""
-        return sa.Table(
-            STAGE,
-            sa.MetaData(),
-            *(sa.Column(name, target.c[name].type) for name in columns),
-            prefixes=["TEMPORARY"],
+    def insert_skipping(
+        self, table: sa.Table, key: Sequence[str]
+    ) -> sa.Insert | None:
+        # RETURNING makes SQLAlchemy send one multi-row INSERT; without it,
+        # sqlite3 runs one statement a row (177 ms a batch of 1,000, not 13).
+        return (
+            sqlite_dialect.insert(table)
+            .on_conflict_do_nothing(index_elements=list(key))
+            .returning(*(table.c[name] for name in key))
         )
-
-    @contextlib.contextmanager
-    def bulk_stage(
-        self,
-        engine: sa.Engine,
-        target: sa.Table,
-        columns: Sequence[str],
-        rows: Sequence[contract.Row],
-    ) -> Generator[sa.Table | None]:
-        """Yields a staging table filled before the batch's transaction.
-
-        For bulk loaders that cannot join the transaction; None, by default,
-        stages the batch in the transaction (`stage`, `fill_stage`).
-        """
-        del engine, target, columns, rows  # Unused.
-        yield None
-
-    def create_stage(self, connection: sa.Connection, stage: sa.Table) -> None:
-        stage.create(connection)
-
-    def drop_stage(self, connection: sa.Connection, stage: sa.Table) -> None:
-        """Drops the staging table, in the batch's transaction."""
-        stage.drop(connection)
-
-    def estimated_rows(
-        self, connection: sa.Connection, schema: str, table: str
-    ) -> int:
-        """Returns the row count of the statistics, -1 when unknown."""
-        del connection, schema, table  # Unused.
-        return -1
-
-    def _estimate(
-        self, connection: sa.Connection, statement: str, **params: Any
-    ) -> int:
-        """Runs a statistics query; -1 when it has no answer."""
-        found = connection.execute(sa.text(statement), params).scalar()
-        return -1 if found is None or found < 0 else int(found)
-
-    def fill_stage(
-        self,
-        connection: sa.Connection,
-        stage: sa.Table,
-        rows: Sequence[contract.Row],
-    ) -> None:
-        """Inserts the batch into the staging table, in one round trip when
-        the driver can."""
-        connection.execute(stage.insert(), coerce(stage, rows))
-
-    def delete(
-        self, connection: sa.Connection, table: sa.Table, stage: sa.Table
-    ) -> int:
-        """Deletes the rows of `table` matching a row of the staging table."""
-        match = sa.and_(*(table.c[c.name] == c for c in stage.c))
-        return self.run(
-            connection, sa.delete(table).where(sa.exists().where(match))
-        )
-
-    def duplicate_keys(
-        self, connection: sa.Connection, stage: sa.Table, key: Sequence[str]
-    ) -> int:
-        """Returns how many keys have more than one row in the staging table.
-
-        Compared by the database, in the collation of the staging columns,
-        which is the target's: keys that differ in Python may be one key to
-        the target, like `'ABC'` and `'abc'` under a case-insensitive
-        collation, or `'a'` and `'a '` on SQL Server.
-        """
-        columns = [stage.c[name] for name in key]
-        duplicates = (
-            sa.select(*columns)
-            .group_by(*columns)
-            .having(sa.func.count() > 1)
-            .subquery()
-        )
-        return int(
-            connection.execute(
-                sa.select(sa.func.count()).select_from(duplicates)
-            ).scalar_one()
-        )
-
-    def changed(
-        self, current: sa.ColumnElement[Any], new: sa.ColumnElement[Any]
-    ) -> sa.ColumnElement[bool]:
-        """Returns whether a value changed, NULLs included."""
-        return current.is_distinct_from(new)
-
-    def merge(
-        self,
-        connection: sa.Connection,
-        target: contract.TableTarget,
-        table: sa.Table,
-        stage: sa.Table,
-        updates: Sequence[str],
-    ) -> tuple[int, int]:
-        """Merges the staging table into the target.
-
-        Returns:
-            The rows created, and the rows updated.
-        """
-        columns = [c.name for c in stage.c]
-        if target.mode is contract.WriteMode.INSERT:
-            select = sa.select(*stage.c)
-            created = connection.execute(
-                sa.insert(table).from_select(columns, select)
-            ).rowcount
-            return created, 0
-
-        updated = 0
-        if target.mode in _UPDATING and updates:
-            updated = self.update(connection, target, table, stage, updates)
-        if target.mode is contract.WriteMode.UPDATE:
-            return 0, updated
-        missing = ~sa.exists().where(_same_key(target, table, stage))
-        created = self.run(
-            connection,
-            sa.insert(table).from_select(
-                columns, sa.select(*stage.c).where(missing)
-            ),
-        )
-        return created, updated
-
-    def update(
-        self,
-        connection: sa.Connection,
-        target: contract.TableTarget,
-        table: sa.Table,
-        stage: sa.Table,
-        updates: Sequence[str],
-    ) -> int:
-        """Updates the target rows that changed; returns how many."""
-        statement = (
-            sa.update(table)
-            .values({name: stage.c[name] for name in updates})
-            .where(
-                _same_key(target, table, stage),
-                sa.or_(*(
-                    self.changed(table.c[name], stage.c[name])
-                    for name in updates
-                )),
-            )
-        )
-        return self.run(connection, statement)
-
-    def run(self, connection: sa.Connection, statement: _Joining) -> int:
-        """Runs a statement joining the target with the staging table;
-        returns the rows it changed."""
-        return connection.execute(statement).rowcount
 
 
 class MssqlDialect(Dialect):
@@ -313,27 +95,51 @@ class MssqlDialect(Dialect):
 
     name = "mssql"
     _BINARY_COLLATION = "Latin1_General_100_BIN2"
-    bulk_copy_rows = 2000
+    # Error 8003: a statement binds 2,100 parameters at most.
+    parameter_limit = 2100
+    in_chunk_cap = MSSQL_IN_CHUNK
+
+    def __init__(
+        self,
+        *,
+        bulk_copy_rows: int | None = None,
+        in_chunk: int | None = None,
+        chooser: staging.StagingChooser | None = None,
+    ) -> None:
+        super().__init__(
+            bulk_copy_rows=bulk_copy_rows, in_chunk=in_chunk, chooser=chooser
+        )
+        self._seeks: dict[tuple[str, frozenset[str]], bool] = {}
+        self._seeks_lock = threading.Lock()
+        # Tables whose next parameter staging the chooser is to time.
+        self._timing: dict[str, int] = {}
+
     # Error numbers (pyodbc, pymssql, bulk copy): deadlock victim (1205),
-    # lock timeout (1222), Azure SQL's database unavailable or busy (40613,
-    # 40501, 40197, 49918-49920), network errors (233, 10053, 10054, 10060,
-    # 64), timeout (-2); login failed (18456), cannot open the database
-    # (4060), no such object or column (208, 207), permission (229, 230),
-    # syntax (102, 156).
-    retryable_codes = _codes(
-        "1205 1222 40613 40501 40197 49918 49919 49920 233 10053 10054 "
+    # lock timeout (1222), no memory to run the query yet (8645), Azure SQL's
+    # database unavailable or busy (40613, 40501, 40197, 49918-49920),
+    # network errors (233, 10053, 10054, 10060, 64), timeout (-2); login
+    # failed (18456), cannot open the database (4060), no such object or
+    # column (208, 207), permission (229, 230), syntax (102, 156).
+    retryable_codes = base_dialect.error_codes(
+        "1205 1222 8645 40613 40501 40197 49918 49919 49920 233 10053 10054 "
         "10060 64 -2"
     )
-    fatal_codes = _codes("18456 4060 208 207 229 230 102 156")
+    fatal_codes = base_dialect.error_codes("18456 4060 208 207 229 230 102 156")
     # mssql-python gives no error number: match the messages.
     retryable_messages = (
         "was deadlocked on lock",
         "Lock request time out period exceeded",
+        "A timeout occurred while waiting for memory resources",
         "Connection reset",
         "Broken pipe",
         "Io error",
     )
     fatal_messages = ("Login failed for user", "Cannot open database")
+
+    def bind(self, column: sa.ColumnElement[object], value: object) -> object:
+        """See `Dialect.bind`; `datetime` and `smalldatetime` columns compare
+        with a parameter cast to their type (`mssql_datetimes`)."""
+        return mssql_datetimes.bind(column, super().bind(column, value))
 
     @contextlib.contextmanager
     def bulk_stage(
@@ -342,62 +148,84 @@ class MssqlDialect(Dialect):
         target: sa.Table,
         columns: Sequence[str],
         rows: Sequence[contract.Row],
+        minimum: int | None = None,
     ) -> Generator[sa.Table | None]:
-        """See `Dialect.bulk_stage`; bulk copy (BCP) with mssql-python.
-
-        Bulk copy runs on a connection of its own, which cannot see the
-        session's `#` tables: the batch goes into a global `##` table, created
-        on a connection held until the batch is merged. SQL Server drops it
-        with that session, should the process die.
+        """See `Dialect.bulk_stage`; bulk copy (BCP) with mssql-python, into
+        a global `##` table (`bulk_loading.bulk_copied`), from
+        `bulk_copy_rows` rows, or when the online choice says so
+        (`staging.StagingChooser`: the first batches of a table go both
+        ways, timed; the faster way is kept).
 
         Raises:
             DBAPIError: If the bulk copy fails: its error, wrapped for
                 `transient` to tell whether to try again.
         """
-        if engine.dialect.driver != "mssqlpython" or (
-            len(rows) < self.bulk_copy_rows
+        if engine.dialect.driver != "mssqlpython" or not self._bulk_copies(
+            target.fullname, len(rows), minimum
         ):
             yield None
             return
-
         stage = sa.Table(
             f"##{STAGE}_{uuid.uuid4().hex}",
             sa.MetaData(),
             *(sa.Column(name, target.c[name].type) for name in columns),
         )
-        with engine.connect() as holder:
-            stage.create(holder)
-            holder.commit()
-            try:
-                driver = holder.connection.driver_connection
-                if driver is None:
-                    raise contract.FatalError("bulk copy: no driver connection")
-                cursor = driver.cursor()
-                try:
-                    cursor.bulkcopy(
-                        stage.name,
-                        [
-                            tuple(row[name] for name in columns)
-                            for row in coerce(stage, rows)
-                        ],
-                        column_mappings=list(columns),
-                        keep_nulls=True,
-                        timeout=0,
-                    )
-                except (RuntimeError, ValueError, TypeError) as exc:
-                    # Server or network errors, or data the copy cannot convert.
-                    raise sa_exc.DBAPIError(
-                        f"bulk copy into {stage.name}",
-                        None,
-                        exc,
-                        hide_parameters=True,
-                    ) from exc
-                finally:
-                    cursor.close()
-                yield stage
-            finally:
-                stage.drop(holder)
-                holder.commit()
+        with contextlib.ExitStack() as stack:
+            started = self._now()
+            filled = stack.enter_context(
+                bulk_loading.bulk_copied(
+                    engine, stage, bulk_loading.coerce(stage, rows)
+                )
+            )
+            self._timed(target.fullname, staging.BULK_COPY, len(rows), started)
+            yield filled
+
+    def _bulk_copies(self, table: str, rows: int, minimum: int | None) -> bool:
+        """Whether a batch of `rows` rows of `table` is bulk copied: by the
+        threshold when one is set, else as the chooser says, which then
+        times the staging either way."""
+        if self.bulk_copy_rows is not None or self.chooser is None:
+            threshold = self.bulk_copy_rows if minimum is None else minimum
+            return threshold is not None and rows >= threshold
+        if self.chooser.pick(table, rows) == staging.BULK_COPY:
+            return True
+        with self._seeks_lock:
+            self._timing[table] = self._timing.get(table, 0) + 1
+        return False
+
+    def _now(self) -> float:
+        return self.chooser.clock() if self.chooser is not None else 0.0
+
+    def _timed(
+        self,
+        table: str,
+        strategy: relational_types.Staging,
+        rows: int,
+        started: float,
+    ) -> None:
+        if self.chooser is not None:
+            self.chooser.record(table, strategy, rows, self._now() - started)
+
+    def fill_stage(
+        self,
+        connection: sa.Connection,
+        stage: sa.Table,
+        rows: Sequence[contract.Row],
+    ) -> None:
+        """See `Dialect.fill_stage`; timed for the chooser when it picked
+        parameters for this batch (`stage` knows its target)."""
+        target = stage.info.get("target")
+        timing = False
+        if isinstance(target, str):
+            with self._seeks_lock:
+                pending = self._timing.get(target, 0)
+                if pending:
+                    self._timing[target] = pending - 1
+                    timing = True
+        started = self._now()
+        super().fill_stage(connection, stage, rows)
+        if timing and isinstance(target, str):
+            self._timed(target, staging.PARAMETERS, len(rows), started)
 
     def estimated_rows(
         self, connection: sa.Connection, schema: str, table: str
@@ -413,8 +241,8 @@ class MssqlDialect(Dialect):
             table=table,
         )
 
-    def changed(
-        self, current: sa.ColumnElement[Any], new: sa.ColumnElement[Any]
+    def changed[T](
+        self, current: sa.ColumnElement[T], new: sa.ColumnElement[T]
     ) -> sa.ColumnElement[bool]:
         """See `Dialect.changed`; text in binary, and by its byte length."""
         if not isinstance(current.type, sa.String):
@@ -434,19 +262,72 @@ class MssqlDialect(Dialect):
             f"#{STAGE}",
             sa.MetaData(),
             *(sa.Column(name, target.c[name].type) for name in columns),
+            info={"target": target.fullname},
         )
 
-    def run(self, connection: sa.Connection, statement: _Joining) -> int:
-        """See `Dialect.run`; seeks the target's rows by their key.
+    def prepare_join(
+        self, engine: sa.Engine, table: sa.Table, columns: Sequence[str]
+    ) -> None:
+        """See `Dialect.prepare_join`; whether an index seeks `columns`."""
+        if self._seeks_known(engine.dialect, table, columns) is None:
+            with engine.connect() as connection:
+                self._learn_seeks(connection, table, columns)
+
+    def _seeks_known(
+        self, dialect: sa.Dialect, table: sa.Table, columns: Sequence[str]
+    ) -> bool | None:
+        with self._seeks_lock:
+            return self._seeks.get(_join_of(dialect, table, columns))
+
+    def _learn_seeks(
+        self, connection: sa.Connection, table: sa.Table, columns: Sequence[str]
+    ) -> bool:
+        """Reads whether an index seeks `columns`, once per table (with or
+        without its schema) and columns; a table without one is logged once.
+
+        Once per `Database`, which a process keeps: an index created while
+        it runs is seen by the next run.
+        """
+        learnt = _join_of(connection.dialect, table, columns)
+        seeks = mssql_indexes.seekable(connection, table, learnt[1])
+        with self._seeks_lock:
+            if learnt in self._seeks:
+                return self._seeks[learnt]
+            self._seeks[learnt] = seeks
+        if not seeks:
+            _LOG.warning(
+                "%s has no index on %s: each batch scans it. Add one (a"
+                " primary key, a unique or any index led by these columns);"
+                " until then batches written at once into it may deadlock.",
+                table.fullname,
+                sorted(columns),
+            )
+        return seeks
+
+    def run(
+        self,
+        connection: sa.Connection,
+        statement: relational_types.Joining,
+        *,
+        table: sa.Table,
+        on: Sequence[str],
+    ) -> int:
+        """See `Dialect.run`; seeks the target's rows by `on`, if indexed.
 
         Left to itself, SQL Server scans the whole target (a plan made while
         the table was small stays cached), locking every row and page it
         reads: batches written at once, by threads or processes, then wait
         for each other's new rows and deadlock, and every batch costs a scan.
         A nested loop from the staging table, with row locks, touches only
-        the batch's own keys. Without an index on the key, each of its rows
-        scans the target: slow, still correct.
+        the batch's own keys. Without an index on `on`, that nested loop
+        would scan the target once per row of the batch: the statement then
+        runs without hints, one scan per batch.
         """
+        seeks = self._seeks_known(connection.dialect, table, on)
+        if seeks is None:
+            seeks = self._learn_seeks(connection, table, on)
+        if not seeks:
+            return connection.execute(statement).rowcount
         if isinstance(statement, (sa.Update, sa.Delete)):
             statement = statement.with_hint(_ROW_LOCKS, dialect_name=self.name)
         compiled = statement.compile(
@@ -463,23 +344,37 @@ class OracleDialect(Dialect):
 
     name = "oracle"
     session_setup = ("ALTER SESSION SET TIME_ZONE = '+00:00'",)
+    # 65,535 bind variables a statement; ORA-01795: 1,000 values an IN list.
+    parameter_limit = 65_535
+    in_list_limit = 1000
     # Deadlock (60), resource busy or timeout (51, 54, 30006), cannot
-    # serialize (8177), lost or closed connections (3113, 3114, 3135,
-    # 12537, 12547, DPY-4011), no listener or connect timeout (12541, 12170,
-    # DPY-6005), the database starting or stopping (1033, 1034, 1089, 1092,
-    # 12514, 12528); no table or column (942, 904), bad login or locked
-    # account (1017, 28000), privileges (1031), a missing user (1918).
-    retryable_codes = _codes(
-        "ORA-00060 ORA-00051 ORA-00054 ORA-30006 ORA-08177 ORA-03113 "
-        "ORA-03114 ORA-03135 ORA-12537 ORA-12547 ORA-12541 ORA-12170 "
-        "ORA-01033 ORA-01034 ORA-01089 ORA-01092 ORA-12514 ORA-12528 "
-        "DPY-4011 DPY-6005"
+    # serialize (8177), snapshot too old (1555: a new query reads a new
+    # snapshot), shared memory short (4031), lost or closed connections
+    # (3113, 3114, 3135, 12537, 12547, DPY-4011), no listener or connect
+    # timeout (12541, 12170, DPY-6005), the database starting or stopping
+    # (1033, 1034, 1089, 1092, 12514, 12528); no table or column (942, 904),
+    # bad login or locked account (1017, 28000), privileges (1031), a
+    # missing user (1918).
+    retryable_codes = base_dialect.error_codes(
+        "ORA-00060 ORA-00051 ORA-00054 ORA-30006 ORA-08177 ORA-01555 "
+        "ORA-04031 ORA-03113 ORA-03114 ORA-03135 ORA-12537 ORA-12547 "
+        "ORA-12541 ORA-12170 ORA-01033 ORA-01034 ORA-01089 ORA-01092 "
+        "ORA-12514 ORA-12528 DPY-4011 DPY-6005"
     )
-    fatal_codes = _codes(
+    fatal_codes = base_dialect.error_codes(
         "ORA-00942 ORA-00904 ORA-01017 ORA-28000 ORA-01031 ORA-01918"
     )
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        bulk_copy_rows: int | None = None,
+        in_chunk: int | None = None,
+        chooser: staging.StagingChooser | None = None,
+    ) -> None:
+        super().__init__(
+            bulk_copy_rows=bulk_copy_rows, in_chunk=in_chunk, chooser=chooser
+        )
         self._created: set[str] = set()
         self._lock = threading.Lock()
 
@@ -554,8 +449,8 @@ class OracleDialect(Dialect):
             table=denormalize(table),
         )
 
-    def changed(
-        self, current: sa.ColumnElement[Any], new: sa.ColumnElement[Any]
+    def changed[T](
+        self, current: sa.ColumnElement[T], new: sa.ColumnElement[T]
     ) -> sa.ColumnElement[bool]:
         """See `Dialect.changed`; LOBs only compare with DBMS_LOB."""
         if not _is_lob(current.type):
@@ -580,7 +475,7 @@ class OracleDialect(Dialect):
         new = stage.alias("etl_new")
         dialect = connection.dialect
 
-        def sql(expression: sa.ColumnElement[Any]) -> str:
+        def sql(expression: sa.ClauseElement) -> str:
             return str(
                 expression.compile(
                     dialect=dialect, compile_kwargs={"literal_binds": True}
@@ -614,24 +509,24 @@ class MysqlDialect(Dialect):
     """
 
     name = "mysql"
+    session_setup = ("SET time_zone = '+00:00'",)
+    # Error 1390: a prepared statement takes 65,535 placeholders at most.
+    parameter_limit = 65_535
     # Under InnoDB's default REPEATABLE READ, the merge's `NOT EXISTS` read of
     # the target takes shared next-key locks on its gaps, where batches of
     # other key ranges insert: writes made at once deadlock. READ COMMITTED,
     # the default of the other databases, reads the target unlocked.
-    session_setup = (
-        "SET time_zone = '+00:00'",
-        "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED",
-    )
+    isolation_level = "READ COMMITTED"
     # Lock wait timeout (1205), deadlock (1213), too many connections
     # (1040), server shutting down (1053), network errors (1158-1161),
     # cannot connect (2002, 2003), lost connections (2006, 2013, 2055),
     # closed for inactivity (4031); access denied (1044, 1045, 1142),
     # unknown database (1049), no such table or column (1146, 1054), syntax
     # (1064).
-    retryable_codes = _codes(
+    retryable_codes = base_dialect.error_codes(
         "1205 1213 1040 1053 1158 1159 1160 1161 2002 2003 2006 2013 2055 4031"
     )
-    fatal_codes = _codes("1044 1045 1142 1049 1146 1054 1064")
+    fatal_codes = base_dialect.error_codes("1044 1045 1142 1049 1146 1054 1064")
 
     def create_stage(self, connection: sa.Connection, stage: sa.Table) -> None:
         """See `Dialect.create_stage`.
@@ -653,12 +548,13 @@ class MysqlDialect(Dialect):
         exists = " IF EXISTS" if if_exists else ""
         connection.exec_driver_sql(f"DROP TEMPORARY TABLE{exists} {name}")
 
-    def changed(
-        self, current: sa.ColumnElement[Any], new: sa.ColumnElement[Any]
+    def changed[T](
+        self, current: sa.ColumnElement[T], new: sa.ColumnElement[T]
     ) -> sa.ColumnElement[bool]:
         if isinstance(current.type, sa.String):
-            current = sa.cast(current, sa.LargeBinary)
-            new = sa.cast(new, sa.LargeBinary)
+            return super().changed(
+                sa.cast(current, sa.LargeBinary), sa.cast(new, sa.LargeBinary)
+            )
         return super().changed(current, new)
 
     def estimated_rows(
@@ -672,6 +568,17 @@ class MysqlDialect(Dialect):
             table=table,
         )
 
+    def insert_skipping(
+        self, table: sa.Table, key: Sequence[str]
+    ) -> sa.Insert | None:
+        """See `Dialect.insert_skipping`; `ON DUPLICATE KEY UPDATE k = k`
+        leaves a row there as it is. INSERT IGNORE would also hide other
+        errors: a value truncated, a bad date."""
+        kept = key[0]
+        return mysql_dialect.insert(table).on_duplicate_key_update(
+            {kept: table.c[kept]}
+        )
+
 
 class PostgresDialect(Dialect):
     """Postgres: row values, COPY into the staging table, ON CONFLICT."""
@@ -679,12 +586,33 @@ class PostgresDialect(Dialect):
     name = "postgresql"
     # A SET, not a startup option: `PGTZ` would override that.
     session_setup = ("SET TIME ZONE 'UTC'",)
+    # The Bind message counts its parameters in 16 bits (psycopg).
+    parameter_limit = 32_767
     # Connection errors have no SQLSTATE: bad login, missing database or role.
+    # A statement past its `statement_timeout` (57014, like a cancel) would
+    # time out again: keyset pages are short, so it is slow for a reason a
+    # retry cannot fix. Waits on locks are `lock_timeout`'s (55P03), retried.
     fatal_messages = (
         "password authentication failed",
         "no pg_hba.conf entry",
         "does not exist",
+        "canceling statement due to statement timeout",
     )
+
+    def session_warnings(self, connection: sa.Connection) -> list[str]:
+        """See `Dialect.session_warnings`: messages in a language other than
+        English, which `fatal_messages` cannot tell."""
+        locale = str(
+            connection.execute(sa.text("SHOW lc_messages")).scalar_one()
+        )
+        if _in_english(locale):
+            return []
+        return [
+            f"lc_messages is {locale!r}: a statement past its"
+            " statement_timeout is told by its English message, else retried"
+            " as a cancel is; set the role's (ALTER ROLE <user> SET"
+            " lc_messages = 'C')"
+        ]
 
     def estimated_rows(
         self, connection: sa.Connection, schema: str, table: str
@@ -700,7 +628,9 @@ class PostgresDialect(Dialect):
         )
 
     def after(
-        self, columns: Sequence[sa.ColumnElement[Any]], values: Sequence[Any]
+        self,
+        columns: Sequence[sa.ColumnElement[object]],
+        values: Sequence[object],
     ) -> sa.ColumnElement[bool]:
         return sa.tuple_(*columns) > sa.tuple_(*values)
 
@@ -722,52 +652,53 @@ class PostgresDialect(Dialect):
         stage: sa.Table,
         rows: Sequence[contract.Row],
     ) -> None:
-        """See `Dialect.fill_stage`; COPY with psycopg, the fastest way in.
+        """See `Dialect.fill_stage`; COPY with psycopg, the fastest way in
+        (`bulk_loading.copy_rows`).
 
         Raises:
             DBAPIError: If COPY fails: the driver's error, wrapped as
                 SQLAlchemy does for its statements.
         """
-        driver = connection.connection.driver_connection
-        if connection.dialect.driver != "psycopg" or driver is None:
+        if connection.dialect.driver != "psycopg":
             super().fill_stage(connection, stage, rows)
             return
-        # Imported here: only Postgres through psycopg needs them.
-        # pylint: disable=import-outside-toplevel
-        import psycopg
-        from psycopg import sql as pg_sql
-        from psycopg.types import json as pg_json
+        bulk_loading.copy_rows(connection, stage, rows)
 
-        # pylint: enable=import-outside-toplevel
+    def insert_missing(
+        self,
+        engine: sa.Engine,
+        table: sa.Table,
+        rows: Sequence[contract.Row],
+        key: Sequence[str],
+    ) -> None:
+        """See `Dialect.insert_missing`; one INSERT ... SELECT FROM unnest()
+        ... ON CONFLICT DO NOTHING, the batch bound as one array a column.
 
-        json_columns = [isinstance(c.type, sa.JSON) for c in stage.c]
-        statement = pg_sql.SQL("COPY {} ({}) FROM STDIN").format(
-            pg_sql.Identifier(STAGE),
-            pg_sql.SQL(", ").join(pg_sql.Identifier(c.name) for c in stage.c),
+        Few, large parameters: next to a thread busy in Python, a multi-row
+        VALUES of 1,000 rows took twice as long and COPY into a staging
+        table three times (every round trip waits for the GIL).
+        """
+        if not rows:
+            return
+        columns = list(rows[0])
+        arrays = sa.func.unnest(*(
+            sa.bindparam(f"p_{name}", type_=sa.ARRAY(table.c[name].type))
+            for name in columns
+        ))
+        statement = (
+            pg_dialect.insert(table)
+            .from_select(
+                columns,
+                sa.select(arrays.table_valued(*columns).render_derived()),
+            )
+            .on_conflict_do_nothing(index_elements=list(key))
         )
-        try:
-            with driver.cursor() as cursor, cursor.copy(statement) as copy:
-                for row in rows:
-                    copy.write_row([
-                        pg_json.Jsonb(row[c.name])
-                        if is_json and row[c.name] is not None
-                        else row[c.name]
-                        for c, is_json in zip(stage.c, json_columns)
-                    ])
-        except psycopg.Error as exc:
-            error: Any = exc  # A DBAPI error, which SQLAlchemy cannot type.
-            lost = connection.dialect.is_disconnect(error, driver, None)
-            if lost:
-                connection.invalidate(exc)
-            raise sa_exc.DBAPIError.instance(
-                f"COPY {STAGE} FROM STDIN",
-                None,
-                exc,
-                psycopg.Error,
-                hide_parameters=True,
-                connection_invalidated=lost,
-                dialect=connection.dialect,
-            ) from exc
+        values = bulk_loading.coerce(table, rows)
+        base_dialect.autocommitted(
+            engine,
+            statement,
+            {f"p_{name}": [row[name] for row in values] for name in columns},
+        )
 
     def merge(
         self,
@@ -814,6 +745,7 @@ _DIALECTS: dict[str, type[Dialect]] = {
     "mariadb": MysqlDialect,
     "oracle": OracleDialect,
     "postgresql": PostgresDialect,
+    "sqlite": SqliteDialect,
 }
 
 
@@ -829,33 +761,44 @@ _DIALECT_BY_DRIVER: dict[str, type[Dialect]] = {
     "pymysql": MysqlDialect,
     "MySQLdb": MysqlDialect,
     "mysql": MysqlDialect,
-    "sqlite3": Dialect,
-}
-
-# mssql-python gives the SQLSTATE of an error only as its description.
-_MSSQL_PYTHON_STATES = {
-    "Disconnect error": "01002",
-    "Client unable to establish connection": "08001",
-    "Connection not open": "08003",
-    "Server rejected the connection": "08004",
-    "Connection failure during transaction": "08007",
-    "Communication link failure": "08S01",
-    "Invalid authorization specification": "28000",
-    "Invalid catalog name": "3D000",
-    "Serialization failure": "40001",
-    "Statement completion unknown": "40003",
-    "Syntax error or access violation": "42000",
-    "Base table or view not found": "42S02",
-    "Column not found": "42S22",
-    "Operation canceled": "HY008",
-    "Timeout expired": "HYT00",
-    "Connection timeout expired": "HYT01",
+    "sqlite3": SqliteDialect,
 }
 
 
-def for_engine(engine: sa.Engine) -> Dialect:
-    """Returns the behavior of the engine's database; the base by default."""
-    return _DIALECTS.get(engine.dialect.name, Dialect)()
+def for_engine(
+    engine: sa.Engine,
+    *,
+    bulk_copy_rows: int | None = None,
+    in_chunk: int | None = None,
+) -> Dialect:
+    """Returns the behavior of the engine's database; the base by default.
+
+    Args:
+        engine: The engine.
+        bulk_copy_rows: See `Dialect`; None chooses online.
+        in_chunk: See `Dialect.in_chunk`; None derives it.
+    """
+    return for_name(
+        engine.dialect.name, bulk_copy_rows=bulk_copy_rows, in_chunk=in_chunk
+    )
+
+
+def for_name(
+    name: str,
+    *,
+    bulk_copy_rows: int | None = None,
+    in_chunk: int | None = None,
+) -> Dialect:
+    """Returns the behavior of a database by its SQLAlchemy dialect name.
+
+    Args:
+        name: The SQLAlchemy dialect name (`mssql`, `postgresql`...).
+        bulk_copy_rows: See `Dialect`; None chooses online.
+        in_chunk: See `Dialect.in_chunk`; None derives it.
+    """
+    return _DIALECTS.get(name, Dialect)(
+        bulk_copy_rows=bulk_copy_rows, in_chunk=in_chunk
+    )
 
 
 def is_transient(
@@ -889,109 +832,22 @@ def driver_error(exc: BaseException) -> sa_exc.DBAPIError | None:
     return sa_exc.DBAPIError(None, None, exc, hide_parameters=True)
 
 
-def error_code(orig: BaseException | None) -> str | None:
-    """Returns the database's own code of a driver error, if it has one.
-
-    `ORA-00060` or `DPY-4011` (python-oracledb), `1213` (MySQL drivers,
-    pymssql, the number in pyodbc's and bulk copy's messages),
-    `SQLITE_BUSY` (sqlite3, without the extended code).
-    """
-    if orig is None:
-        return None
-    name = getattr(orig, "sqlite_errorname", None)
-    if isinstance(name, str):
-        return "_".join(name.split("_")[:2])
-    args = getattr(orig, "args", ())
-    first = args[0] if args else None
-    full_code = getattr(first, "full_code", None)
-    if isinstance(full_code, str):
-        return full_code
-    if isinstance(first, int) and not isinstance(first, bool):
-        return str(first)
-    found = _ODBC_NATIVE.search(str(orig)) or _BULK_NATIVE.search(str(orig))
-    return found.group(1) if found else None
+def _in_english(locale: str) -> bool:
+    """Whether Postgres messages in `locale` are English: an empty one is
+    the server's environment, which a session cannot tell."""
+    language = locale.split(".", 1)[0].split("_", 1)[0]
+    return language in ("C", "POSIX", "en")
 
 
-def sqlstate(orig: BaseException | None) -> str | None:
-    """Returns the SQLSTATE of a driver error, if it tells it.
-
-    psycopg and PyMySQL give it, pyodbc first in its arguments, mssql-python
-    as its description.
-    """
-    state = getattr(orig, "sqlstate", None)
-    if isinstance(state, str) and _SQLSTATE.match(state):
-        return state
-    args = getattr(orig, "args", ())
-    if args and isinstance(args[0], str) and _SQLSTATE.match(args[0]):
-        return args[0]
-    description = getattr(orig, "driver_error", None)
-    if isinstance(description, str):
-        return _MSSQL_PYTHON_STATES.get(description)
-    return None
+def _join_of(
+    dialect: sa.Dialect, table: sa.Table, columns: Sequence[str]
+) -> tuple[str, frozenset[str]]:
+    """The table, in its schema (the default one if none), and the columns
+    joined on: `dbo.t` and `t` are one table."""
+    schema = table.schema or dialect.default_schema_name or ""
+    return f"{schema}.{table.name}", frozenset(c.lower() for c in columns)
 
 
-def coerce(
-    table: sa.Table, rows: Sequence[contract.Row]
-) -> list[dict[str, Any]]:
-    """Adapts values to the column types where drivers are strict.
-
-    A UUID may come as text (mappings produce text): UUID columns get
-    `uuid.UUID` objects.
-    """
-    uuids = [
-        c.name
-        for c in table.c
-        if isinstance(c.type, sa.Uuid) and c.type.as_uuid
-    ]
-    if not uuids:
-        return [dict(row) for row in rows]
-    coerced = []
-    for row in rows:
-        values = dict(row)
-        for name in uuids:
-            value = values.get(name)
-            if isinstance(value, str):
-                values[name] = uuid.UUID(value)
-        coerced.append(values)
-    return coerced
-
-
-# How each database reports a duplicate key: SQLSTATE 23505 (Postgres),
-# errors 2627 and 2601 (SQL Server, whose drivers do not all give the number),
-# ORA-00001, MySQL 1062, SQLite.
-_UNIQUE_VIOLATIONS = (
-    "23505",
-    "2627",
-    "2601",
-    "Cannot insert duplicate key",
-    "ORA-00001",
-    "1062",
-    "Duplicate entry",
-    "UNIQUE constraint failed",
-)
-
-
-def is_unique_violation(exc: BaseException | None) -> bool:
-    """Whether a database error is a duplicate key, whatever the database.
-
-    A writer racing another one on the same key gets one: trying again then
-    finds the row, and updates it. Any other constraint (a foreign key, NOT
-    NULL) is not.
-    """
-    if not isinstance(exc, sa_exc.IntegrityError):
-        return False
-    if getattr(exc.orig, "sqlstate", None) == "23505":
-        return True
-    text = str(exc.orig)
-    return any(marker in text for marker in _UNIQUE_VIOLATIONS)
-
-
-def _is_lob(type_: sa.types.TypeEngine[Any]) -> bool:
+def _is_lob[T](type_: sa.types.TypeEngine[T]) -> bool:
     """Whether values of the type are LOBs: CLOB, NCLOB, BLOB..."""
     return isinstance(type_, (sa.LargeBinary, sa.Text))
-
-
-def _same_key(
-    target: contract.TableTarget, table: sa.Table, stage: sa.Table
-) -> sa.ColumnElement[bool]:
-    return sa.and_(*(table.c[k] == stage.c[k] for k in target.key))

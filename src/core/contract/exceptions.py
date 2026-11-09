@@ -6,12 +6,8 @@ Retrying is decided by type: `RetryableError` for transient failures,
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 from core.contract import etl
-
-if TYPE_CHECKING:
-    from core.contract import quality
+from core.contract import quality
 
 
 class PipelineError(Exception):

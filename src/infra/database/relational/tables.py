@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
 import threading
-from typing import Any
 
 import sqlalchemy as sa
 
@@ -12,6 +11,7 @@ from core import contract
 from infra.database import batches
 from infra.database.relational import database
 from infra.database.relational import dialects
+from infra.database.relational import inspector
 from shared import utils
 
 
@@ -62,11 +62,14 @@ class RelationalTableReader(database.RelationalAdapter, contract.ITableReader):
             if query.columns
             else list(table.c)
         )
-        base = sa.select(*selected).where(*_conditions(table, query.filters))
+        dialect = self.db.dialect
+        base = sa.select(*selected).where(
+            *_conditions(dialect, table, query.filters)
+        )
         if query.lower is not None:
-            base = base.where(order[0] >= query.lower)
+            base = base.where(order[0] >= dialect.bind(order[0], query.lower))
         if query.upper is not None:
-            base = base.where(order[0] <= query.upper)
+            base = base.where(order[0] <= dialect.bind(order[0], query.upper))
         base = base.order_by(*order).limit(self.page_size)
 
         after = query.after
@@ -92,13 +95,18 @@ class RelationalTableReader(database.RelationalAdapter, contract.ITableReader):
         table: str,
         column: str,
         filters: Sequence[contract.Condition] = (),
-    ) -> Any:
+    ) -> object:
         reflected = self.db.table(table)
         statement = sa.select(
             sa.func.max(database.column(reflected, column))
-        ).where(*_conditions(reflected, filters))
+        ).where(*_conditions(self.db.dialect, reflected, filters))
         with self.db.connect(f"reading the max of {table}.{column}") as conn:
             return conn.execute(statement).scalar()
+
+    def column_family(self, table: str, column: str) -> contract.TypeFamily:
+        """The family of the column's type, as reflected."""
+        reflected = self.db.table(table)
+        return inspector.family(database.column(reflected, column).type)
 
     def count(
         self, table: str, filters: Sequence[contract.Condition] = ()
@@ -107,7 +115,7 @@ class RelationalTableReader(database.RelationalAdapter, contract.ITableReader):
         statement = (
             sa.select(sa.func.count())
             .select_from(reflected)
-            .where(*_conditions(reflected, filters))
+            .where(*_conditions(self.db.dialect, reflected, filters))
         )
         with self.db.connect(f"counting the rows of {table}") as connection:
             return int(connection.execute(statement).scalar_one())
@@ -118,7 +126,7 @@ class RelationalTableReader(database.RelationalAdapter, contract.ITableReader):
         order_by: Sequence[str],
         offsets: Sequence[int],
         filters: Sequence[contract.Condition] = (),
-    ) -> list[tuple[Any, ...]]:
+    ) -> list[tuple[object, ...]]:
         """See `contract.ITableReader.keys_at`.
 
         One query per offset, each after the row of the previous one (keyset)
@@ -139,11 +147,11 @@ class RelationalTableReader(database.RelationalAdapter, contract.ITableReader):
         )
         base = (
             sa.select(*order)
-            .where(*_conditions(reflected, filters))
+            .where(*_conditions(self.db.dialect, reflected, filters))
             .order_by(*order)
             .limit(1)
         )
-        found: list[tuple[Any, ...]] = []
+        found: list[tuple[object, ...]] = []
         with self.db.connect(f"reading the quantiles of {table}") as conn:
             for skipped in skips:
                 statement = base.offset(skipped)
@@ -161,7 +169,7 @@ class RelationalTableReader(database.RelationalAdapter, contract.ITableReader):
         self,
         query: contract.TableQuery,
         table: sa.Table,
-        order: list[sa.Column[Any]],
+        order: list[sa.Column[object]],
     ) -> None:
         """Fails if a row has NULL in an `order_by` column.
 
@@ -182,7 +190,7 @@ class RelationalTableReader(database.RelationalAdapter, contract.ITableReader):
             .select_from(table)
             .where(
                 sa.or_(*(c.is_(None) for c in order)),
-                *_conditions(table, query.filters),
+                *_conditions(self.db.dialect, table, query.filters),
             )
             .limit(1)
         )
@@ -246,6 +254,9 @@ class RelationalTableWriter(database.RelationalAdapter, contract.ITableWriter):
 
         dialect = self.db.dialect
         action = f"writing {len(rows)} row(s) to {target.table}"
+        with database.errors(action, dialect):
+            if target.mode is not contract.WriteMode.INSERT and target.key:
+                dialect.prepare_join(self.db.engine, table, target.key)
         with (
             database.errors(action, dialect),
             dialect.bulk_stage(self.db.engine, table, columns, unique) as bulk,
@@ -290,7 +301,10 @@ class RelationalTableWriter(database.RelationalAdapter, contract.ITableWriter):
         )
         dialect = self.db.dialect
         stage = dialect.stage(reflected, columns)
-        with self.db.begin(f"deleting {len(rows)} row(s) of {table}") as conn:
+        action = f"deleting {len(rows)} row(s) of {table}"
+        with database.errors(action, dialect):
+            dialect.prepare_join(self.db.engine, reflected, columns)
+        with self.db.begin(action) as conn:
             dialect.create_stage(conn, stage)
             dialect.fill_stage(conn, stage, unique)
             deleted = dialect.delete(conn, reflected, stage)
@@ -366,13 +380,15 @@ def _skips(offsets: Sequence[int]) -> list[int]:
 
 
 def _conditions(
-    table: sa.Table, filters: Sequence[contract.Condition]
+    dialect: dialects.Dialect,
+    table: sa.Table,
+    filters: Sequence[contract.Condition],
 ) -> list[sa.ColumnElement[bool]]:
     """Translates the conditions of the port into SQLAlchemy expressions."""
     expressions = []
     for condition in filters:
         col = database.column(table, condition.column)
-        value = condition.value
+        value = dialect.bind(col, condition.value)
         match condition.operator:
             case contract.Operator.EQ:
                 expressions.append(col == value)
@@ -387,9 +403,13 @@ def _conditions(
             case contract.Operator.GE:
                 expressions.append(col >= value)
             case contract.Operator.IN:
-                expressions.append(col.in_(condition.values))
+                expressions.append(
+                    col.in_([dialect.bind(col, v) for v in condition.values])
+                )
             case contract.Operator.NOT_IN:
-                expressions.append(col.not_in(condition.values))
+                expressions.append(
+                    col.not_in([dialect.bind(col, v) for v in condition.values])
+                )
             case contract.Operator.IS_NULL:
                 expressions.append(col.is_(None))
             case contract.Operator.IS_NOT_NULL:

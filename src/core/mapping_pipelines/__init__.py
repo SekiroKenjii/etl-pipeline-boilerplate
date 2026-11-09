@@ -29,8 +29,8 @@ from core.mapping_pipelines.kinds import Sync
 from core.mapping_pipelines.mappings import Mappings
 from core.mapping_pipelines.module import MappingModule
 from core.mapping_pipelines.reconciliation import reconciliations
-from core.mapping_pipelines.settings import LookupTable
-from core.mapping_pipelines.settings import MappingSettings
+from core.mapping_pipelines.types import LookupTable
+from core.mapping_pipelines.types import MappingSettings
 
 __all__ = [
     "Deletes",

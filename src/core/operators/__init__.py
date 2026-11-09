@@ -5,7 +5,6 @@ run parameters) once, whatever adapter is plugged in.
 """
 
 from core.operators.api import ApiExtractor
-from core.operators.api import Params
 from core.operators.changes import ChangeExtractor
 from core.operators.changes import ChangeLoader
 from core.operators.changes import Deletes
@@ -22,11 +21,13 @@ from core.operators.partitions import KeyRange
 from core.operators.partitions import PartitionExtractor
 from core.operators.partitions import split
 from core.operators.passthrough import Passthrough
-from core.operators.quarantine import Fetch
 from core.operators.quarantine import QuarantineReplay
 from core.operators.reconciliation import MissingSourceRows
 from core.operators.tables import TableExtractor
 from core.operators.tables import TableLoader
+from core.operators.types import Fetch
+from core.operators.types import Params
+from core.operators.types import SourceRecord
 
 __all__ = [
     "ApiExtractor",
@@ -49,6 +50,7 @@ __all__ = [
     "Passthrough",
     "QuarantineReplay",
     "Snapshot",
+    "SourceRecord",
     "TableExtractor",
     "TableLoader",
     "split",

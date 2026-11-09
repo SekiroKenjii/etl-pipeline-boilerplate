@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import logging
 import pathlib
+import shutil
+import types
 from typing import Any
 
 import pytest
@@ -13,6 +16,8 @@ from core import keys
 from core import runtime
 from core.runtime import names
 from infra.database import relational
+from infra.database.relational import dialects
+from shared import utils
 
 
 def _settings(tmp_path: pathlib.Path, **values: Any) -> config.AppSettings:
@@ -41,10 +46,10 @@ def test_a_sql_database_and_file_bookkeeping(tmp_path: pathlib.Path) -> None:
 
         assert isinstance(reader, relational.RelationalTableReader)
         assert reader.db is db
-        assert isinstance(registry, keys.CachedKeyRegistry)
+        assert isinstance(registry, keys.TieredKeyCache)
         assert health == {
-            names.database("crm"): "ok",
-            names.store("landing"): "ok",
+            names.database("crm"): runtime.Health("ok"),
+            names.store("landing"): runtime.Health("ok"),
         }
         with pytest.raises(
             contract.PipelineConfigError, match="bookkeeping.database"
@@ -100,7 +105,41 @@ def test_an_unreachable_database_is_unhealthy(tmp_path: pathlib.Path) -> None:
     with runtime.Resources(factories.resource_specs(settings)) as resources:
         health = resources.health()
 
-    assert health[names.database("down")].startswith("RetryableError")
+    assert health[names.database("down")].status.startswith("RetryableError")
+
+
+def test_a_session_s_warning_is_reported_by_the_check_still_ok(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    warning = "lc_messages is 'de_DE.utf8': ..."
+    monkeypatch.setattr(
+        dialects.SqliteDialect, "session_warnings", lambda *_: [warning]
+    )
+    settings = _settings(
+        tmp_path,
+        databases={"crm": {"url": f"sqlite:///{tmp_path / 'crm.db'}"}},
+    )
+
+    with runtime.Resources(factories.resource_specs(settings)) as resources:
+        health = resources.health()
+
+    assert health == {names.database("crm"): runtime.Health("ok", (warning,))}
+
+
+def test_a_session_without_warnings_reports_none(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    settings = _settings(
+        tmp_path,
+        databases={"crm": {"url": f"sqlite:///{tmp_path / 'crm.db'}"}},
+    )
+
+    with runtime.Resources(factories.resource_specs(settings)) as resources:
+        with caplog.at_level(logging.WARNING):
+            health = resources.health()
+
+    assert health == {names.database("crm"): runtime.Health("ok")}
+    assert not caplog.records
 
 
 def test_debezium_changes_through_a_kafka_cluster(
@@ -133,3 +172,88 @@ def test_debezium_changes_through_a_kafka_cluster(
         assert cluster.group_id == "g"
         assert isinstance(source, messaging.DebeziumChangeSource)
         assert source.messages.topic == "legacy.CRM.CUSTOMER"
+
+
+def test_the_key_cache_budgets_reach_the_cache(tmp_path: pathlib.Path) -> None:
+    settings = _settings(
+        tmp_path,
+        databases={"crm": {"url": f"sqlite:///{tmp_path / 'crm.db'}"}},
+        bookkeeping={"directory": str(tmp_path / "var")},
+        tuning={"key_cache_memory": "64MiB", "key_cache_disk": "1GiB"},
+    )
+
+    with runtime.Resources(factories.resource_specs(settings)) as resources:
+        registry = resources.get(names.KEYS, contract.IKeyRegistry)
+
+    assert isinstance(registry, keys.TieredKeyCache)
+    assert registry.memory_budget == 64 * 1024**2
+    assert registry.disk_budget == 1024**3
+
+
+def test_the_key_cache_budgets_from_the_environment(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ETL__TUNING__KEY_CACHE_MEMORY", "64MiB")
+    monkeypatch.setenv("ETL__TUNING__KEY_CACHE_DISK", "0")
+    settings = _settings(tmp_path, bookkeeping={"directory": str(tmp_path)})
+
+    with runtime.Resources(factories.resource_specs(settings)) as resources:
+        registry = resources.get(names.KEYS, contract.IKeyRegistry)
+
+    assert isinstance(registry, keys.TieredKeyCache)
+    assert (registry.memory_budget, registry.disk_budget) == (64 * 1024**2, 0)
+
+
+def test_the_key_cache_of_a_database_bookkeeping_is_closed_with_it(
+    tmp_path: pathlib.Path,
+) -> None:
+    settings = _settings(
+        tmp_path,
+        databases={"etl": {"url": f"sqlite:///{tmp_path / 'etl.db'}"}},
+        bookkeeping={"database": "etl", "create": True},
+        tuning={"key_cache_memory": 1, "key_cache_disk": 10**6},
+    )
+
+    with runtime.Resources(factories.resource_specs(settings)) as resources:
+        registry = resources.get(names.KEYS, contract.IKeyRegistry)
+        assert isinstance(registry, keys.TieredKeyCache)
+        assert registry.memory_budget == 1
+        registry.register([
+            contract.KeyEntry("e", "k1", ("1",)),
+            contract.KeyEntry("e", "k2", ("2",)),
+        ])
+        directory = registry.spill_directory
+        assert directory is not None
+        assert directory.exists()
+
+    assert not directory.exists()
+
+
+def test_the_key_cache_defaults_come_from_the_budgets(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        utils,
+        "limits",
+        lambda root="/": utils.Limits(
+            4 * 1024**3, "memory.max", 2.0, "cpu.max"
+        ),
+    )
+    monkeypatch.setattr(
+        shutil, "disk_usage", lambda path: types.SimpleNamespace(free=0)
+    )
+    settings = _settings(tmp_path, bookkeeping={"directory": str(tmp_path)})
+
+    with runtime.Resources(factories.resource_specs(settings)) as resources:
+        registry = resources.get(names.KEYS, contract.IKeyRegistry)
+
+    assert isinstance(registry, keys.TieredKeyCache)
+    # 25% of 60% of 4 GiB, in whole MiB; the disk tier: half of no free space.
+    assert registry.memory_budget == 614 * 1024**2
+    assert registry.disk_budget == 0
+    with pytest.raises(ValueError, match="key_cache_memory"):
+        _settings(tmp_path, tuning={"key_cache_memory": "1e9"})
+    with pytest.raises(ValueError, match="key_cache_disk"):
+        _settings(tmp_path, tuning={"key_cache_disk": "-1"})
+    with pytest.raises(ValueError, match="key_cache_memory"):
+        _settings(tmp_path, tuning={"key_cache_memory": 0})

@@ -39,6 +39,16 @@ options = { pool_size = 10, max_overflow = 10, pool_pre_ping = true }
 database = "crm"
 schema_name = "etl"
 
+# The thresholds derived from the pod's memory and CPU limits unless set
+# (docs/tuning.md; `etl config tuning` shows them, `etl calibrate crm`
+# measures the database). The key cache of each process: memory (about
+# 280 MB per million keys), then a SQLite file under $TMPDIR for the keys
+# past it.
+# [tuning]
+# key_cache_memory = "256MiB"
+# key_cache_disk = "2GiB"
+# bulk_copy_rows = 1000
+
 [modules.crm.settings]
 orphans = "park"
 deletes = "soft"

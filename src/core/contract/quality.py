@@ -19,9 +19,10 @@ import hashlib
 import json
 import random
 import typing
-from typing import Any, Protocol
+from typing import Protocol
 
 from core.contract import etl
+from core.contract import state
 from shared import utils
 
 
@@ -178,8 +179,14 @@ class QualityIssue:
         }
 
 
+# Covariant, so that a rejected row is a rejected record of anything.
+# Declared, not PEP 695: pyright infers the parameters of a dataclass
+# invariant on Python 3.13+, from the `__replace__` it synthesizes.
+TRecord_co = typing.TypeVar("TRecord_co", covariant=True)
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
-class RejectedRecord[T]:
+class RejectedRecord(typing.Generic[TRecord_co]):
     """A record the gate dropped into the quarantine.
 
     Attributes:
@@ -188,7 +195,7 @@ class RejectedRecord[T]:
         issues: Why it was rejected.
     """
 
-    record: T
+    record: TRecord_co
     checkpoint: Checkpoint
     issues: tuple[QualityIssue, ...]
 
@@ -424,8 +431,8 @@ class QuarantineEntry:
     pipeline: str
     run_id: str
     checkpoint: str
-    record: Any
-    issues: tuple[Mapping[str, Any], ...]
+    record: state.StateValue
+    issues: tuple[Mapping[str, object], ...]
     rejected_at: datetime.datetime
     status: QuarantineStatus = QuarantineStatus.OPEN
     resolved_at: datetime.datetime | None = None
@@ -485,7 +492,7 @@ class IQuarantine(abc.ABC):
 
     @abc.abstractmethod
     def put(
-        self, records: Sequence[RejectedRecord[Any]], ctx: etl.ETLContext
+        self, records: Sequence[RejectedRecord[object]], ctx: etl.ETLContext
     ) -> None:
         """Stores the records rejected in one batch.
 

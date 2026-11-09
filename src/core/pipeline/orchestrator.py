@@ -7,7 +7,6 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 from concurrent import futures
 import contextvars
 import logging
-import time
 from typing import NamedTuple
 
 from core import contract
@@ -63,20 +62,22 @@ class BaseOrchestrator(abc.ABC):
     being resumed).
 
     The run fails if any step failed, whatever its policy; PARTIAL_SUCCESS is
-    for rows rejected or skipped, never a failed step.
+    for rows rejected or steps skipped, never a failed step. A cancelled run
+    retries no step: it neither waits its backoff nor tries again.
     """
 
     def __init__(
         self,
         listeners: Sequence[contract.PipelineListener] = (),
-        sleep: Callable[[float], None] = time.sleep,
+        sleep: Callable[[float], None] | None = None,
         max_workers: int = 1,
     ) -> None:
         """Initializes the orchestrator.
 
         Args:
             listeners: The observability hooks.
-            sleep: Waits between retries; replaceable in tests.
+            sleep: Waits between retries, replaceable in tests; by default
+                until the backoff ends or the run is cancelled.
             max_workers: The most steps running at the same time.
 
         Raises:
@@ -161,9 +162,10 @@ class BaseOrchestrator(abc.ABC):
             finally:
                 self.teardown(ctx)
 
-            result.complete(
-                _resolve_status(result, ctx, halted_by, _selected(plan, ctx))
+            status = _resolve_status(
+                result, ctx, halted_by, _selected(plan, ctx)
             )
+            result.complete(status, _reason(result, status))
             _close(span, result.status, result.message, result.stats)
             self._notify("on_pipeline_end", result, ctx)
         return result
@@ -297,42 +299,29 @@ class BaseOrchestrator(abc.ABC):
         while True:
             self._notify("on_step_start", step, ctx, attempt)
             try:
-                with (
-                    observability_context.log_context(**{
-                        observability_context.STEP: step.name,
-                        observability_context.ATTEMPT: attempt,
-                    }),
-                    tracing.span(
-                        "etl.step",
-                        {
-                            observability_context.STEP: step.name,
-                            observability_context.ATTEMPT: attempt,
-                        },
-                    ) as span,
-                ):
-                    step_result = step.handler(ctx, upstream)
-                    if step_result.is_done:
-                        _close(
-                            span,
-                            step_result.status,
-                            step_result.message,
-                            step_result.stats,
-                        )
+                step_result = _attempt(step, ctx, upstream, attempt)
                 break
             # Recorded in the step's result; its policy decides what next.
             except Exception as exc:  # pylint: disable=broad-exception-caught
                 self._notify("on_step_error", step, exc, ctx, attempt)
 
-                if step.retry.should_retry(exc, attempt):
-                    self._sleep(step.retry.delay_for(attempt))
+                if step.retry.should_retry(exc, attempt) and self._backoff(
+                    ctx, step.retry.delay_for(attempt)
+                ):
                     attempt += 1
                     continue
 
                 step_result = contract.ETLResult()
-                step_result.add_error(_error_of(exc, step))
+                error = _error_of(exc, step)
+                step_result.add_error(error)
+                if ctx.is_cancelled:
+                    status = contract.ETLStatus.CANCELLED
+                else:
+                    status = contract.ETLStatus.FAILED
                 step_result.complete(
-                    contract.ETLStatus.FAILED,
-                    f"failed after {attempt} attempt(s)",
+                    status,
+                    f"{status.value} after {attempt} attempt(s):"
+                    f" {error.message}",
                 )
                 break
 
@@ -347,6 +336,15 @@ class BaseOrchestrator(abc.ABC):
             coordinator.finished(step.name, step_result, ctx)
         return step_result
 
+    def _backoff(self, ctx: contract.ETLContext, seconds: float) -> bool:
+        """Waits before a retry; False if the run is, or gets, cancelled."""
+        if ctx.is_cancelled:
+            return False
+        if self._sleep is None:
+            return not ctx.wait(seconds)
+        self._sleep(seconds)
+        return not ctx.is_cancelled
+
     def _notify(self, hook: str, *args: object) -> None:
         """Calls `hook` of every listener; one that raises is logged, and
         the others are still called."""
@@ -360,6 +358,32 @@ class BaseOrchestrator(abc.ABC):
                     type(listener).__name__,
                     hook,
                 )
+
+
+def _attempt(
+    step: contract.PipelineStep,
+    ctx: contract.ETLContext,
+    upstream: dict[str, contract.ETLResult],
+    attempt: int,
+) -> contract.ETLResult:
+    """Runs a step once, in its log context and span."""
+    fields: dict[str, str | int] = {
+        observability_context.STEP: step.name,
+        observability_context.ATTEMPT: attempt,
+    }
+    with (
+        observability_context.log_context(**fields),
+        tracing.span("etl.step", fields) as span,
+    ):
+        step_result = step.handler(ctx, upstream)
+        if step_result.is_done:
+            _close(
+                span,
+                step_result.status,
+                step_result.message,
+                step_result.stats,
+            )
+    return step_result
 
 
 def resolve_execution_order(
@@ -513,9 +537,9 @@ def _resolve_status(
 ) -> contract.ETLStatus:
     """The status of a run, from the statuses of its selected steps.
 
-    A failed step fails the run, whatever its policy: a partial success only
-    ever means rows rejected. A run whose steps all skipped themselves (nothing
-    to do) is SKIPPED.
+    A failed step fails the run, whatever its policy: a partial success means
+    rows rejected, or steps skipped while others ran. A run whose steps all
+    skipped themselves (nothing to do) is SKIPPED.
     """
     statuses = [
         step_result.status
@@ -538,6 +562,19 @@ def _resolve_status(
     if contract.ETLStatus.CANCELLED in statuses:
         return contract.ETLStatus.CANCELLED
     return contract.ETLStatus.SKIPPED
+
+
+def _reason(
+    result: contract.PipelineResult, status: contract.ETLStatus
+) -> str | None:
+    """Why a run failed or was cancelled: the first step that did, with its
+    message; None for any other outcome, or when no step tells."""
+    if status not in (contract.ETLStatus.FAILED, contract.ETLStatus.CANCELLED):
+        return None
+    for name, step_result in result.step_results.items():
+        if step_result.status is status and step_result.message:
+            return f"{name}: {step_result.message}"
+    return None
 
 
 def _error_of(exc: Exception, step: contract.PipelineStep) -> contract.ETLError:

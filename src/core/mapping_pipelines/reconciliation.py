@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
 
 from core import contract
 from core import mapping
@@ -70,7 +69,7 @@ def _expect(
     compiled: mapping.CompiledMapping,
     corrections: operators.Corrections,
     name: str,
-    lineage: Callable[[Any], str],
+    lineage: Callable[[operators.SourceRecord], str],
 ) -> Callable[[contract.Row], contract.Expected]:
     """What a source row becomes, corrected, through the mapping."""
 

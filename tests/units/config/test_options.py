@@ -213,6 +213,15 @@ class TestCheckedOptions:
         ].page_size == (1_000)
         with pytest.raises(config.ConfigError, match="page_size"):
             _load(databases={"a": {"url": "sqlite://", "page_size": 0}})
+        # A page is held in memory by every step reading at once.
+        with pytest.raises(config.ConfigError, match="page_size"):
+            _load(databases={"a": {"url": "sqlite://", "page_size": 100_001}})
+        assert (
+            _load(databases={"a": {"url": "sqlite://", "page_size": 100_000}})
+            .databases["a"]
+            .page_size
+            == 100_000
+        )
 
 
 class TestPools:
@@ -232,8 +241,12 @@ class TestPools:
         return settings.module_settings("crm", crm_settings.CrmSettings)
 
     def test_parallel_ranges_need_a_pool_that_holds_them(self) -> None:
+        # The CPU budget would cap the steps below 16 on a small host.
         with pytest.raises(config.ConfigError) as caught:
-            self._crm(modules={"crm": {"settings": {"partitions": 16}}})
+            self._crm(
+                modules={"crm": {"settings": {"partitions": 16}}},
+                tuning={"max_parallel_steps": 16},
+            )
 
         message = str(caught.value)
         # 16 ranges: a transaction and a bulk copy each, plus the records.
@@ -245,13 +258,20 @@ class TestPools:
     def test_a_large_enough_pool_or_fewer_steps_pass(self) -> None:
         ranges = {"modules": {"crm": {"settings": {"partitions": 16}}}}
 
-        assert self._crm(**ranges, runs={"max_parallel_steps": 4}).partitions
+        assert self._crm(**ranges, tuning={"max_parallel_steps": 4}).partitions
         with pytest.raises(config.ConfigError, match="legacy"):
-            self._crm(**ranges, crm={"options": {"max_overflow": 29}})
+            self._crm(
+                **ranges,
+                crm={"options": {"max_overflow": 29}},
+                tuning={"max_parallel_steps": 16},
+            )
         assert self._crm(
             modules={"crm": {"settings": {"partitions": 6}}},
             crm={"options": {"pool_size": 10, "max_overflow": 4}},
         )
+
+    def test_deletes_above_a_tenth_of_an_entity_need_confirming(self) -> None:
+        assert self._crm().max_delete_share == 0.1
 
     def test_unlimited_pools_and_sqlite_pass(self) -> None:
         ranges = {"modules": {"crm": {"settings": {"partitions": 64}}}}

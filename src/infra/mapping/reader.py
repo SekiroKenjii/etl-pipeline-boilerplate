@@ -1,4 +1,4 @@
-"""Reading mapping workbooks (xlsx). Needs the `mappings` extra (openpyxl)."""
+"""Reading mapping workbooks (xlsx)."""
 
 from __future__ import annotations
 
@@ -8,11 +8,11 @@ import datetime
 import difflib
 import pathlib
 import re
-from typing import Any
 
 import openpyxl
 
 from core import contract
+from infra.mapping import clients as mapping_clients
 from infra.mapping import layout
 
 _LIST_SEPARATORS = re.compile(r"[,;\n]")
@@ -84,7 +84,7 @@ class _Sheet:
 
     def __init__(
         self,
-        worksheet: Any,
+        worksheet: mapping_clients.WorksheetLike,
         file: str,
         columns: dict[str, tuple[str, ...]],
         required: Sequence[str],
@@ -190,7 +190,7 @@ class XlsxMappingReader:
         problems: _Problems = []
         workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
         try:
-            sheets = {
+            sheets: dict[str, mapping_clients.WorksheetLike] = {
                 layout.normalize(ws.title): ws for ws in workbook.worksheets
             }
             index = _Sheet(
@@ -222,7 +222,9 @@ class XlsxMappingReader:
             labels=labels,
         )
 
-    def _index_sheet(self, sheets: dict[str, Any], file: str) -> Any:
+    def _index_sheet(
+        self, sheets: dict[str, mapping_clients.WorksheetLike], file: str
+    ) -> mapping_clients.WorksheetLike:
         """Returns the sheet listing the mappings.
 
         Raises:
@@ -241,7 +243,7 @@ class XlsxMappingReader:
     def _mappings(
         self,
         index: _Sheet,
-        sheets: dict[str, Any],
+        sheets: dict[str, mapping_clients.WorksheetLike],
         used: set[str],
         labels: dict[str, str],
         problems: _Problems,
@@ -282,7 +284,7 @@ class XlsxMappingReader:
     def _lookups(
         self,
         index: _Sheet,
-        sheets: dict[str, Any],
+        sheets: dict[str, mapping_clients.WorksheetLike],
         used: set[str],
         problems: _Problems,
     ) -> dict[str, dict[str, str]]:
@@ -461,7 +463,9 @@ def _whole(row: _Row, key: str, sheet: _Sheet, problems: _Problems) -> int:
     return 1
 
 
-def _lookup(worksheet: Any, file: str, problems: _Problems) -> dict[str, str]:
+def _lookup(
+    worksheet: mapping_clients.WorksheetLike, file: str, problems: _Problems
+) -> dict[str, str]:
     """Reads a lookup sheet: key in the first column, value in the second."""
     table: dict[str, str] = {}
     rows = worksheet.iter_rows(values_only=True)
@@ -518,7 +522,7 @@ def _params(
                 location,
             )
         )
-    for item, value in items:
+    for item, value, trailing in items:
         key, equals, _ = item.partition("=")
         key = key.strip()
         if not equals or not key:
@@ -528,6 +532,14 @@ def _params(
                 )
             )
             continue
+        if trailing:
+            problems.append(
+                contract.MappingProblem(
+                    f"{item.strip()!r} has text after its closing quote: put"
+                    ' it inside the quotes, or "" for a quote',
+                    location,
+                )
+            )
         if key in params:
             problems.append(
                 contract.MappingProblem(
@@ -538,17 +550,21 @@ def _params(
     return params
 
 
-def _param_items(text: str) -> tuple[list[tuple[str, str]], bool]:
+type _ParamItem = tuple[str, str, bool]
+
+
+def _param_items(text: str) -> tuple[list[_ParamItem], bool]:
     """Splits a parameters cell into its items, outside quotes.
 
     Returns:
-        Each item as written, with its value (unquoted, or trimmed), and
-        whether a quote is left open.
+        Each item as written, with its value (unquoted, or trimmed) and
+        whether text follows its closing quote; and whether a quote is left
+        open.
     """
-    items: list[tuple[str, str]] = []
+    items: list[_ParamItem] = []
     raw: list[str] = []  # The item as written.
     value: list[str] = []  # Its value, once `=` is met.
-    in_value = quoted = was_quoted = False
+    in_value = quoted = was_quoted = trailing = False
     position = 0
     while position < len(text):
         char = text[position]
@@ -565,8 +581,9 @@ def _param_items(text: str) -> tuple[list[tuple[str, str]], bool]:
                 value.append(char)
             continue
         if char in _PARAM_SEPARATORS:
-            _add_item(items, raw, value, was_quoted)
+            _add_item(items, raw, value, was_quoted, trailing)
             raw, value, in_value, was_quoted = [], [], False, False
+            trailing = False
             continue
         raw.append(char)
         if not in_value:
@@ -574,23 +591,26 @@ def _param_items(text: str) -> tuple[list[tuple[str, str]], bool]:
         elif char == '"' and not "".join(value).strip() and not was_quoted:
             quoted = was_quoted = True
             value = []
-        elif not (was_quoted and char.isspace()):
+        elif was_quoted:
+            trailing = trailing or not char.isspace()
+        else:
             value.append(char)
-    _add_item(items, raw, value, was_quoted)
+    _add_item(items, raw, value, was_quoted, trailing)
     return items, quoted
 
 
 def _add_item(
-    items: list[tuple[str, str]],
+    items: list[_ParamItem],
     raw: list[str],
     value: list[str],
     was_quoted: bool,
+    trailing: bool,
 ) -> None:
     """Adds an item to `items`, unless it is blank."""
     item = "".join(raw)
     if item.strip():
         text = "".join(value)
-        items.append((item, text if was_quoted else text.strip()))
+        items.append((item, text if was_quoted else text.strip(), trailing))
 
 
 def _choice[T](

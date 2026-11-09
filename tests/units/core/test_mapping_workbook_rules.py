@@ -93,6 +93,53 @@ class TestWorkbooks:
         assert name.params == {"separator": "; ", "skip": "x"}
         assert code.params == {"A": "a;b", "Q": 'say "hi"'}
 
+    @pytest.mark.parametrize(
+        "params",
+        [
+            'separator=", "x',
+            'separator=", " x; skip=y',
+            'Q="say ""hi"""!',
+            'A="a" "b"',
+        ],
+    )
+    def test_text_after_a_closing_quote_is_refused(
+        self, tmp_path: pathlib.Path, params: str
+    ) -> None:
+        path = _workbook(
+            tmp_path / "crm.xlsx",
+            {
+                "Mappings": INDEX,
+                "customer": [
+                    ["Target column", "Source columns", "Transform", "Params"],
+                    ["name", "A, B", "concat", params],
+                ],
+            },
+        )
+
+        (problem,) = _problems(path)
+        assert "after its closing quote" in problem
+        assert "Params" in problem
+
+    def test_spaces_after_a_closing_quote_are_not_text(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        path = _workbook(
+            tmp_path / "crm.xlsx",
+            {
+                "Mappings": INDEX,
+                "customer": [
+                    ["Target column", "Source columns", "Transform", "Params"],
+                    ["name", "A, B", "concat", 'separator=", "  \n skip="y" '],
+                ],
+            },
+        )
+
+        (name,) = (
+            infra_mapping.XlsxMappingReader().read(path).get("customer").fields
+        )
+
+        assert name.params == {"separator": ", ", "skip": "y"}
+
 
 class TestDateFormats:
 
@@ -114,6 +161,8 @@ class TestDateFormats:
             ("d/M/yyyy", "unknown token(s) M, d"),
             ("dd/mm/yyyy", "mm is minutes"),
             ("dd/MM", "has no year"),
+            ("dd-MMM-yyyy", "unknown token(s) M"),
+            ("HH:mm:ss.SSS", "unknown token(s) SSS"),
         ],
     )
     def test_unknown_tokens_are_refused(
@@ -126,7 +175,14 @@ class TestDateFormats:
 
     @pytest.mark.parametrize(
         "source_format",
-        ["dd/MM/yyyy", "yyyy-MM-dd'T'HH:mm:ss", "%d.%m.%Y", "dd/MM/yy"],
+        [
+            "dd/MM/yyyy",
+            "yyyy-MM-dd'T'HH:mm:ss",
+            "%d.%m.%Y",
+            "dd/MM/yy",
+            "%d-%b-%Y",
+            "%Y-%m-%d %H:%M:%S.%f",
+        ],
     )
     def test_known_tokens_are_accepted(self, source_format: str) -> None:
         assert self._problems(source_format) == []

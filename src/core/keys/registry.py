@@ -1,8 +1,7 @@
-"""Key registries (crosswalks): in memory, JSON Lines files, and a cache."""
+"""Key registries (crosswalks): in memory, and in JSON Lines files."""
 
 from __future__ import annotations
 
-import collections
 from collections.abc import Collection, Iterator, Sequence
 import json
 import pathlib
@@ -149,107 +148,3 @@ class JsonLinesKeyRegistry(contract.IKeyRegistry):
                         keys[item["surrogate_key"]] = tuple(item["natural_key"])
             self._keys[entity] = keys
         return keys
-
-
-class CachedKeyRegistry(contract.IKeyRegistry):
-    """An LRU cache in front of a slower registry, such as a database.
-
-    Written through on `register`. Only positive answers are cached: a key
-    unknown now may be registered a moment later by another step or host.
-    `known` costs one call to the inner registry for all the misses of a
-    batch; natural keys are fetched only when asked for.
-
-    Attributes:
-        inner: The cached registry.
-        max_entries: The most keys kept in the cache.
-        hits: The keys `known` found in the cache.
-        misses: The keys `known` had to ask the inner registry about.
-    """
-
-    def __init__(
-        self, inner: contract.IKeyRegistry, max_entries: int = 100_000
-    ) -> None:
-        """Initializes an empty cache.
-
-        Args:
-            inner: The registry to cache.
-            max_entries: The most keys kept in the cache.
-
-        Raises:
-            ValueError: If `max_entries` is below 1.
-        """
-        if max_entries < 1:
-            raise ValueError("max_entries must be >= 1")
-        self.inner = inner
-        self.max_entries = max_entries
-        # (entity, surrogate key) -> natural key, or None when not fetched yet.
-        self._cache: collections.OrderedDict[
-            tuple[str, str], tuple[str, ...] | None
-        ] = collections.OrderedDict()
-        self._lock = threading.Lock()
-        self.hits = 0
-        self.misses = 0
-
-    def register(self, entries: Sequence[contract.KeyEntry]) -> None:
-        self.inner.register(entries)
-        with self._lock:
-            for entry in entries:
-                self._put(
-                    (entry.entity, entry.surrogate_key), entry.natural_key
-                )
-
-    def known(self, entity: str, surrogate_keys: Collection[str]) -> set[str]:
-        """See `contract.IKeyRegistry.known`."""
-        found: set[str] = set()
-        missing: list[str] = []
-        with self._lock:
-            for key in surrogate_keys:
-                if (entity, key) in self._cache:
-                    self._cache.move_to_end((entity, key))
-                    found.add(key)
-                else:
-                    missing.append(key)
-            self.hits += len(found)
-            self.misses += len(missing)
-
-        if missing:
-            confirmed = self.inner.known(entity, missing)
-            with self._lock:
-                for key in confirmed:
-                    if (entity, key) not in self._cache:
-                        self._put((entity, key), None)
-            found |= confirmed
-        return found
-
-    def entries(self, entity: str) -> Iterator[contract.KeyEntry]:
-        """See `contract.IKeyRegistry.entries`; read from the inner registry."""
-        return self.inner.entries(entity)
-
-    def natural_key(
-        self, entity: str, surrogate_key: str
-    ) -> tuple[str, ...] | None:
-        with self._lock:
-            cached = self._cache.get((entity, surrogate_key))
-        if cached is not None:
-            return cached
-
-        natural = self.inner.natural_key(entity, surrogate_key)
-        if natural is not None:
-            with self._lock:
-                self._put((entity, surrogate_key), natural)
-        return natural
-
-    def forget(self, entity: str, natural_key: Sequence[str]) -> list[str]:
-        gone = self.inner.forget(entity, natural_key)
-        with self._lock:
-            for key in gone:
-                self._cache.pop((entity, key), None)
-        return gone
-
-    def _put(
-        self, key: tuple[str, str], natural: tuple[str, ...] | None
-    ) -> None:
-        self._cache[key] = natural
-        self._cache.move_to_end(key)
-        while len(self._cache) > self.max_entries:
-            self._cache.popitem(last=False)

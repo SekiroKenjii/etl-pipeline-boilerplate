@@ -19,8 +19,8 @@ environment variables.
 | `${env:NAME}` | An environment variable | — |
 | `${file:/run/secrets/x}` | A mounted file (Docker, Kubernetes secrets) | — |
 | `${vault:secret/crm/db#password}` | HashiCorp Vault, KV version 2 | `VAULT_ADDR`, `VAULT_TOKEN` or `VAULT_TOKEN_FILE`, `VAULT_NAMESPACE`, `VAULT_CACERT` or `VAULT_CAPATH` |
-| `${gcp:crm-db-url}` | Google Cloud Secret Manager (`gcp-secrets` extra) | Application Default Credentials, `GOOGLE_CLOUD_PROJECT` |
-| `${azure:acme-kv/crm-db-url}` | Azure Key Vault (`azure-secrets` extra) | `DefaultAzureCredential` (managed identity first), `AZURE_KEYVAULT_DNS_SUFFIX` |
+| `${gcp:crm-db-url}` | Google Cloud Secret Manager | Application Default Credentials, `GOOGLE_CLOUD_PROJECT` |
+| `${azure:acme-kv/crm-db-url}` | Azure Key Vault | `DefaultAzureCredential` (managed identity first), `AZURE_KEYVAULT_DNS_SUFFIX` |
 
 How secrets are handled:
 
@@ -91,11 +91,26 @@ The names above are always redacted; `logging.redact` adds to them (an
 `ssn` field, say).
 
 Exceptions are rendered once, redacted, by the filter: the formatters and
-the OTLP exporter (`exception.message`, `exception.stacktrace`) use that
-text, and the record's `exc_info` is cleared so no handler can print the
-raw traceback. A failed attempt that will be retried is logged in one
-line; the traceback comes with the last attempt only. Lineage events
-carry the redacted error message too.
+the OTLP log exporter (`exception.message`, `exception.stacktrace`) use
+that text, and the record's `exc_info` is cleared so no handler can print
+the raw traceback. A failed attempt that will be retried is logged in one
+line; the traceback comes with the last attempt only.
+
+The other sinks get the same redaction, `logging.redact` included:
+
+- **Traces.** A failed span's `exception` event (`exception.type`,
+  `exception.message`, `exception.stacktrace`) and its status description
+  are the redacted text, never the exception itself: the step's and the
+  batch's spans alike. An exception whose `str()` raises is described by
+  its type.
+- **Lineage.** The `errorMessage` facet is the redacted message.
+- **The run ledger and `etl run`.** The message of a run and of each step
+  (a step cancelled while failing quotes its exception), the module's
+  fingerprint error, what `etl run` prints of the outcome and what `etl
+  check` reports of a resource are redacted before they are kept or shown.
+- **Kafka dead letters.** The `etl.error` header is the reason redacted
+  whole, then cut to 1,000 characters.
+- **Metrics** carry no error text: only `etl.retryable`.
 
 What is **not** redacted:
 
@@ -108,6 +123,12 @@ What is **not** redacted:
   a non-root logger.
 - Values a driver quotes in another shape than those above. They reach
   the logs and the run ledger's message of a failed step.
+- The line `etl` prints when a command fails (`FAILED <message>`, or the
+  JSON summary of `etl run`): redacted by the built-in names only, since
+  the settings may be what failed.
+- The issues of the quarantine and the quality issues: they hold the rows'
+  values on purpose (the personal columns' issues leave them out), with
+  the message of a custom transform that failed on the row.
 - The value and key of a Kafka dead letter: the source message as it was
   (its `etl.error` header is redacted); see
   [Kafka dead letters](#kafka-dead-letters).
@@ -266,8 +287,12 @@ The dead letter topic holds personal data like the source topics:
     values, derived from the real ones by HMAC with `privacy.secret`. The
     same value always gets the same fake, so joins hold and the cutover
     report still reconciles. `email`, `phone` and `hash` fakes keep unique
-    columns unique (80, about 50 and 64 bits of the HMAC: no collision in
-    10^6 values, tested); `name`, `address` and `mask` are not unique.
+    columns unique, but for a collision (80, about 50 and 64 bits of the
+    HMAC: no collision in 10^6 values, tested). For n values the chance of
+    one is about n^2 / 2^(bits+1): for `phone`, 5e-4 at a million values
+    and 5e-2 at 10 million, when the unique index would refuse the load;
+    use `hash` for a unique column that large. `name`, `address` and `mask`
+    are not unique.
   - Each kind needs a target type holding its fakes, checked when the
     mapping compiles: text of at least 15 characters for `name`, 41 for
     `email`, 20 for `phone`, 29 for `address`, 16 for `hash`; text for
@@ -275,7 +300,8 @@ The dead letter topic holds personal data like the source topics:
   - `date` shifts every date of a record by the same 1 to 180 days, either
     way, derived from the record's natural key: a start stays before its
     end, and the days between them stay the same. Ages and fiscal periods
-    move with the shift.
+    move with the shift. A mapping without a primary key uses the source
+    key, else the row itself: then a row that changes gets another shift.
   - The issues of a personal column never hold its value, in production
     as in UAT: the quarantine, the issue sinks, `etl quarantine export` and
     the cutover reports say what is wrong (`the value does not match the
@@ -296,11 +322,18 @@ The dead letter topic holds personal data like the source topics:
 - **Cutover diffs.** `etl cutover report` spills the source rows of the
   buckets that differ to disk past 50,000 rows: JSON lines, personal data
   included, in a directory of `$TMPDIR` only its user can read, removed when
-  the report is done (not after `kill -9`). Point `TMPDIR` at a volume
+  the report is done or stopped by SIGTERM or Ctrl-C (exit 130), not after
+  `kill -9`. Point `TMPDIR` at a volume
   allowed to hold the source data, sized for the source table; the image's
   read-only root filesystem needs a writable volume there anyway. The
   report's samples show the values that differ: treat the reports as the
   source data too.
+- **The key cache** writes the keys past `tuning.key_cache_memory` to
+  a SQLite file: natural keys, which may be personal data (a customer
+  number), in a directory of `$TMPDIR` only its user can read, removed when
+  the process ends, cancelled by SIGTERM or Ctrl-C included, not after
+  `kill -9`. `key_cache_disk = 0` keeps the keys in memory and the registry
+  only.
 - **Right to erasure.**
 
   ```sh

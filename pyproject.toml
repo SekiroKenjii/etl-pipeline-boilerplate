@@ -24,38 +24,33 @@ classifiers = [
     "Typing :: Typed",
 ]
 # `core` and `shared` need nothing beyond the standard library.
-dependencies = []
-
-[project.optional-dependencies]
-# One extra per `infra` connector family.
-http = ["httpx>=0.28"]
-mappings = ["openpyxl>=3.1"]
-gcs = ["google-cloud-storage>=2.18"]
-# Secret managers, for `${gcp:...}` and `${azure:...}` placeholders; `${vault:...}`
-# needs the `http` extra.
-gcp-secrets = ["google-cloud-secret-manager>=2.20"]
-azure-secrets = ["azure-keyvault-secrets>=4.8", "azure-identity>=1.17"]
-# Relational databases, through SQLAlchemy Core; one extra per driver.
-sql = ["sqlalchemy>=2.0.41", "alembic>=1.16"]
-postgres = ["etl-pipeline-boilerplate[sql]", "psycopg[binary]>=3.2"]
-mssql = ["etl-pipeline-boilerplate[sql]", "mssql-python>=1.0"]
-oracle = ["etl-pipeline-boilerplate[sql]", "oracledb>=2.5"]
-mysql = ["etl-pipeline-boilerplate[sql]", "pymysql>=1.1"]
-mongodb = ["pymongo>=4.10"]
-# Kafka topics, Debezium change events among them.
-kafka = ["confluent-kafka>=2.6"]
-# The application: settings, bootstrap, the `etl` command.
-app = ["pydantic-settings>=2.6"]
-# Logs (and later traces) exported by OpenTelemetry (OTLP).
-otel = [
+# Every library the code imports: each adapter `app` may create (psycopg for
+# COPY and logical replication), the secret managers of the placeholders,
+# OpenTelemetry, openpyxl for workbooks and xlsx reports.
+dependencies = [
+    "pydantic-settings>=2.6",
+    "sqlalchemy>=2.0.41",
+    "alembic>=1.16",
+    "pymongo>=4.10",
+    "confluent-kafka>=2.6",
+    "httpx>=0.28",
+    "google-cloud-storage>=2.18",
+    "google-cloud-secret-manager>=2.20",
+    "azure-keyvault-secrets>=4.8",
+    "azure-identity>=1.17",
     "opentelemetry-sdk>=1.27",
     "opentelemetry-exporter-otlp-proto-http>=1.27",
+    "psycopg[binary]>=3.2",
+    "openpyxl>=3.1",
 ]
-all = [
-    "etl-pipeline-boilerplate[http,mappings,gcs,postgres,mssql,oracle,mysql]",
-    "etl-pipeline-boilerplate[mongodb,kafka,app,otel]",
-    "etl-pipeline-boilerplate[gcp-secrets,azure-secrets]",
-]
+
+[project.optional-dependencies]
+# The other SQL drivers: SQLAlchemy loads them by the URL, the code never
+# imports them.
+mssql = ["mssql-python>=1.0"]
+oracle = ["oracledb>=2.5"]
+mysql = ["pymysql>=1.1"]
+all = ["etl-pipeline-boilerplate[mssql,oracle,mysql]"]
 
 [project.scripts]
 etl = "cli.run:main"
@@ -74,24 +69,10 @@ tests = [
     "pytest>=9.2.0",
     "pytest-xdist>=3.8.0",
     "hypothesis>=6.120",
-    # The optional extras, so that their adapters are tested too.
-    "httpx>=0.28",
-    "openpyxl>=3.1",
-    "google-cloud-storage>=2.18",
-    "google-cloud-secret-manager>=2.20",
-    "azure-keyvault-secrets>=4.8",
-    "azure-identity>=1.17",
-    "sqlalchemy>=2.0.41",
-    "alembic>=1.16",
-    "psycopg[binary]>=3.2",
+    # The extras, so that every driver is tested too.
     "mssql-python>=1.0",
     "oracledb>=2.5",
     "pymysql>=1.1",
-    "pymongo>=4.10",
-    "confluent-kafka>=2.6",
-    "pydantic-settings>=2.6",
-    "opentelemetry-sdk>=1.27",
-    "opentelemetry-exporter-otlp-proto-http>=1.27",
 ]
 coverage = ["coverage>=7.17.0", "pytest-cov>=7.1.0"]
 lint = ["pyink>=24.10", "isort>=6.0", "pylint>=3.3"]
@@ -172,8 +153,8 @@ ignore-long-lines = '^\s*(# )?<?https?://\S+>?$|^\s*(from\s+\S+\s+)?import\s+.+$
 
 [tool.pylint.basic]
 good-names = ["main", "_", "i", "j", "k", "fn"]
-# PEP 695 type parameters: T, TIn, TOut...
-typevar-rgx = "^([A-Z]|T[A-Za-z]+)$"
+# PEP 695 type parameters: T, TIn, TOut...; declared variance: TIn_contra.
+typevar-rgx = "^([A-Z]|T[A-Za-z]+)(_co|_contra)?$"
 no-docstring-rgx = "(__.*__|main|test.*|.*test|.*Test)$"
 docstring-min-length = 12
 

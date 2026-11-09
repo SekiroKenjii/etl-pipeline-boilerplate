@@ -12,7 +12,7 @@ ETL is.
 
 from __future__ import annotations
 
-from collections.abc import Generator, Iterator, Mapping
+from collections.abc import Collection, Generator, Iterator, Mapping
 import contextlib
 import datetime
 import re
@@ -25,6 +25,7 @@ from confluent_kafka import admin as kafka_admin
 from core import contract
 from core import observability
 from core.observability import metrics
+from infra.messaging import clients as messaging_clients
 
 _TOPIC_HEADER = "etl.topic"
 _MESSAGE_ID = re.compile(r"(.+)\[(\d+)\]@(\d+)")
@@ -37,6 +38,10 @@ _SECRET_PROPERTIES = frozenset({
     "ssl_key",
 })
 
+type _Headers = (
+    dict[str, str | bytes | None] | list[tuple[str, str | bytes | None]]
+)
+
 
 class _Credentials:
     """librdkafka properties holding secrets, kept apart from the others.
@@ -48,21 +53,21 @@ class _Credentials:
 
     __slots__ = ("_values",)
 
-    def __init__(self, values: Mapping[str, Any]) -> None:
+    def __init__(self, values: Mapping[str, object]) -> None:
         self._values = dict(values)
 
     def __repr__(self) -> str:
         return f"<credentials {sorted(self._values)}: hidden>"
 
-    def merged(self, config: Mapping[str, Any]) -> dict[str, Any]:
+    def merged(self, config: Mapping[str, object]) -> dict[str, object]:
         """The properties of a client: `config` and the credentials."""
         return {**config, **self._values}
 
 
 def _split(
-    config: Mapping[str, Any],
-    credentials: _Credentials | Mapping[str, Any] | None,
-) -> tuple[dict[str, Any], _Credentials]:
+    config: Mapping[str, object],
+    credentials: _Credentials | Mapping[str, object] | None,
+) -> tuple[dict[str, object], _Credentials]:
     """The properties without secrets, and the secrets: those of `config`,
     and `credentials`."""
     secret = {
@@ -99,15 +104,18 @@ class KafkaCluster(contract.IMessageLog):
             without the secrets (`sasl.password`...): those are kept apart,
             and given to each client when it is built.
         group_id: The consumer group whose offsets the ETL commits.
+        redact: More secret names hidden in the reasons of dead letters, on
+            top of `observability.SECRET_NAMES`: the logs' `redact`.
     """
 
     def __init__(
         self,
-        config: Mapping[str, Any],
+        config: Mapping[str, object],
         *,
-        credentials: Mapping[str, Any] | None = None,
+        credentials: Mapping[str, object] | None = None,
         group_id: str = "etl",
         timeout_seconds: float = 30.0,
+        redact: Collection[str] = (),
     ) -> None:
         """Initializes the cluster.
 
@@ -117,9 +125,11 @@ class KafkaCluster(contract.IMessageLog):
             credentials: The librdkafka properties holding secrets.
             group_id: The consumer group of the ETL.
             timeout_seconds: How long to wait for the brokers.
+            redact: More secret names hidden in the reasons of dead letters.
         """
         self.config, self._credentials = _split(config, credentials)
         self.group_id = group_id
+        self.redact = tuple(redact)
         self._timeout = timeout_seconds
 
     def topic(self, name: str) -> KafkaTopic:
@@ -140,7 +150,7 @@ class KafkaCluster(contract.IMessageLog):
 
     def dead_letters(self, topic: str) -> KafkaDeadLetters:
         """Returns a dead letter topic of the cluster."""
-        return KafkaDeadLetters(self.producer(), topic)
+        return KafkaDeadLetters(self.producer(), topic, redact=self.redact)
 
     def ping(self) -> None:
         """Checks that a broker answers.
@@ -148,7 +158,10 @@ class KafkaCluster(contract.IMessageLog):
         Raises:
             RetryableError: If none does in time.
         """
-        admin = kafka_admin.AdminClient(self._credentials.merged(self.config))
+        # confluent-kafka types the config narrower than librdkafka takes it
+        # (callbacks such as `error_cb`).
+        config: dict[str, Any] = self._credentials.merged(self.config)
+        admin = kafka_admin.AdminClient(config)
         with errors("reaching the brokers"):
             admin.list_topics(timeout=self._timeout)
 
@@ -164,10 +177,10 @@ class KafkaTopic(contract.IMessageSource):
 
     def __init__(
         self,
-        config: Mapping[str, Any],
+        config: Mapping[str, object],
         topic: str,
         *,
-        credentials: _Credentials | Mapping[str, Any] | None = None,
+        credentials: _Credentials | Mapping[str, object] | None = None,
         group_id: str = "etl",
         timeout_seconds: float = 30.0,
         poll_seconds: float = 0.5,
@@ -194,6 +207,7 @@ class KafkaTopic(contract.IMessageSource):
             "auto.offset.reset": "earliest",
         }
         self._topic = topic
+        self._group_id = group_id
         self._timeout = timeout_seconds
         self._poll = poll_seconds
         self._consumer: confluent_kafka.Consumer | None = None
@@ -251,7 +265,7 @@ class KafkaTopic(contract.IMessageSource):
         metrics.meter().gauge(
             "etl.messages.lag",
             sum(max(0, stop.get(p, 0) - o) for p, o in positions.items()),
-            {_TOPIC_HEADER: self._topic, "etl.group": self._config["group.id"]},
+            {_TOPIC_HEADER: self._topic, "etl.group": self._group_id},
             unit="{message}",
             description="Messages of the topic not loaded yet, at the start",
         )
@@ -392,7 +406,7 @@ class KafkaProducer:
     """
 
     def __init__(
-        self, config: Mapping[str, Any], *, timeout_seconds: float = 30.0
+        self, config: Mapping[str, object], *, timeout_seconds: float = 30.0
     ) -> None:
         self._producer = confluent_kafka.Producer(
             {**config, "enable.idempotence": True}
@@ -410,7 +424,10 @@ class KafkaProducer:
         partition: int | None = None,
     ) -> None:
         """Queues a message; `flush` waits for it."""
-        options: dict[str, Any] = {"key": key, "on_delivery": self._delivered}
+        options: messaging_clients.ProduceOptions = {
+            "key": key,
+            "on_delivery": self._delivered,
+        }
         if headers:
             options["headers"] = list(headers.items())
         if partition is not None:
@@ -452,17 +469,25 @@ class KafkaDeadLetters(contract.IDeadLetters):
     for a message of Kafka `etl.topic`, `etl.partition` and `etl.offset`,
     as Kafka Connect's dead letter queues do.
 
-    The reason is redacted (`observability.redact_text`) and cut to
-    `_MAX_REASON` characters: the message itself is kept as it was, so
-    restrict who reads the topic and how long it keeps them as for the
-    source topic.
+    The reason is redacted (`observability.redact_text`, with `redact`),
+    then cut to `_MAX_REASON` characters: the message itself is kept as it
+    was, so restrict who reads the topic and how long it keeps them as for
+    the source topic.
 
     Attributes:
         topic: The dead letter topic.
+        redact: More secret names hidden in the reasons.
     """
 
-    def __init__(self, producer: KafkaProducer, topic: str) -> None:
+    def __init__(
+        self,
+        producer: KafkaProducer,
+        topic: str,
+        *,
+        redact: Collection[str] = (),
+    ) -> None:
         self.topic = topic
+        self.redact = tuple(redact)
         self._producer = producer
 
     def send(self, message: contract.Message, reason: str) -> None:
@@ -475,7 +500,7 @@ class KafkaDeadLetters(contract.IDeadLetters):
             key=message.key,
             headers={
                 **message.headers,
-                "etl.error": _reason(reason).encode(),
+                "etl.error": _reason(reason, self.redact).encode(),
                 "etl.message": message.id.encode(),
                 **origin,
             },
@@ -490,11 +515,12 @@ class KafkaDeadLetters(contract.IDeadLetters):
         )
 
 
-def _reason(reason: str) -> str:
+def _reason(reason: str, redact: Collection[str]) -> str:
     """Why a message is a dead letter: redacted, at most `_MAX_REASON`
     characters."""
-    # Redaction takes time with the length: what is cut is not redacted.
-    reason = observability.redact_text(reason[: 4 * _MAX_REASON])
+    # Redacted whole (linear time), then cut: a cut first may split a secret
+    # out of its pattern, and masks shrink the text, bringing it in front.
+    reason = observability.redact_text(reason, redact)
     if len(reason) <= _MAX_REASON:
         return reason
     return reason[: _MAX_REASON - 1] + "…"
@@ -512,13 +538,19 @@ def _offsets(position: contract.StateValue) -> dict[int, int]:
         raise contract.FatalError(f"Not a position of a topic: {position!r}")
     try:
         return {
-            int(partition): int(offset)  # type: ignore[arg-type]
+            int(partition): _offset(offset)
             for partition, offset in position.items()
         }
     except (TypeError, ValueError):
         raise contract.FatalError(
             f"Not a position of a topic: {position!r}"
         ) from None
+
+
+def _offset(value: contract.StateValue) -> int:
+    if not isinstance(value, (str, int, float)):
+        raise TypeError(f"not an offset: {value!r}")
+    return int(value)
 
 
 def _coordinates(message: confluent_kafka.Message) -> tuple[int, int]:
@@ -565,7 +597,7 @@ def _origin(message_id: str) -> dict[str, bytes]:
     }
 
 
-def _headers(raw: Any) -> dict[str, bytes]:
+def _headers(raw: _Headers | None) -> dict[str, bytes]:
     """The headers of a message, as `{name: value}`; a name sent twice keeps
     its last value."""
     items = raw.items() if isinstance(raw, dict) else raw or ()

@@ -14,7 +14,8 @@ import dataclasses
 import hashlib
 import json
 import typing
-from typing import Any
+
+from shared import utils
 
 DIGEST = "digest"
 COUNTERS = (
@@ -34,7 +35,7 @@ COUNTERS = (
 )
 
 
-def digest(report: Mapping[str, Any]) -> str:
+def digest(report: Mapping[str, object]) -> str:
     """The SHA-256 of a report's content, its own digest aside."""
     content = {k: v for k, v in report.items() if k != DIGEST}
     text = json.dumps(
@@ -43,19 +44,19 @@ def digest(report: Mapping[str, Any]) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
-def seal(report: Mapping[str, Any]) -> dict[str, Any]:
+def seal(report: Mapping[str, object]) -> dict[str, object]:
     """The report with its digest."""
     return {**report, DIGEST: digest(report)}
 
 
-def verify(report: Mapping[str, Any]) -> bool:
+def verify(report: Mapping[str, object]) -> bool:
     """Whether a sealed report is as it was sealed: its content has its
     digest. Whether that digest is the one recorded when it was saved is
     the ledger's to tell."""
     return report.get(DIGEST) == digest(report)
 
 
-def verdict(report: Mapping[str, Any]) -> str:
+def verdict(report: Mapping[str, object]) -> str:
     """The verdict of a report; of an older one, from `passed`."""
     found = report.get("verdict")
     if isinstance(found, str):
@@ -101,8 +102,8 @@ class Comparison:
     passed: tuple[bool, bool]
     entities: list[EntityChange]
     verdicts: tuple[str, str] = ("", "")
-    provenance: dict[str, tuple[Any, Any]] = dataclasses.field(
-        default_factory=dict[str, tuple[Any, Any]]
+    provenance: dict[str, tuple[object, object]] = dataclasses.field(
+        default_factory=dict[str, tuple[object, object]]
     )
 
     @property
@@ -111,7 +112,9 @@ class Comparison:
         return [e for e in self.entities if e.deltas or e.before != e.after]
 
 
-def compare(before: Mapping[str, Any], after: Mapping[str, Any]) -> Comparison:
+def compare(
+    before: Mapping[str, object], after: Mapping[str, object]
+) -> Comparison:
     """Compares two reports of the same module.
 
     Raises:
@@ -121,28 +124,27 @@ def compare(before: Mapping[str, Any], after: Mapping[str, Any]) -> Comparison:
         raise ValueError(
             f"reports of {before.get('module')!r} and {after.get('module')!r}"
         )
-    old = {e["entity"]: e for e in before.get("entities", [])}
-    new = {e["entity"]: e for e in after.get("entities", [])}
+    old, new = _entities(before), _entities(after)
     entities: list[EntityChange] = []
     for name in [*old, *(n for n in new if n not in old)]:
         a, b = old.get(name), new.get(name)
         deltas = {
-            counter: int(b.get(counter) or 0) - int(a.get(counter) or 0)
+            counter: _count(b, counter) - _count(a, counter)
             for counter in COUNTERS
             if a is not None
             and b is not None
-            and (b.get(counter) or 0) != (a.get(counter) or 0)
+            and _count(b, counter) != _count(a, counter)
         }
         entities.append(
             EntityChange(
                 name,
-                a["status"] if a else None,
-                b["status"] if b else None,
+                str(a["status"]) if a else None,
+                str(b["status"]) if b else None,
                 deltas,
             )
         )
-    old_provenance = flat(before.get("provenance") or {})
-    new_provenance = flat(after.get("provenance") or {})
+    old_provenance = flat(_mapping(before.get("provenance")))
+    new_provenance = flat(_mapping(after.get("provenance")))
     return Comparison(
         module=str(after.get("module")),
         before=(str(before.get("generated_at")), str(before.get(DIGEST, ""))),
@@ -158,17 +160,36 @@ def compare(before: Mapping[str, Any], after: Mapping[str, Any]) -> Comparison:
     )
 
 
-def flat(data: Mapping[str, Any], prefix: str = "") -> dict[str, Any]:
+def flat(data: Mapping[str, object], prefix: str = "") -> dict[str, object]:
     """Nested mappings as one, by dotted entry: a report's provenance."""
-    found: dict[str, Any] = {}
+    found: dict[str, object] = {}
     for name, value in data.items():
-        if isinstance(value, Mapping) and value:
-            found |= flat(
-                typing.cast(Mapping[str, Any], value), f"{prefix}{name}."
-            )
+        if nested := _mapping(value):
+            found |= flat(nested, f"{prefix}{name}.")
         else:
             found[f"{prefix}{name}"] = value
     return found
+
+
+def _mapping(value: object) -> Mapping[str, object]:
+    """A JSON object of a report; empty for anything else."""
+    if isinstance(value, Mapping):
+        return typing.cast(Mapping[str, object], value)
+    return {}
+
+
+def _entities(report: Mapping[str, object]) -> dict[str, Mapping[str, object]]:
+    """The entities of a report, by name."""
+    found = report.get("entities")
+    listed = typing.cast(list[object], found) if isinstance(found, list) else []
+    entities = [_mapping(entity) for entity in listed]
+    return {str(entity["entity"]): entity for entity in entities}
+
+
+def _count(entity: Mapping[str, object] | None, counter: str) -> int:
+    """A counter of an entity; 0 when it has none."""
+    value = None if entity is None else entity.get(counter)
+    return value if isinstance(value, int) else 0
 
 
 def comparison_markdown(comparison: Comparison) -> str:
@@ -213,10 +234,10 @@ def comparison_markdown(comparison: Comparison) -> str:
     return "\n".join(lines) + "\n"
 
 
-def shown(value: Any) -> str:
-    """A provenance value, as Markdown."""
+def shown(value: object) -> str:
+    """A provenance value, as Markdown: on one line."""
     if value is None:
         return "-"
     if isinstance(value, str):
-        return f"`{value}`"
+        return f"`{utils.one_line(value)}`"
     return f"`{json.dumps(value, ensure_ascii=False, sort_keys=True)}`"

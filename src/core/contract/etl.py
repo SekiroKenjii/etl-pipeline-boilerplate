@@ -1,4 +1,4 @@
-"""The run context, counters, errors and results of ETL operations."""
+"""The run context, counters and errors of ETL operations."""
 
 from __future__ import annotations
 
@@ -7,13 +7,9 @@ import dataclasses
 import datetime
 import enum
 import threading
-from typing import TYPE_CHECKING
 import uuid
 
 from shared import utils
-
-if TYPE_CHECKING:
-    from core.contract import quality
 
 
 class ETLPhase(enum.StrEnum):
@@ -93,6 +89,14 @@ class ETLContext:
     @property
     def is_cancelled(self) -> bool:
         return self._cancelled.is_set()
+
+    def wait(self, seconds: float) -> bool:
+        """Waits up to `seconds` for the run to be cancelled.
+
+        Returns:
+            Whether it was.
+        """
+        return self._cancelled.wait(seconds)
 
 
 @dataclasses.dataclass(slots=True)
@@ -189,136 +193,3 @@ class ETLError:
             "exception": repr(self.exception) if self.exception else None,
             "timestamp": self.timestamp.isoformat(),
         }
-
-
-def _no_reports() -> dict[quality.Checkpoint, quality.QualityReport]:
-    return {}
-
-
-@dataclasses.dataclass(slots=True)
-class ETLResult:
-    """The result of an ETL operation, usually one pipeline step.
-
-    Attributes:
-        status: The outcome.
-        stats: The record counters.
-        errors: The errors met.
-        quality_reports: One report per quality checkpoint, merged over the
-            batches.
-        started_at: When the operation started.
-        completed_at: When it completed, or None while it runs.
-        message: A human-readable summary.
-        data: Free-form values, e.g. the number of attempts of a step.
-    """
-
-    status: ETLStatus = ETLStatus.IN_PROGRESS
-    stats: ETLStats = dataclasses.field(default_factory=ETLStats)
-    errors: list[ETLError] = dataclasses.field(default_factory=list[ETLError])
-    quality_reports: dict[quality.Checkpoint, quality.QualityReport] = (
-        dataclasses.field(default_factory=_no_reports)
-    )
-    started_at: datetime.datetime = dataclasses.field(
-        default_factory=utils.utc_now
-    )
-    completed_at: datetime.datetime | None = None
-    message: str | None = None
-    data: dict[str, object] = dataclasses.field(
-        default_factory=dict[str, object]
-    )
-
-    @classmethod
-    def skipped(cls, message: str) -> ETLResult:
-        """Returns a completed result with the SKIPPED status."""
-        result = cls()
-        result.complete(ETLStatus.SKIPPED, message)
-        return result
-
-    def add_error(self, error: ETLError) -> None:
-        self.errors.append(error)
-
-    def add_quality_report(self, report: quality.QualityReport) -> None:
-        """Merges the report of a batch into the one kept per checkpoint."""
-        self.stats.rejected += report.rejected
-
-        existing = self.quality_reports.get(report.checkpoint)
-        if existing is None:
-            self.quality_reports[report.checkpoint] = report
-        else:
-            existing.merge(report)
-
-    @property
-    def is_done(self) -> bool:
-        return self.completed_at is not None
-
-    @property
-    def has_blocking_issues(self) -> bool:
-        """Whether errors, rejects or a failed gate prevent a full success.
-
-        Quality warnings are not blocking.
-        """
-        return (
-            bool(self.errors)
-            or self.stats.failed > 0
-            or self.stats.rejected > 0
-            or self.quality_failed
-        )
-
-    @property
-    def quality_failed(self) -> bool:
-        return any(report.failed for report in self.quality_reports.values())
-
-    def duration(self) -> float | None:
-        """Returns the duration in seconds, or None while it runs."""
-        if self.completed_at is None:
-            return None
-
-        return (self.completed_at - self.started_at).total_seconds()
-
-    def mark(self, status: ETLStatus, with_message: str | None = None) -> None:
-        self.status = status
-
-        if with_message is not None:
-            self.message = with_message
-
-    def complete(
-        self, status: ETLStatus | None = None, message: str | None = None
-    ) -> None:
-        """Marks the operation as completed.
-
-        Args:
-            status: The final status. When None and the operation is still
-                pending or in progress, it is derived from the errors,
-                counters and quality reports.
-            message: A summary, replacing the current one.
-        """
-        self.completed_at = utils.utc_now()
-
-        if status is not None:
-            self.status = status
-        elif self.status in (ETLStatus.PENDING, ETLStatus.IN_PROGRESS):
-            self.status = self._resolve_status()
-
-        if message is not None:
-            self.message = message
-
-    def _resolve_status(self) -> ETLStatus:
-        """SUCCESS without blocking issues; FAILED on a failed quality gate,
-        or on errors with nothing loaded; PARTIAL_SUCCESS otherwise.
-
-        Rows rejected are bad data, quarantined, not a failure: a window
-        holding only rejected rows is a partial success, so the steps
-        depending on this one still run.
-        """
-        if not self.has_blocking_issues:
-            return ETLStatus.SUCCESS
-
-        if self.quality_failed:
-            return ETLStatus.FAILED
-
-        if not self.errors and self.stats.failed == 0:
-            return ETLStatus.PARTIAL_SUCCESS
-
-        if self.stats.successful > 0:
-            return ETLStatus.PARTIAL_SUCCESS
-
-        return ETLStatus.FAILED

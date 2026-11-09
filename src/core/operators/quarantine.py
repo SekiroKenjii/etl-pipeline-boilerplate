@@ -2,15 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 import itertools
 
 from core import contract
 from core import pipeline
-
-type Fetch[T] = Callable[
-    [Sequence[contract.QuarantineEntry], contract.ETLContext], Iterable[T]
-]
+from core.operators import types as operators_types
 
 
 class QuarantineReplay[T](pipeline.IDataExtractor[T]):
@@ -41,7 +38,7 @@ class QuarantineReplay[T](pipeline.IDataExtractor[T]):
         self,
         quarantine: contract.IQuarantine,
         *,
-        fetch: Fetch[T],
+        fetch: operators_types.Fetch[T],
         entry_identity: Callable[[contract.QuarantineEntry], str | None],
         identity: Callable[[T], str],
         select: Callable[[contract.QuarantineEntry], bool] = lambda _: True,

@@ -15,13 +15,17 @@ docker run --rm localhost/etl-pipeline:dev --env dev list
 What is in the image:
 
 - **Contents.** It is built from `uv.lock`, with every connector by
-  default; `--build-arg EXTRAS="--extra app --extra postgres"` builds a
+  default; `--build-arg EXTRAS="--extra mssql"` builds a
   smaller one. It holds the package, `config/` and `mappings/`.
 - **User.** It runs as user 10001, and works with a read-only root
   filesystem when `/app/var` and `/tmp` are writable volumes.
 - **Overrides.** Mounted files and `ETL__*` variables override the settings.
   Secrets are files (`${file:...}`) or come from a secret manager (see
   `docs/security.md`).
+- **Limits.** The process reads the container's memory and CPU limits
+  (`resources.limits`) at start-up and sizes its caches, spills and
+  parallel steps from them ({doc}`tuning`): give a pod the memory a run
+  may use, and `etl check` prints what it derived.
 - **Base images.** `python` and `uv` are pinned by digest in the
   `Dockerfile`: a build takes the same bytes until a reviewed commit changes
   the digest (Dependabot proposes it weekly). OS patches come that way, not
@@ -74,15 +78,16 @@ refuse unsigned images in the namespace.
 | Code | Meaning | Kubernetes Job | Airflow task |
 | --- | --- | --- | --- |
 | 0 | Success. A partial success too, with `--partial-ok` | Complete | success |
-| 1 | Failed: a step failed | Retried (`backoffLimit`) | Retried (`retries`) |
-| 2 | Invalid settings or arguments; a pipeline that cannot be built; keys changed without `--rekey` | Fails at once (`podFailurePolicy`) | Failed after its retries |
+| 1 | Failed: a step failed; the bookkeeping database unreachable | Retried (`backoffLimit`) | Retried (`retries`) |
+| 2 | Invalid settings or arguments; a pipeline that cannot be built; keys changed without `--rekey`; deletes to confirm (`confirm_deletes`) | Fails at once (`podFailurePolicy`) | Failed after its retries |
 | 3 | Partial success, without `--partial-ok` | Failed | Failed |
-| 4 | Another run holds some of the steps | Fails at once | Retried, then failed |
+| 4 | Another run holds some of the steps; for a retry of the same label, after waiting up to `lease_seconds` | Fails at once | Retried, then failed |
 | 130 | Cancelled (SIGTERM, SIGINT) | Not counted on a node drain | Failed |
 
 - **Partial success.** A partial success means rows were rejected into the
-  quarantine, and nothing else: a failed step is exit 1, even one the
-  pipeline went on without. With `--partial-ok` the run counts as done: the
+  quarantine, or a step skipped (by itself, or after a dependency skipped):
+  a failed step is exit 1, even one the pipeline went on without, and so
+  are records failed. With `--partial-ok` the run counts as done: the
   `EtlRejectRateHigh` alert and `etl quarantine list` deal with the rejects,
   and the run ledger still records `partial_success`.
 - **Cancellation.** On SIGTERM, each running step finishes its batch, and
@@ -90,14 +95,36 @@ refuse unsigned images in the namespace.
   `terminationGracePeriodSeconds` is 300.
 - **Locks.** Two runs never run the same step at once, whatever the
   scheduler: each step has a lock in the database, `<pipeline>/<step>`, with
-  a lease. A run locked out exits 4 and fails: a locked night alerts, it is
-  never skipped. A pod that dies loses its leases after `lease_seconds`, and
-  the next run takes over.
+  a lease, held by the process. A run locked out exits 4 and fails: a
+  locked night alerts, it is never skipped. A pod that dies loses its
+  leases after `lease_seconds`, and the next run takes over.
 - **Retries.** The CronJobs run `etl run ... --label $(JOB_NAME) --resume`:
   the run is labelled with its Job. A pod retried by the Job resumes that
-  run, runs only the steps it did not finish, and takes over the locks of
-  the pod that died; the next Job is a new label, which runs every step.
+  run, and runs only the steps it did not finish. It waits, up to
+  `lease_seconds`, for the locks of the pod before it: those of a pod that
+  died expire within that time, and the retry takes them over; a pod still
+  running (its node cut off from the API server, not from the database)
+  keeps them, and the retry exits 4 rather than load the same steps at the
+  same time. The next Job is a new label, which runs every step.
   The DAG does the same with a label per DAG run and task.
+
+## Database sessions
+
+On Postgres (a source, a target, the ETL's tables), a statement past its
+`statement_timeout` fails the step at once, and is told by its English
+message ({doc}`operations`, Retries): in another language it is retried as
+a cancel, three times. Give the ETL's role English messages, once, as a
+superuser (or a role granted `SET ON PARAMETER lc_messages`, Postgres 15
+and later):
+
+```sql
+ALTER ROLE etl SET lc_messages = 'C';
+```
+
+`etl check` warns of a session in another language (or left to the
+server's environment, `lc_messages = ''`): a line
+`WARN database.<name>: lc_messages is ...` after the database's `ok`
+(logged at WARNING too), the exit code still 0.
 
 ## Kubernetes
 
@@ -171,7 +198,9 @@ job needs a label of its own, and the bookkeeping in a database every pod
 reaches, as in `config/prod.toml`.
 
 To try it locally, `make kind-up k8s-demo` runs the demo on kind: an init
-container seeds SQLite, then `crm.full_load` runs. With rootless podman,
+container seeds SQLite, then `crm.full_load` runs. The demo leaves out
+`etl-housekeeping`: its SQLite lives in the pod of each run and goes with
+it, so no quarantine is left to purge. With rootless podman,
 kind needs the cgroup controllers delegated; the Makefile runs it in a
 `systemd-run --user -p Delegate=yes` scope. `make kind-down` deletes the
 cluster.
@@ -203,9 +232,11 @@ Airflow image, against kind. A seed task comes first (`ETL_SEED_DEMO=1`),
 and the tasks share SQLite on a volume.
 
 Each `etl run` task carries `--label {{ run_id }}/<task> --resume`: a
-retry resumes the run of its try, and takes over the locks of a try that
-died. Exit 4 (another run holds some of the steps) fails the task, which is
-retried, then fails the DAG run: a locked night is never marked a success.
+retry resumes the run of its try. It waits, up to `lease_seconds`, for the
+locks of the try before it: a try that died frees them within that time; a
+zombie task still running keeps them, and the retry exits 4. Exit 4
+(another run holds some of the steps) fails the task, which is retried,
+then fails the DAG run: a locked night is never marked a success.
 
 Without Kubernetes, a `BashOperator` running `etl run crm.full_load
 --partial-ok --label {{ run_id }} --resume` on workers that have the package

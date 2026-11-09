@@ -30,6 +30,10 @@ from config.settings import OtlpSettings
 from config.settings import PrivacySettings
 from config.settings import RunsSettings
 from config.settings import StoreSettings
+from config.tuning import Chosen
+from config.tuning import EffectiveTuning
+from config.tuning import resolve_tuning
+from config.tuning import TuningSettings
 
 __all__ = [
     "DEFAULT_ENV",
@@ -37,8 +41,10 @@ __all__ = [
     "AppSettings",
     "BookkeepingSettings",
     "ChangesSettings",
+    "Chosen",
     "ConfigError",
     "DatabaseSettings",
+    "EffectiveTuning",
     "EngineOptions",
     "KafkaSettings",
     "LineageSettings",
@@ -52,7 +58,9 @@ __all__ = [
     "RunsSettings",
     "SecretError",
     "StoreSettings",
+    "TuningSettings",
     "is_secret_name",
     "load_settings",
     "register_provider",
+    "resolve_tuning",
 ]

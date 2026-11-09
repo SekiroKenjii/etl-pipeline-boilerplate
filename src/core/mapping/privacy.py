@@ -6,8 +6,10 @@ instead of the real ones. Values are derived from the real one by HMAC:
 
 - the same value always gives the same fake one, so joins on them still
   match, and the kinds made unique (`email`, `phone`, `hash`) keep unique
-  columns unique: they take enough bits of the HMAC for a collision to be
-  negligible (below 1e-3 for 10 million phone numbers, the smallest space);
+  columns unique, but for a collision: n values in a space of N give one
+  with a chance of about n^2 / 2N. The phone's 10^15 numbers are the
+  smallest space: 5e-4 for a million numbers, 5e-2 for 10 million (use
+  `hash`, 2^64, for a unique column that large: 3e-6); `email` has 2^80;
 - without the secret, a fake value tells nothing of the real one.
 
 Kinds:
@@ -31,23 +33,8 @@ import datetime
 import hashlib
 import hmac
 import json
-from typing import Protocol
 
-
-class Anonymizer(Protocol):
-    """Replaces a personal value by a fake one."""
-
-    def __call__(self, value: object, record: Sequence[str] = ()) -> object:
-        """Returns the fake value of `value`.
-
-        Args:
-            value: The value, cast to its target type; None stays None.
-            record: Identifies the record, e.g. its canonical natural key:
-                the `date` kind shifts every date of a record by the same
-                number of days.
-        """
-        ...
-
+from core.mapping import types
 
 _FAMILY = (
     "Smith", "Johnson", "Brown", "Garcia", "Miller", "Davis", "Martin",
@@ -150,7 +137,7 @@ SAME_LENGTH_KINDS = frozenset({"mask"})
 TEMPORAL_KINDS = frozenset({"date"})
 
 
-def anonymizer(kind: str, secret: bytes) -> Anonymizer:
+def anonymizer(kind: str, secret: bytes) -> types.Anonymizer:
     """Returns the function anonymizing values of `kind`.
 
     Raises:

@@ -29,6 +29,8 @@ cutover-runbook
 
 deployment
 performance
+tuning
+algorithms
 security
 ```
 
@@ -38,5 +40,6 @@ security
 
 reference/cli
 reference/api
+reference/types
 adr/index
 ```

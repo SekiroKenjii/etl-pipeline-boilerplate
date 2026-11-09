@@ -7,7 +7,6 @@ Revises: 0002
 from __future__ import annotations
 
 import json
-from typing import Any
 
 from alembic import context
 from alembic import op
@@ -103,7 +102,7 @@ def _identify(connection: sa.Connection, quarantine: sa.TableClause) -> None:
         if after is not None:
             page = page.where(columns.id > after)
         rows = connection.execute(page).all()
-        keys: list[dict[str, Any]] = []
+        keys: list[dict[str, object]] = []
         for id_, pipeline, checkpoint, record in rows:
             try:
                 data = json.loads(record)

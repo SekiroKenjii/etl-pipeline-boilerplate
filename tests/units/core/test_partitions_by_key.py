@@ -175,6 +175,48 @@ class TestFirstRead:
         assert source.last_query.order_by == ("id",)
 
 
+class TestReadingAgain:
+    """After the first read, the rows at its watermark are read again until
+    a run has read them all."""
+
+    def _late_commits(self) -> tuple[list[dict[str, Any]], _Range]:
+        """Row 9 read at minute 1, then 1 to 4 committed late at minute 1."""
+        table = _rows((9, 1))
+        source = _Range(table)
+        assert source.run() == [9]
+        table.extend(_rows((1, 1), (2, 1), (3, 1), (4, 1)))
+        return table, source
+
+    def test_a_run_dying_half_way_loses_no_late_row(self) -> None:
+        _, source = self._late_commits()
+
+        assert source.run(batch_size=1, fail_on_batch=2) == [1]
+        assert source.saved["recheck"] is True
+        assert source.run() == [2, 3, 4, 9]
+        assert source.run() == []
+
+    def test_a_backfill_below_the_watermark_keeps_the_read_again(
+        self,
+    ) -> None:
+        table, source = self._late_commits()
+        table.extend(_rows((5, -7), (20, 20)))
+        backfill = contract.ETLContext(
+            contract.ETLRunInfo("p", since=_at(-10), until=_at(-5))
+        )
+
+        assert source.run(ctx=backfill) == [5]
+        assert source.run() == [1, 2, 3, 4, 9, 20]
+
+    def test_a_backfill_before_the_first_read_saves_nothing(self) -> None:
+        source = _Range(_rows((1, 1), (2, 5)))
+        backfill = contract.ETLContext(contract.ETLRunInfo("p", since=_at(5)))
+
+        assert source.run(ctx=backfill) == [2]
+        assert source.saved is None
+        assert source.run() == [1, 2]
+        assert source.last_query.order_by == ("id",)
+
+
 class TestSavedState:
 
     def test_a_position_by_watermark_goes_on_by_watermark(self) -> None:

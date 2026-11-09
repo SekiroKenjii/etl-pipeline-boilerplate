@@ -140,6 +140,8 @@ def _last_changes[T](records: Iterable[T]) -> list[T]:
     for index, item in enumerate(items):
         if isinstance(item, contract.ChangeEvent):
             last[(item.table, *item.key)] = index
+    if not last:
+        return items
     return [
         item
         for index, item in enumerate(items)
