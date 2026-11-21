@@ -199,7 +199,7 @@ jobs:
           path: var
       - name: Analysis
         if: env.SONAR_TOKEN != ''
-        uses: SonarSource/sonarqube-scan-action@e805d875275f728fac1885b413934be6d7c63f65 # v8.4.1
+        uses: SonarSource/sonarqube-scan-action@59202af334b4ba7b5db01b701b8e79f8b3bef0f4 # v8.5.0
         with:
           args: -Dsonar.qualitygate.wait=true
 
@@ -226,7 +226,7 @@ jobs:
         with:
           name: image-sbom
           path: var/image.cdx.json
-      - uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+      - uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
         with:
           cluster_name: etl
       - name: Kubernetes Job
